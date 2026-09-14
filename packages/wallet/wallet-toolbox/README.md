@@ -15,12 +15,12 @@ The **2.14.0 candidate** adds authenticated raw binary HTTP for wallet sync:
 - **Faster local source reads**, selecting keys before loading transaction and proof bytes.
 - **Legacy provider compatibility**, with no additional server database migration from 2.13.0.
 
-Synthetic authenticated HTTP tests cover large records, added latency, interrupted
-uploads, restart recovery, lost acknowledgements, corruption rejection and repeat
-sync. An initial native macOS raw-transport readback completed a large wallet
-(over 130,000 records across all 12 data categories). Full native validation of
-the tuned 1 MiB inline setting remains in progress. Earlier large-wallet E2E
-results below describe previous implementations; see [methods and limits](#sync-performance-and-recovery).
+**Large-wallet native E2E:** a retained device copy, resumed full replay to an
+existing remote backup, unchanged repeat, and two fresh restores of **over 134,000
+records across all 12 categories** completed. Recovery tests include restart,
+profile switching, interrupted acknowledgements and automatic bounded-read retry.
+See [methods and limits](#sync-performance-and-recovery) for measured results and
+remaining release checks.
 
 ## Overview
 
@@ -71,6 +71,26 @@ The toolbox publishes three npm packages from this repo:
 - **[`@bsv/wallet-toolbox-mobile`](https://www.npmjs.com/package/@bsv/wallet-toolbox-mobile)** — Mobile build; remote wallet storage plus portable local ChainTracks components and adapter contracts
 
 ### Sync performance and recovery
+
+Candidate validation (2026-09-14) passed **2,319 Toolbox tests** and **6,485
+conformance cases**, with one and 211 existing skips respectively. Native macOS
+validation with the 1 MiB inline setting completed two fresh restores of 134,758
+records across all 12 categories, each in about 12.2 minutes. Both cleaned up
+their isolated IndexedDB stores and preserved the selected primary. The first
+recovered automatically from a gateway read failure. After adjusting upstream
+connection reuse, the final copy completed 979 raw sync requests without a
+gateway error. Its foreground event-loop delay was 9 ms at the 95th percentile
+(111 ms maximum). Independent key/index counts of the retained local copy matched
+all 12 restored categories. A full replay from the retained local copy to an
+existing remote backup survived checkpoint recovery; its unchanged repeat made
+zero inserts and zero updates. This replay spanned
+interruptions and tuning revisions, so it is not a fresh-upload timing benchmark.
+
+The controlled HTTP body comparison and identical-page source-read measurement
+below isolate particular gains. Different native runs used different data and
+settings; no controlled whole-wallet speedup is claimed. The candidate still
+requires hosted checks and release validation; inherited repository health
+controls remain expired. It has not been published.
 
 Sync pages start at 64 records and adapt after successful commits toward a
 five-second write budget. Source database scans are excluded from

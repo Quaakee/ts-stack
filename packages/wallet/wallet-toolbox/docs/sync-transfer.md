@@ -15,6 +15,11 @@ GET health checks do not rule this out. Fix the connection lifetime mismatch
 rather than enabling unconditional write retries. See the
 [Caddy transport documentation](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport).
 
+If resets persist with shorter reuse, an operator can test `keepalive off` on
+that upstream. Each request then opens a new upstream connection; measure that
+cost with a full copy before adopting the setting. Client-side HTTP connections,
+binary framing and authentication are separate from this proxy transport choice.
+
 A migrated Knex-backed `StorageServer` advertises `syncTransfer` in runtime
 settings: `{ version: 1, maxBytes, partBytes, inlineBytes, binaryTransport? }`.
 `binaryTransport: { version: 1, inlineBytes }` advertises raw HTTP sync. These are
