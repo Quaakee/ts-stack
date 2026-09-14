@@ -78,6 +78,15 @@ function fixture() {
   engine.logger = { ...console, error: jest.fn() }
   const submit = jest.spyOn(engine, 'submit').mockResolvedValue({})
   const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+  if (typeof globalThis.fetch !== 'function') {
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: async () => {
+        throw new Error('unexpected network request')
+      }
+    })
+  }
   const fetchMock = jest.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
     const endpoint = new URL(String(url)).pathname
     requests.push({
