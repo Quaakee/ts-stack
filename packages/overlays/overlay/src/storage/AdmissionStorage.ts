@@ -243,6 +243,7 @@ export function admissionSemanticDigest(identity: AdmissionIdentity): string {
     identity.scope.genesisHash,
     identity.scope.nodeId,
     identity.txid,
+    identity.mode,
     identity.contextDigest,
     String(topics.length),
     ...topics.flatMap(({ topic, policyId }) => [topic, policyId])
