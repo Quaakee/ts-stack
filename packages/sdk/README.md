@@ -16,10 +16,20 @@ emits a portable `number[]` settlement artifact so HTTP, WebSocket, Message Box,
 and JSON transports preserve identical transaction bytes. The same boundary
 protects overlay lookup queries and JSON BEEF responses.
 
-Security-sensitive overlay consumers can use the exported bounded transaction
-evidence coordinator to verify copied BEEF against a caller-owned chain tracker.
-See the [transaction evidence guide](./docs/transaction-evidence.md) for the
-receipt, graph, cache, cancellation, and resolver-intake contracts.
+AuthFetch stops pending certificate dispatch and session recovery after its
+request deadline. An already dispatched request may still complete on the
+server; callers must resolve its outcome before retrying a non-idempotent write.
+
+For signature payloads of at least 64 KiB, `ProtoWallet` uses asynchronous
+platform SHA-256 when Web Crypto is available, avoiding long synchronous
+hashing on browser UI threads. Unsupported or failed native hashing falls back
+to the existing implementation using the same input snapshot. Short payloads,
+explicit digests, signature bytes, and verification rules remain compatible.
+No host registration or API migration is required. The additional portable
+path measures 742,126 raw bytes in the SDK Vite fixture and 555,548 raw bytes
+in UMD; their reviewed ceilings are 742,500 and 556,000 bytes respectively.
+The combined sync and security candidate measures 560,560 raw bytes with esbuild;
+its reviewed raw ceiling is 561,000 bytes. Compression ceilings are unchanged.
 
 ## Table of Contents
 
@@ -118,6 +128,11 @@ For a more detailed tutorial and advanced examples, check our [Documentation](#d
 
 - **Key Value Store**: Distributed key-value store for decentralized data storage and retrieval.
 
+Identity publication rejects a certificate unless its certifier signature
+verifies affirmatively. `GlobalKVStore` likewise treats overlay responses as
+untrusted and returns only entries with a valid controller signature; a
+verification error or `valid: false` result is rejected.
+
 - **Distributed Storage**: Scalable and secure distributed data storage solutions to support blockchain applications.
 
 - **Wallet Interface**: Standardized interface for wallet operations, supporting multiple cryptocurrencies and protocols.
@@ -135,7 +150,6 @@ Comprehensive documentation is available in several formats:
   - **[🔧 How-To Guides](https://bsv-blockchain.github.io/ts-stack/guides/)**: Practical solutions to specific problems
   - **[📚 Reference](https://bsv-blockchain.github.io/ts-stack/reference/)**: Complete technical specifications and API documentation
   - **[🏗️ Architecture](https://bsv-blockchain.github.io/ts-stack/architecture/)**: Architecture and design explanations
-- **[Transaction evidence](./docs/transaction-evidence.md)**: Bounded verification of untrusted BEEF and overlay receipts
 - **[⚡ Examples](https://docs.bsvblockchain.org/guides/sdks/ts/examples)**: Practical code examples
 - **Code Annotations**: The SDK is richly documented with code-level annotations that show up in editors like VSCode
 
