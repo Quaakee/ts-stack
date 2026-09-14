@@ -417,6 +417,40 @@ describe('BASM reconciliation evidence binding', () => {
     expect(f.tracker.currentHeight).not.toHaveBeenCalled()
   })
 
+  it('admits a BASM-proven historical coinbase through the real submit path', async () => {
+    const f = fixture()
+    const coinbase = new Transaction(
+      1,
+      [],
+      [{ satoshis: 50, lockingScript: LockingScript.fromASM('OP_TRUE') }],
+      0
+    )
+    const beef = coinbase.toBEEF()
+    const txid = coinbase.id('hex')
+    const manager = {
+      identifyAdmissibleOutputs: jest.fn(async () => ({ outputsToAdmit: [0], coinsToRetain: [] })),
+      getDocumentation: jest.fn(async () => ''),
+      getMetaData: jest.fn(async () => ({ name: 'test', shortDescription: 'test' }))
+    }
+    f.engine.managers[topic] = manager
+    Object.assign(f.storage, {
+      doesAppliedTransactionExist: jest.fn(async () => false),
+      findOutput: jest.fn(async () => null),
+      insertOutput: jest.fn(async () => undefined),
+      insertAppliedTransaction: jest.fn(async () => undefined),
+      upsertTransactionRecord: jest.fn(async () => undefined)
+    })
+    f.submit.mockRestore()
+
+    await expect(f.engine.submit({ beef, topics: [topic] }, undefined, 'historical-tx')).resolves.toEqual({
+      [topic]: { outputsToAdmit: [0], coinsToRetain: [] }
+    })
+    expect(manager.identifyAdmissibleOutputs).toHaveBeenCalledWith(beef, [], undefined, 'historical-tx')
+    expect(f.storage.insertAppliedTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ txid, topic, proven: false })
+    )
+  })
+
   it('reports a finite proof request limit for a block above 1000 admissions (B02 chunking required)', async () => {
     const f = fixture()
     const admitted = Array.from({ length: 1001 }, (_, blockIndex) => ({

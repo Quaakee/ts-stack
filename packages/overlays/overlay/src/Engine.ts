@@ -1071,7 +1071,12 @@ export class Engine {
     const txid = tx.id('hex')
 
     this.startTime(`submit_${txid}`)
-    if (mode !== 'historical-tx-no-spv') {
+    // BASM reconciliation has already validated historical-tx inclusion with
+    // the compound Merkle proof and canonical header. Running Transaction.verify
+    // here would incorrectly apply coinbase maturity to an admitted historical
+    // transaction, even though BASM only proves inclusion. Current submissions
+    // still require the normal SPV/Bitcoin validity check.
+    if (mode === 'current-tx') {
       this.startTime(`chainTracker_${txid.substring(0, 10)}`)
       const txValid = await tx.verify(this.chainTracker)
       if (!txValid) throw new Error('Unable to verify SPV information.')
