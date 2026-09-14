@@ -17,6 +17,17 @@ export const syncIdbStores: Record<string, string> = {
   provenTxReq: 'proven_tx_reqs'
 }
 
+interface OwnershipSelection {
+  keys: IDBValidKey[]
+  owned: IDBValidKey[]
+  scanned: number
+  inUse: boolean
+}
+
+// Reuse key joins only inside the same readonly snapshot. Readwrite transactions
+// must always observe their own later mutations; no cache survives a sync page.
+const selections = new WeakMap<object, Map<string, OwnershipSelection>>()
+
 /**
  * Select identity/timestamp keys before loading binary-bearing rows. All joins,
  * filtering and page reads share a transaction; no cached offset survives writes.
@@ -61,10 +72,19 @@ export async function readSyncItemsIdb(
     }
     keys = keys.slice(offset, offset + limit)
   } else {
-    keys =
+    const cacheKey = JSON.stringify([name, args.userId, args.since])
+    let cache = trx.mode === 'readonly' ? selections.get(trx) : undefined
+    if (trx.mode === 'readonly' && cache == null) {
+      cache = new Map()
+      selections.set(trx, cache)
+    }
+    const cached = cache?.get(cacheKey)
+    // Concurrent callers on one transaction must not append to the same prefix.
+    const prior = cached?.inUse === true ? undefined : cached
+    keys = prior?.keys ?? (
       args.since == null
         ? await store.getAllKeys()
-        : await store.index('updated_at').getAllKeys(IDBKeyRange.lowerBound(args.since))
+        : await store.index('updated_at').getAllKeys(IDBKeyRange.lowerBound(args.since)))
     // Ownership can only remove keys. An exhausted upper bound needs no joins,
     // including when earlier entities are revisited on every later sync page.
     if (offset >= keys.length) {
@@ -72,16 +92,17 @@ export async function readSyncItemsIdb(
       return []
     }
     // Timestamp index traversal is not BRC-40 primary-key order.
-    if (args.since != null) keys.sort((a, b) => indexedDB.cmp(a, b))
+    if (prior == null && args.since != null) keys.sort((a, b) => indexedDB.cmp(a, b))
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const related: any = trx.objectStore(relationStore)
     if (name === 'txLabelMap' || name === 'outputTagMap') {
       const owned = new Set(await related.index('userId').getAllKeys(args.userId))
       keys = keys.filter(key => owned.has((key as IDBValidKey[])[0])).slice(offset, offset + limit)
     } else {
-      const selected: IDBValidKey[] = []
-      let skipped = 0
-      for (let start = 0; start < keys.length && selected.length < limit; start += 128) {
+      const selection = prior ?? { keys, owned: [], scanned: 0, inUse: false }
+      selection.inUse = true
+      cache?.set(cacheKey, selection)
+      for (let start = selection.scanned; start < keys.length && selection.owned.length < offset + limit; start += 128) {
         const batch = keys.slice(start, start + 128)
         const owned = await Promise.all(
           batch.map(async key => {
@@ -96,19 +117,17 @@ export async function readSyncItemsIdb(
             )
           })
         )
-        for (let i = 0; i < batch.length && selected.length < limit; i++) {
-          if (!owned[i]) continue
-          if (skipped++ < offset) continue
-          selected.push(batch[i])
-        }
+        for (let i = 0; i < batch.length; i++) if (owned[i]) selection.owned.push(batch[i])
+        selection.scanned = start + batch.length
       }
-      keys = selected
+      selection.inUse = false
+      keys = selection.owned.slice(offset, offset + limit)
     }
   }
   const rows = await Promise.all(keys.map(async key => storage.validateEntity(await store.get(key))))
   if (args.trx == null) await trx.done
-  // Retain the ordinary reader's reconstruction of pruned transaction/script
-  // fields. These reads occur after our transaction, just as in find* methods.
+  // Reconstruct pruned fields inside the caller's snapshot when supplied.
+  // Standalone reads retain the ordinary reader's post-transaction hydration.
   if (name === 'transaction') for (const row of rows) await storage.validateRawTransaction(row, args.trx)
   if (name === 'output') for (const row of rows) await storage.validateOutputScript(row, args.trx)
   return rows

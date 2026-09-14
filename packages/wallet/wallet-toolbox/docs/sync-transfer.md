@@ -188,15 +188,22 @@ remain. Hermes compression varies slightly with build paths.
 
 The subsequent IndexedDB source paging and customization guard add 3,727 Vite
 and 2,915 esbuild raw bytes relative to the initial raw-transport candidate. Only
-these two raw ceilings increase again; gzip and Brotli limits remain unchanged.
+these two raw ceilings initially increased; gzip and Brotli limits were unchanged.
 A native large-wallet sample returned the identical 64-record page in 270 ms
 versus 5,539 ms through the original reader. This is one source-query comparison,
 not whole-wallet throughput evidence.
 
+Reusing ownership joins inside a readonly page snapshot adds another 683 Vite
+and 431 esbuild raw bytes. It prevents repeated prefix joins within the source's
+size-aware queries, while each new page sees later writes. This explicit cost
+advances the exceeded Vite raw/gzip/Brotli and esbuild gzip/Brotli ceilings shown below;
+the checker remains strict. A concurrent-reader guard keeps callers from mutating
+the same cached prefix. No new dependency or server code enters the browser.
+
 | Artifact | Raw | Gzip | Brotli | Raw ceiling | Gzip ceiling | Brotli ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vite | 1,721,602 | 406,496 | 317,914 | 1,722,000 | 406,500 | 318,000 |
-| esbuild | 1,343,236 | 369,437 | 296,723 | 1,344,000 | 369,500 | 297,000 |
+| Vite | 1,722,285 | 406,733 | 318,029 | 1,723,000 | 406,800 | 318,300 |
+| esbuild | 1,343,667 | 369,610 | 297,093 | 1,344,000 | 369,700 | 297,200 |
 | Metro | 1,768,739 | 449,430 | 348,088 | 1,770,000 | 455,000 | 360,000 |
 | Hermes | 3,589,715 | 1,441,493 | 1,133,833 | 3,591,000 | 1,460,500 | 1,135,000 |
 
@@ -204,7 +211,7 @@ Before upstream integration, Linux CI measured Vite gzip at 404,970 and Hermes
 gzip at 1,457,902, above the corresponding macOS measurements. The combined
 ceilings retain that platform allowance and the upstream security artifact costs.
 The combined Linux esbuild artifact measured 369,222 gzip bytes; its ceiling is
-369,500 bytes. The complete hosted platform checks must pass these limits before
+369,700 bytes after the source-page snapshot addition. The complete hosted platform checks must pass these limits before
 review.
 
 Browser composition contains only the existing SDK, wallet client, noble hashes,

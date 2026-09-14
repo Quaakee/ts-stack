@@ -131,6 +131,104 @@ async function seed(storage: StorageIdb): Promise<void> {
 }
 
 describe('IndexedDB source sync paging', () => {
+  test.each(['provenTx', 'provenTxReq'])('reuses %s joins only within one readonly snapshot', async name => {
+    const storage = makeStorage()
+    try {
+      await seed(storage)
+      const trx = storage.toDbTrx([syncIdbStores[name], 'transactions'], 'readonly')
+      const ownership = jest.spyOn(IDBIndex.prototype, 'getKey')
+      const id = name === 'provenTx' ? 'provenTxId' : 'provenTxReqId'
+      try {
+        const first = await readSyncItemsIdb(storage, name, { userId: 1, paged: { offset: 0, limit: 1 }, trx })
+        const lookups = ownership.mock.calls.length
+        expect(first.map(row => row[id])).toEqual([1])
+        expect(lookups).toBe(4)
+        const second = await readSyncItemsIdb(storage, name, { userId: 1, paged: { offset: 1, limit: 1 }, trx })
+        expect(second.map(row => row[id])).toEqual([3])
+        expect(ownership).toHaveBeenCalledTimes(lookups)
+        await trx.done
+      } finally {
+        ownership.mockRestore()
+      }
+      await storage.updateTransaction(2, { userId: 1 })
+      const changed = await readSyncItemsIdb(storage, name, { userId: 1, paged: { offset: 1, limit: 1 } })
+      expect(changed.map(row => row[id])).toEqual([2])
+    } finally {
+      await storage.destroy()
+      await storage.dropAllData()
+    }
+  })
+
+  test('concurrent reads on one snapshot cannot append duplicate ownership keys', async () => {
+    const storage = makeStorage()
+    try {
+      await seed(storage)
+      const trx = storage.toDbTrx(['proven_txs', 'transactions'], 'readonly')
+      const args = { userId: 1, paged: { offset: 0, limit: 1 }, trx }
+      const original = IDBIndex.prototype.getKey
+      let concurrent: Promise<any[]> | undefined
+      const lookup = jest.spyOn(IDBIndex.prototype, 'getKey').mockImplementation(function (...params) {
+        if (concurrent == null) concurrent = readSyncItemsIdb(storage, 'provenTx', args)
+        return original.apply(this, params)
+      })
+      try {
+        expect((await readSyncItemsIdb(storage, 'provenTx', args)).map(row => row.provenTxId)).toEqual([1])
+        expect((await concurrent!).map(row => row.provenTxId)).toEqual([1])
+        expect((await readSyncItemsIdb(storage, 'provenTx', { ...args, paged: { offset: 2, limit: 1 } }))).toEqual([])
+        await trx.done
+      } finally {
+        lookup.mockRestore()
+      }
+    } finally {
+      await storage.destroy()
+      await storage.dropAllData()
+    }
+  })
+
+  test('does not reuse ownership keys across writes in a readwrite transaction', async () => {
+    const storage = makeStorage()
+    try {
+      await seed(storage)
+      const trx = storage.toDbTrx(['proven_txs', 'transactions'], 'readwrite')
+      const args = { userId: 1, paged: { offset: 1, limit: 1 }, trx }
+      expect((await readSyncItemsIdb(storage, 'provenTx', args)).map(row => row.provenTxId)).toEqual([3])
+      await storage.updateTransaction(2, { userId: 1 }, trx)
+      expect((await readSyncItemsIdb(storage, 'provenTx', args)).map(row => row.provenTxId)).toEqual([2])
+      await trx.done
+    } finally {
+      await storage.destroy()
+      await storage.dropAllData()
+    }
+  })
+
+  test('shares ownership selection across size-aware queries in one complete sync page', async () => {
+    const storage = makeStorage()
+    try {
+      await seed(storage)
+      const trx = storage.toDbTrx(['proven_txs', 'transactions'], 'readwrite')
+      const proof = (await trx.objectStore('proven_txs').get(1))!
+      const transaction = (await trx.objectStore('transactions').get(1))!
+      for (let id = 5; id <= 80; id++) {
+        await trx.objectStore('proven_txs').put({ ...proof, provenTxId: id, txid: txid(id) })
+        await trx.objectStore('transactions').put({ ...transaction, transactionId: id, provenTxId: id, txid: txid(id), reference: `ref-${id}` })
+      }
+      await trx.done
+      const ownership = jest.spyOn(IDBIndex.prototype, 'getKey')
+      try {
+        const chunk = await storage.getSyncChunk({ identityKey: owner, fromStorageIdentityKey: peer,
+          toStorageIdentityKey: peer, offsets: [{ name: 'provenTx', offset: 0 }], maxItems: 64, maxRoughSize: 10000000 })
+        expect(chunk.provenTxs).toHaveLength(64)
+        expect(ownership).toHaveBeenCalledTimes(80)
+        expect(chunk.provenTxs!.map(row => row.provenTxId)).toEqual([1, 3, ...Array.from({ length: 62 }, (_, i) => i + 5)])
+      } finally {
+        ownership.mockRestore()
+      }
+    } finally {
+      await storage.destroy()
+      await storage.dropAllData()
+    }
+  })
+
   test.each(['provenTx', 'provenTxReq'])('does not join exhausted %s keys and sees later additions', async name => {
     const storage = makeStorage()
     try {

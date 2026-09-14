@@ -73,7 +73,9 @@ The toolbox publishes three npm packages from this repo:
 ### Sync performance and recovery
 
 Sync pages start at 64 records and adapt after successful commits toward a
-five-second page budget. Proof-bearing pages cap growth at 128 records; cheap
+five-second write budget. Source database scans are excluded from
+the write budget, so repeated local lookups cannot collapse the upload to one
+record per page. Proof-bearing pages cap growth at 128 records; cheap
 metadata pages can grow to 1,000, while provider byte/item ceilings still apply.
 The server checks at most eight proofs concurrently and waits for all started
 checks to settle on failure before rejecting the page. Every proof still passes
@@ -141,7 +143,9 @@ sources. Sync reads select keys, preserve primary-key ordering and inclusive
 timestamps, then load only the selected page's values. Ownership queries are
 batched at 128 requests; temporary key metadata still scales with wallet size.
 This avoids repeatedly loading earlier binary records while advancing a copy.
-Already exhausted key ranges skip ownership joins; later writes remain visible.
+Queries within a page reuse ownership keys in one readonly snapshot. The next
+page opens a fresh snapshot and sees later writes. Already exhausted key ranges
+skip ownership joins.
 Indexes backfill automatically and preserve stored bytes, tombstones and duplicate
 transaction IDs. Clients requesting schema version 6 or earlier cannot reopen an
 upgraded copy; retain a version-7-compatible client for local data.

@@ -6,6 +6,10 @@ attention to changes that materially alter behavior or extend functionality.
 
 ## wallet-toolbox (unreleased)
 
+- Adapt sync page work to write latency, excluding source scans that happen before
+  the write request. Reuse local ownership joins within one readonly page snapshot;
+  later pages see new writes and readwrite transactions never reuse these keys.
+
 - IndexedDB source sync selects keys before loading binary-bearing records; schema 7 backfills timestamp and ownership indexes without changing wallet rows. Retained copies require a schema-7-compatible client.
 
 - Add negotiated raw binary HTTP sync, shared across full, browser and mobile

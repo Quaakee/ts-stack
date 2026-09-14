@@ -886,12 +886,15 @@ export class WalletStorageManager implements sdk.WalletStorage {
         // adaptive limit so a fast page can grow the next request again.
         const pageArgs = budget.apply(args)
         pageArgs.includeNextCheckpoint = true
-        const startedAt = Date.now()
         const chunk = await reader.getSyncChunk(pageArgs)
         if (chunk.user != null) {
           // Merging state from a reader cannot update activeStorage
           chunk.user.activeStorage = ((this._active as ManagedStorage).user as TableUser).activeStorage
         }
+        // Source scans happen before the write RPC and do not consume its
+        // authentication deadline. Counting them can collapse a large local
+        // backup to single-record pages, repeating the same expensive scan.
+        const startedAt = Date.now()
         const r = await writer.processSyncChunk(pageArgs, chunk)
         budget.committed(chunk, Date.now() - startedAt)
         inserts += r.inserts
@@ -940,9 +943,12 @@ export class WalletStorageManager implements sdk.WalletStorage {
         // adaptive limit so a fast page can grow the next request again.
         const pageArgs = budget.apply(args)
         pageArgs.includeNextCheckpoint = true
-        const startedAt = Date.now()
         const chunk = await reader.getSyncChunk(pageArgs)
         log += EntitySyncState.syncChunkSummary(chunk)
+        // Source scans happen before the write RPC and do not consume its
+        // authentication deadline. Counting them can collapse a large local
+        // backup to single-record pages, repeating the same expensive scan.
+        const startedAt = Date.now()
         const r = await writer.processSyncChunk(pageArgs, chunk)
         budget.committed(chunk, Date.now() - startedAt)
         inserts += r.inserts

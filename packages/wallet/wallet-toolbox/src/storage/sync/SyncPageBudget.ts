@@ -1,6 +1,6 @@
 import type { RequestSyncChunkArgs, SyncChunk } from '../../sdk/WalletStorage.interfaces'
 
-/** Per-copy work budget. Bytes alone cannot bound network-backed proof checks. */
+/** Per-copy write budget. Bytes alone cannot bound network-backed proof checks. */
 export class SyncPageBudget {
   private maxItems = 64
 

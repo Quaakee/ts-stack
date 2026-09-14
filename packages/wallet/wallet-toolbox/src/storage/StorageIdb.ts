@@ -2304,7 +2304,17 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     ) {
       return await super.getSyncChunk(args)
     }
-    return await getSyncChunk(this, args, async (name, page) => await readSyncItemsIdb(this, name, page))
+    // A page may make several size-aware queries. Keep their key joins in one
+    // readonly snapshot; the next page creates a new snapshot and sees writes.
+    let trx: ReturnType<StorageIdb['toDbTrx']> | undefined
+    try {
+      return await getSyncChunk(this, args, async (name, page) => {
+        trx ??= this.toDbTrx(Object.values(syncIdbStores), 'readonly')
+        return await readSyncItemsIdb(this, name, { ...page, trx })
+      })
+    } finally {
+      if (trx != null) await trx.done
+    }
   }
 
   async getProvenTxReqsForUser(args: FindForUserSincePagedArgs): Promise<TableProvenTxReq[]> {

@@ -80,6 +80,54 @@ describe('compact sync checkpoints', () => {
     }
   })
 
+  test.each([
+    ['upload', 100, 128],
+    ['download', 100, 128],
+    ['upload', 20000, 16],
+    ['download', 20000, 16]
+  ] as const)('%s sizes pages by write work despite slow source scans (%i ms writes)', async (direction, writeMs, expected) => {
+    const reader = await makeStorage()
+    const writer = await makeStorage()
+    const identityKey = PrivateKey.fromRandom().toPublicKey().toString()
+    const manager = new WalletStorageManager(identityKey, direction === 'upload' ? reader : writer)
+    const restores: Array<() => void> = []
+    try {
+      await manager.makeAvailable()
+      const { user } = await reader.findOrInsertUser(identityKey)
+      for (let i = 0; i < 200; i++) await reader.findOrInsertTxLabel(user.userId, `budget label ${i}`)
+      let clock = Date.now()
+      const now = jest.spyOn(Date, 'now').mockImplementation(() => clock)
+      restores.push(() => now.mockRestore())
+      const read = reader.getSyncChunk.bind(reader)
+      const requested: number[] = []
+      const readSpy = jest.spyOn(reader, 'getSyncChunk').mockImplementation(async args => {
+        requested.push(args.maxItems)
+        const chunk = await read(args)
+        clock += 30000 // Database time before the write RPC starts.
+        return chunk
+      })
+      restores.push(() => readSpy.mockRestore())
+      const write = writer.processSyncChunk.bind(writer)
+      const writeSpy = jest.spyOn(writer, 'processSyncChunk').mockImplementation(async (args, chunk) => {
+        const result = await write(args, chunk)
+        clock += writeMs
+        return result
+      })
+      restores.push(() => writeSpy.mockRestore())
+      if (direction === 'upload') await manager.syncToWriter({ identityKey }, writer)
+      else await manager.syncFromReader(identityKey, reader)
+      expect(requested.slice(0, 2)).toEqual([64, expected])
+      const { user: target } = await writer.findOrInsertUser(identityKey)
+      expect(await writer.countTxLabels({ partial: { userId: target.userId } })).toBe(200)
+    } finally {
+      for (const restore of restores.reverse()) restore()
+      await reader.destroy()
+      await writer.destroy()
+      await reader.dropAllData()
+      await writer.dropAllData()
+    }
+  })
+
   test('syncs every page, reuses committed progress, and performs a no-change resync', async () => {
     const reader = await makeStorage()
     const writer = await makeStorage()
