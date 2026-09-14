@@ -77,12 +77,15 @@ export function overlayAdmissionContextDigest(offChainValues?: number[]): string
 }
 
 export function overlayAdmissionOperationId(
-  mode: OverlayAdmissionMode,
+  _mode: OverlayAdmissionMode,
   txid: string,
   topics: string[]
 ): string {
   const topicKey = [...topics].sort((a, b) => a.localeCompare(b, 'en')).join('\n')
-  const raw = `submit:${mode}:${txid}:${topicKey}`
+  // Historical GASP replay and a later live retry represent the same
+  // transaction admission. Keep their id stable so the durable admission
+  // record is replayed instead of being submitted a second time.
+  const raw = `submit:${txid}:${topicKey}`
   if (Buffer.byteLength(raw, 'utf8') <= 512 && raw.isWellFormed()) return raw
   return `submit:${createHash('sha256').update(raw, 'utf8').digest('hex')}`
 }

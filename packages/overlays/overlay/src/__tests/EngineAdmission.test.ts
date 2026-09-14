@@ -126,7 +126,7 @@ describe('Engine overlay admission helpers', () => {
 
   test('operation ids stay raw when short and hash when oversized or ill-formed', () => {
     const short = overlayAdmissionOperationId('live', exampleTxid, ['Hello'])
-    expect(short).toBe(`submit:live:${exampleTxid}:Hello`)
+    expect(short).toBe(`submit:${exampleTxid}:Hello`)
     const hashed = overlayAdmissionOperationId('historical', exampleTxid, ['t'.repeat(600)])
     expect(hashed.startsWith('submit:')).toBe(true)
     expect(hashed).not.toContain('t'.repeat(600))

@@ -181,6 +181,9 @@ export class MongoOverlayStorage implements Storage {
       txid,
       outputIndex: encodeMongoOutputIndex(String(outputIndex))
     }
+    // Evicted outputs remain for audit/history but must never be exposed as
+    // current overlay state.
+    filter.state = { $ne: 'evicted' }
     if (topic !== undefined) filter.topic = topic
     if (spent === true) filter.state = 'spent'
     if (spent === false) filter.state = 'unspent'
@@ -201,7 +204,8 @@ export class MongoOverlayStorage implements Storage {
         network: this.admissionScope.network,
         genesisHash: this.admissionScope.genesisHash,
         nodeId: this.admissionScope.nodeId,
-        txid
+        txid,
+        state: { $ne: 'evicted' }
       })
       .toArray()
     return await Promise.all(
