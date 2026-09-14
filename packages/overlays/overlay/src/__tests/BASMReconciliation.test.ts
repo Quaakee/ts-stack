@@ -452,7 +452,7 @@ describe('BASM reconciliation evidence binding', () => {
     f.submit.mockRestore()
 
     await expect(f.engine.submit({ beef, topics: [topic] }, undefined, 'historical-tx')).resolves.toEqual({
-      [topic]: { outputsToAdmit: [0], coinsToRetain: [] }
+      [topic]: { outputsToAdmit: [0], coinsToRetain: [], coinsRemoved: [] }
     })
     expect(manager.identifyAdmissibleOutputs).toHaveBeenCalledWith(beef, [], undefined, 'historical-tx')
     expect(f.storage.insertAppliedTransaction).toHaveBeenCalledWith(
