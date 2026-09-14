@@ -13,6 +13,14 @@ Use this package in:
 
 For Node servers, use [`@bsv/wallet-toolbox`](https://www.npmjs.com/package/@bsv/wallet-toolbox). For React Native / mobile, use [`@bsv/wallet-toolbox-mobile`](https://www.npmjs.com/package/@bsv/wallet-toolbox-mobile).
 
+## Large wallet records
+
+Compatible providers negotiate authenticated, integrity-checked transfers for
+records that exceed a single HTTP message. Uploads resume saved pieces after
+interruption; ordinary pages and legacy providers retain their existing protocol.
+Version 1 is bounded to 64 MiB per frame and requires an upgraded provider.
+See the [transfer and migration guide](../docs/sync-transfer.md).
+
 ## Install
 
 Install the `@bsv/sdk` peer dependency alongside this package:
@@ -74,7 +82,7 @@ const { tx } = await wallet.createAction({
 
 ### BRC-100 wallet inside a browser extension
 
-Talk to a remote `StorageServer` over HTTP, sign locally with a key the user controls.
+Talk to a remote `StorageServer` over HTTPS, sign locally with a key the user controls.
 
 ### Authenticated app with `WalletClient`
 
@@ -116,6 +124,21 @@ older server. See [the full expiry guide](../docs/no-send-expiry.md).
 
 The browser entry includes `Wallet`, `WalletSigner`, `WalletStorageManager`, `StorageClient`, `StorageIdb`, `Services`, `Monitor`, `WalletPermissionsManager`, `WalletSettingsManager`, and related browser-safe APIs. It does not promise every full-package or test-only export.
 
+## Wallet snapshot security
+
+Wallet-manager snapshots contain root key material and intentionally include
+the decryption key needed by their self-contained format, so access to the
+snapshot is access to the wallet. Store the complete snapshot only through a browser or
+extension facility backed by an OS Keychain or comparably trusted secret store.
+Do not use ordinary localStorage, logs, analytics, crash reports, clipboard
+data, or unprotected synchronization. Treat any snapshot that leaves trusted
+storage as a wallet-credential compromise and rotate the affected wallet.
+
+`StorageClient` and credential-bearing Arcade SSE clients require HTTPS for
+remote endpoints. Plain HTTP is accepted only for explicit loopback hosts such
+as `localhost` during development. SSE dependency debug logging is disabled so
+callback tokens and authorization headers do not reach application logs.
+
 See the [`@bsv/wallet-toolbox`](https://www.npmjs.com/package/@bsv/wallet-toolbox) README for full documentation.
 
 ## CORS, CSP, and public services
@@ -142,3 +165,12 @@ This package is released under the [Open BSV License Version 6](./LICENSE.txt).
 The accompanying [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) and
 [LICENSES/](./LICENSES/) preserve earlier Open BSV grants compiled into the
 browser build.
+
+### Local sync database upgrade
+
+IndexedDB automatically upgrades to schema version 6, adding a non-unique
+transaction-ID/user index without replacing wallet records. Exact transaction,
+reference, reclaim, commission, and relation lookups avoid repeated full-wallet
+scans during restores. Legacy duplicate transaction IDs remain intact. Clients
+that request an older IndexedDB schema version cannot reopen this database;
+retain a compatible client when using the local backup.

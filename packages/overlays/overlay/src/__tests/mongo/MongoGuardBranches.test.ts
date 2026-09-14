@@ -357,7 +357,7 @@ describe('Mongo payload store input and operation guards', () => {
       findOne: jest.fn()
     }
     const payloads = {
-      updateOne: jest.fn(async () => ({ matchedCount: 0 }))
+      updateOne: jest.fn(async () => ({ matchedCount: 1 }))
     }
     const db = {
       collection: (name: string) => (name.includes('reference') ? refs : payloads)
@@ -378,6 +378,7 @@ describe('Mongo payload store input and operation guards', () => {
       'already names different content'
     )
     refs.findOne.mockResolvedValueOnce(null)
+    payloads.updateOne.mockResolvedValueOnce({ matchedCount: 0 })
     await expect(store.addReference(session, reference)).rejects.toThrow('not ready for reference')
   })
 
