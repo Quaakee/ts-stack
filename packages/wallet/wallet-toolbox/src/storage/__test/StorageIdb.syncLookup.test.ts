@@ -199,7 +199,7 @@ describe('IndexedDB sync identity lookups', () => {
     for (const row of rows) await old.put('transactions', row)
     old.close()
     try {
-      expect(await writer.migrate('Synthetic version 5 wallet', identity)).toBe('6')
+      expect(await writer.migrate('Synthetic version 5 wallet', identity)).toBe('7')
       expect(await writer.db!.getAll('transactions')).toEqual(rows)
       expect((await writer.findTransactions({
         partial: { userId: 1, txid: targetTxid }, noRawTx: true

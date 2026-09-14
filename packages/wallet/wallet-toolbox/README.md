@@ -12,7 +12,8 @@ The **2.14.0 candidate** adds authenticated raw binary HTTP for wallet sync:
 
 - **About 25% fewer HTTP body bytes** than base64 JSON in a synthetic large-record backup/restore comparison.
 - **Bounded 256 KiB parts**, integrity checks, resumable uploads and checkpoint recovery after interrupted acknowledgements.
-- **Legacy compatibility**, with no additional database migration from 2.13.0.
+- **Faster local source reads**, selecting keys before loading transaction and proof bytes.
+- **Legacy provider compatibility**, with no additional server database migration from 2.13.0.
 
 Synthetic authenticated HTTP tests cover large records, added latency, interrupted
 uploads, restart recovery, lost acknowledgements, corruption rejection and repeat
@@ -103,7 +104,7 @@ parts. Older providers continue using JSON, with transient read failures recover
 through their advertised transfer support. Providers can also set
 `syncTransferInlineBytes` for a smaller legacy JSON ceiling. Rollout controls and
 remaining size limits are documented in the [transfer guide](./docs/sync-transfer.md).
-No new migration is needed from 2.13.0. Ambiguous writes are never blindly retried;
+No new server migration is needed from 2.13.0. Ambiguous writes are never blindly retried;
 resumption rereads the saved checkpoint.
 
 Records exceeding the negotiated 64 MiB frame limit fail safely
@@ -135,7 +136,16 @@ serialized RPC response exceeds the service ceiling, remote clients retry the
 read-only request with a smaller chunk budget and remember the working limit
 for the rest of the session.
 
-IndexedDB schema version 6 adds a non-unique transaction-ID/user index. Sync
+IndexedDB schema version 7 adds timestamp and ownership indexes for local sync
+sources. Sync reads select keys, preserve primary-key ordering and inclusive
+timestamps, then load only the selected page's values. Ownership queries are
+batched at 128 requests; temporary key metadata still scales with wallet size.
+This avoids repeatedly loading earlier binary records while advancing a copy.
+Indexes backfill automatically and preserve stored bytes, tombstones and duplicate
+transaction IDs. Clients requesting schema version 6 or earlier cannot reopen an
+upgraded copy; retain a version-7-compatible client for local data.
+
+The earlier IndexedDB schema version 6 adds a non-unique transaction-ID/user index. Sync
 identity lookups, commissions, and relation maps use selective indexes or exact
 keys instead of scanning the growing wallet for each row. Proof batch checks
 resolve requested transaction IDs through the existing index, preserving primary-key

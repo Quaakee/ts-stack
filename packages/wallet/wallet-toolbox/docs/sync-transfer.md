@@ -46,6 +46,14 @@ silently resent using another transport. The new route does not require a new
 migration beyond the transfer tables already introduced in 2.13.0; rolling back
 from this release to 2.13.0 preserves those tables and committed wallet data.
 
+Local IndexedDB copies separately upgrade automatically to schema 7. Timestamp
+and ownership indexes let the source select keys before materializing a page,
+without repeatedly loading preceding transaction/proof bytes. Key metadata scales
+with the wallet; ownership queries have at most 128 requests in flight. The
+upgrade preserves existing records and duplicate transaction IDs. A retained copy
+requires a schema-7-compatible client afterward; older clients cannot open it.
+This local index upgrade adds no SQLite/MySQL wallet migration.
+
 Version 1 accepts frames up to 64 MiB. With older peers, parts are carried by the
 existing authenticated binary-JSON codec. The frame itself stores binary fields
 directly, avoiding a second base64 encoding. The server
@@ -170,12 +178,19 @@ recorded artifacts, raw growth is 1,725 bytes (Vite), 1,521 (esbuild), 1,692
 is added. Only exceeded raw/Brotli ceilings advance; existing gzip allowances
 remain. Hermes compression varies slightly with build paths.
 
+The subsequent IndexedDB source paging and customization guard add 3,656 Vite
+and 2,864 esbuild raw bytes relative to the initial raw-transport candidate. Only
+these two raw ceilings increase again; gzip and Brotli limits remain unchanged.
+A native large-wallet sample returned the identical 64-record page in 270 ms
+versus 5,539 ms through the original reader. This is one source-query comparison,
+not whole-wallet throughput evidence.
+
 | Artifact | Raw | Gzip | Brotli | Raw ceiling | Gzip ceiling | Brotli ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vite | 1,717,875 | 405,424 | 317,213 | 1,719,000 | 406,500 | 318,000 |
-| esbuild | 1,340,321 | 368,546 | 296,088 | 1,341,500 | 369,500 | 297,000 |
-| Metro | 1,768,705 | 449,402 | 348,240 | 1,770,000 | 455,000 | 360,000 |
-| Hermes | 3,589,527 | 1,441,377 | 1,133,706 | 3,591,000 | 1,460,500 | 1,135,000 |
+| Vite | 1,721,531 | 406,481 | 317,824 | 1,722,000 | 406,500 | 318,000 |
+| esbuild | 1,343,185 | 369,423 | 296,675 | 1,344,000 | 369,500 | 297,000 |
+| Metro | 1,768,739 | 449,430 | 348,088 | 1,770,000 | 455,000 | 360,000 |
+| Hermes | 3,589,715 | 1,441,493 | 1,133,833 | 3,591,000 | 1,460,500 | 1,135,000 |
 
 Before upstream integration, Linux CI measured Vite gzip at 404,970 and Hermes
 gzip at 1,457,902, above the corresponding macOS measurements. The combined

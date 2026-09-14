@@ -46,6 +46,8 @@ import { listActionsIdb } from './methods/listActionsIdb'
 import { listOutputsIdb } from './methods/listOutputsIdb'
 import { reviewStatusIdb } from './methods/reviewStatusIdb'
 import { purgeDataIdb } from './methods/purgeDataIdb'
+import { getSyncChunk } from './methods/getSyncChunk'
+import { readSyncItemsIdb, syncIdbStores } from './methods/readSyncItemsIdb'
 import {
   AuthId,
   FindCertificateFieldsArgs,
@@ -65,6 +67,8 @@ import {
   FindTxLabelsArgs,
   FindUsersArgs,
   ProvenOrRawTx,
+  RequestSyncChunkArgs,
+  SyncChunk,
   PurgeParams,
   PurgeResults,
   TrxToken,
@@ -219,11 +223,22 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
   async initDB(storageName?: string, storageIdentityKey?: string): Promise<IDBPDatabase<StorageIdbSchema>> {
     const chain = this.chain
     const maxOutputScript = 1024
-    const db = await openDB<StorageIdbSchema>(this.dbName, 6, {
+    const db = await openDB<StorageIdbSchema>(this.dbName, 7, {
       upgrade(db, _oldVersion, _newVersion, transaction) {
         upgradeAllStoresV1(db)
         upgradeActionBatchStoresV2(db)
         const transactions = transaction.objectStore('transactions')
+        if (!transactions.indexNames.contains('provenTxId_userId')) {
+          transactions.createIndex('provenTxId_userId', ['provenTxId', 'userId'])
+        }
+        const requests = transaction.objectStore('proven_tx_reqs')
+        if (!requests.indexNames.contains('provenTxReqId_txid')) {
+          requests.createIndex('provenTxReqId_txid', ['provenTxReqId', 'txid'])
+        }
+        for (const storeName of Object.values(syncIdbStores)) {
+          const store = transaction.objectStore(storeName)
+          if (!store.indexNames.contains('updated_at')) store.createIndex('updated_at', 'updated_at')
+        }
         if (!transactions.indexNames.contains('txid_userId')) {
           transactions.createIndex('txid_userId', ['txid', 'userId'])
         }
@@ -2260,6 +2275,36 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
       args.userId
     )
     return results
+  }
+
+  override async getSyncChunk(args: RequestSyncChunkArgs): Promise<SyncChunk> {
+    // Preserve custom reader/filter behavior in subclasses and instance wrappers.
+    // Only the unmodified built-in reader may select directly from its indexes.
+    const entities = [
+      'ProvenTxs',
+      'ProvenTxReqs',
+      'OutputBaskets',
+      'OutputTags',
+      'TxLabels',
+      'Transactions',
+      'Outputs',
+      'TxLabelMaps',
+      'OutputTagMaps',
+      'Certificates',
+      'CertificateFields',
+      'Commissions'
+    ]
+    if (
+      Object.getPrototypeOf(this) !== StorageIdb.prototype ||
+      entities.some(entity =>
+        ['find', 'filter', 'get'].some(prefix =>
+          Object.hasOwn(this, prefix + entity + (prefix === 'get' ? 'ForUser' : ''))
+        )
+      )
+    ) {
+      return await super.getSyncChunk(args)
+    }
+    return await getSyncChunk(this, args, async (name, page) => await readSyncItemsIdb(this, name, page))
   }
 
   async getProvenTxReqsForUser(args: FindForUserSincePagedArgs): Promise<TableProvenTxReq[]> {

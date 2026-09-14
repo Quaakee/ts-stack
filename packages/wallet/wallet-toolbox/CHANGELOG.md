@@ -6,6 +6,8 @@ attention to changes that materially alter behavior or extend functionality.
 
 ## wallet-toolbox (unreleased)
 
+- IndexedDB source sync selects keys before loading binary-bearing records; schema 7 backfills timestamp and ownership indexes without changing wallet rows. Retained copies require a schema-7-compatible client.
+
 - Add negotiated raw binary HTTP sync, shared across full, browser and mobile
   clients, for ordinary pages and bounded resumable parts. Preserve BRC-103
   authentication, provider pricing, integrity verification and atomic checkpoints.

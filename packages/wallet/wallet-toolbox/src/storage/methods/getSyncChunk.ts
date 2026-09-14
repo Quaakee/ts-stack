@@ -60,7 +60,11 @@ function appendSyncItems(chunker: ChunkerArgs, items: any[], offset: number, ite
  * @param args
  * @returns
  */
-export async function getSyncChunk(storage: StorageReader, args: RequestSyncChunkArgs): Promise<SyncChunk> {
+export async function getSyncChunk(
+  storage: StorageReader,
+  args: RequestSyncChunkArgs,
+  readItems?: (name: string, args: FindForUserSincePagedArgs) => Promise<any[]>
+): Promise<SyncChunk> {
   const r: SyncChunk = {
     fromStorageIdentityKey: args.fromStorageIdentityKey,
     toStorageIdentityKey: args.toStorageIdentityKey,
@@ -287,11 +291,12 @@ export async function getSyncChunk(storage: StorageReader, args: RequestSyncChun
     )
     while (!done) {
       if (limit <= 0) break
-      const items = await a.findItems(storage, {
+      const findArgs = {
         userId: user.userId,
         since: args.since,
         paged: { limit, offset }
-      })
+      }
+      const items = readItems == null ? await a.findItems(storage, findArgs) : await readItems(a.name, findArgs)
       checkEntityValues(items)
       if (!preAddCalled) {
         a.preAdd()

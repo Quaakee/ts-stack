@@ -48,6 +48,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableCertificate
     indexes: {
+      updated_at: Date
       userId: number
       userId_type_certifier_serialNumber: [number, Base64String, PubKeyHex, Base64String]
     }
@@ -56,6 +57,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableCertificateField
     indexes: {
+      updated_at: Date
       userId: number
       certificateId: number
     }
@@ -64,6 +66,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableCommission
     indexes: {
+      updated_at: Date
       userId: number
       transactionId: number
     }
@@ -76,6 +79,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableOutput
     indexes: {
+      updated_at: Date
       userId: number
       userId_basketId: [number, number]
       txid_vout_userId: [string, number, number]
@@ -89,6 +93,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableOutputBasket
     indexes: {
+      updated_at: Date
       userId: number
       name_userId: [string, number]
     }
@@ -97,6 +102,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableOutputTag
     indexes: {
+      updated_at: Date
       userId: number
       tag_userId: [string, number]
     }
@@ -105,6 +111,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableOutputTagMap
     indexes: {
+      updated_at: Date
       outputTagId: number
       outputId: number
     }
@@ -113,6 +120,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableProvenTx
     indexes: {
+      updated_at: Date
       txid: HexString
     }
   }
@@ -120,8 +128,10 @@ export interface StorageIdbSchema {
     key: number
     value: TableProvenTxReq
     indexes: {
+      updated_at: Date
       provenTxId: number
       txid: HexString
+      provenTxReqId_txid: [number, string]
       status: ProvenTxReqStatus
       batch: string
     }
@@ -144,9 +154,11 @@ export interface StorageIdbSchema {
     key: number
     value: TableTransaction
     indexes: {
+      updated_at: Date
       userId: number
       txid_userId: [string, number]
       provenTxId: number
+      provenTxId_userId: [number, number]
       reference: string
       status: TransactionStatus
       noSendExpiryState: string
@@ -157,6 +169,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableTxLabel
     indexes: {
+      updated_at: Date
       userId: number
       label_userId: [string, number]
     }
@@ -165,6 +178,7 @@ export interface StorageIdbSchema {
     key: number
     value: TableTxLabelMap
     indexes: {
+      updated_at: Date
       transactionId: number
       txLabelId: number
     }
