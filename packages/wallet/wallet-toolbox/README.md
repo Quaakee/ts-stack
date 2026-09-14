@@ -16,8 +16,10 @@ The **2.14.0 candidate** adds authenticated raw binary HTTP for wallet sync:
 
 Synthetic authenticated HTTP tests cover large records, added latency, interrupted
 uploads, restart recovery, lost acknowledgements, corruption rejection and repeat
-sync. Fresh native E2E validation of this raw transport is pending. Earlier large-wallet
-E2E results below describe previous implementations; see [methods and limits](#sync-performance-and-recovery).
+sync. An initial native macOS raw-transport readback completed a large wallet
+(over 130,000 records across all 12 data categories). Full native validation of
+the tuned 1 MiB inline setting remains in progress. Earlier large-wallet E2E
+results below describe previous implementations; see [methods and limits](#sync-performance-and-recovery).
 
 ## Overview
 
