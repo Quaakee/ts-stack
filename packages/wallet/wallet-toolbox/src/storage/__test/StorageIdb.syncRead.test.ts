@@ -28,123 +28,149 @@ async function seed(storage: StorageIdb): Promise<void> {
     const userId = id === 2 ? 2 : 1
     const time = { created_at: oldTime, updated_at: id === 1 ? new Date('2026-01-03') : id === 3 ? since : oldTime }
     const actualTxid = txid(id === 4 ? 3 : id)
-    await trx
-      .objectStore('transactions')
-      .put({
-        ...time,
-        transactionId: id,
-        userId,
-        provenTxId: id === 4 ? 3 : id,
-        txid: actualTxid,
-        reference: `ref-${id}`,
-        status: 'completed',
-        isOutgoing: true,
-        satoshis: 0,
-        description: '',
-        rawTx: [1, 2, id]
-      })
-    await trx
-      .objectStore('proven_txs')
-      .put({
-        ...time,
-        provenTxId: id,
-        txid: txid(id),
-        height: id,
-        index: 0,
-        rawTx: [1, 2, id],
-        merklePath: [3, 4, id],
-        blockHash: 'ab'.repeat(32),
-        merkleRoot: 'cd'.repeat(32)
-      })
-    await trx
-      .objectStore('proven_tx_reqs')
-      .put({
-        ...time,
-        provenTxReqId: id,
-        txid: txid(id),
-        status: 'completed',
-        attempts: 0,
-        notified: false,
-        history: '{}',
-        notify: '{}',
-        rawTx: [5, 6, id],
-        inputBEEF: [7, 8, id]
-      })
-    await trx
-      .objectStore('output_baskets')
-      .put({
-        ...time,
-        basketId: id,
-        userId,
-        name: `basket-${id}`,
-        isDeleted: id === 3,
-        numberOfDesiredUTXOs: 0,
-        minimumDesiredUTXOValue: 0
-      })
+    await trx.objectStore('transactions').put({
+      ...time,
+      transactionId: id,
+      userId,
+      provenTxId: id === 4 ? 3 : id,
+      txid: actualTxid,
+      reference: `ref-${id}`,
+      status: 'completed',
+      isOutgoing: true,
+      satoshis: 0,
+      description: '',
+      rawTx: [1, 2, id]
+    })
+    await trx.objectStore('proven_txs').put({
+      ...time,
+      provenTxId: id,
+      txid: txid(id),
+      height: id,
+      index: 0,
+      rawTx: [1, 2, id],
+      merklePath: [3, 4, id],
+      blockHash: 'ab'.repeat(32),
+      merkleRoot: 'cd'.repeat(32)
+    })
+    await trx.objectStore('proven_tx_reqs').put({
+      ...time,
+      provenTxReqId: id,
+      txid: txid(id),
+      status: 'completed',
+      attempts: 0,
+      notified: false,
+      history: '{}',
+      notify: '{}',
+      rawTx: [5, 6, id],
+      inputBEEF: [7, 8, id]
+    })
+    await trx.objectStore('output_baskets').put({
+      ...time,
+      basketId: id,
+      userId,
+      name: `basket-${id}`,
+      isDeleted: id === 3,
+      numberOfDesiredUTXOs: 0,
+      minimumDesiredUTXOValue: 0
+    })
     await trx
       .objectStore('output_tags')
       .put({ ...time, outputTagId: id, userId, tag: `tag-${id}`, isDeleted: id === 3 })
     await trx
       .objectStore('tx_labels')
       .put({ ...time, txLabelId: id, userId, label: `label-${id}`, isDeleted: id === 3 })
-    await trx
-      .objectStore('outputs')
-      .put({
-        ...time,
-        outputId: id,
-        userId,
-        transactionId: id,
-        basketId: id,
-        vout: id,
-        txid: actualTxid,
-        spendable: true,
-        change: false,
-        satoshis: 0,
-        type: 'P2PKH',
-        providedBy: 'you',
-        purpose: '',
-        outputDescription: '',
-        lockingScript: [81]
-      })
+    await trx.objectStore('outputs').put({
+      ...time,
+      outputId: id,
+      userId,
+      transactionId: id,
+      basketId: id,
+      vout: id,
+      txid: actualTxid,
+      spendable: true,
+      change: false,
+      satoshis: 0,
+      type: 'P2PKH',
+      providedBy: 'you',
+      purpose: '',
+      outputDescription: '',
+      lockingScript: [81]
+    })
     await trx.objectStore('tx_labels_map').put({ ...time, txLabelId: id, transactionId: 1, isDeleted: id === 3 })
     await trx.objectStore('output_tags_map').put({ ...time, outputTagId: id, outputId: 1, isDeleted: id === 3 })
-    await trx
-      .objectStore('certificates')
-      .put({
-        ...time,
-        certificateId: id,
-        userId,
-        type: `type-${id}`,
-        serialNumber: `serial-${id}`,
-        certifier: peer,
-        subject: owner,
-        revocationOutpoint: '00'.repeat(32) + '.0',
-        signature: '00',
-        isDeleted: id === 3
-      })
+    await trx.objectStore('certificates').put({
+      ...time,
+      certificateId: id,
+      userId,
+      type: `type-${id}`,
+      serialNumber: `serial-${id}`,
+      certifier: peer,
+      subject: owner,
+      revocationOutpoint: '00'.repeat(32) + '.0',
+      signature: '00',
+      isDeleted: id === 3
+    })
     await trx
       .objectStore('certificate_fields')
       .put({ ...time, certificateId: id, userId, fieldName: 'a', fieldValue: 'value', masterKey: 'key' })
     await trx
       .objectStore('certificate_fields')
       .put({ ...time, certificateId: id, userId, fieldName: 'b', fieldValue: 'value', masterKey: 'key' })
-    await trx
-      .objectStore('commissions')
-      .put({
-        ...time,
-        commissionId: id,
-        userId,
-        transactionId: id,
-        satoshis: 0,
-        keyOffset: 'offset',
-        isRedeemed: false,
-        lockingScript: [81]
-      })
+    await trx.objectStore('commissions').put({
+      ...time,
+      commissionId: id,
+      userId,
+      transactionId: id,
+      satoshis: 0,
+      keyOffset: 'offset',
+      isRedeemed: false,
+      lockingScript: [81]
+    })
   }
   await trx.done
 }
 
 describe('IndexedDB source sync paging', () => {
+  test.each(['provenTx', 'provenTxReq'])('does not join exhausted %s keys and sees later additions', async name => {
+    const storage = makeStorage()
+    try {
+      await seed(storage)
+      const args = { userId: 1, paged: { offset: 4, limit: 16 } }
+      const ownership = jest.spyOn(IDBIndex.prototype, 'getKey')
+      const cursors = jest.spyOn(IDBIndex.prototype, 'openKeyCursor')
+      try {
+        expect(await readSyncItemsIdb(storage, name, args)).toEqual([])
+        expect(ownership).not.toHaveBeenCalled()
+        expect(cursors).not.toHaveBeenCalled()
+      } finally {
+        ownership.mockRestore()
+        cursors.mockRestore()
+      }
+      // The shortcut is a bound on this read, never a remembered end-of-table.
+      await storage.updateTransaction(2, { userId: 1 })
+      await storage.updateTransaction(4, { provenTxId: 4, txid: txid(4) })
+      const storeName = syncIdbStores[name]
+      const idField = name === 'provenTx' ? 'provenTxId' : 'provenTxReqId'
+      const trx = storage.db!.transaction(['transactions', storeName], 'readwrite')
+      const firstTransaction = await trx.objectStore('transactions').get(1)
+      await trx.objectStore('transactions').put({
+        ...firstTransaction!,
+        transactionId: 5,
+        provenTxId: 5,
+        txid: txid(5),
+        reference: 'later'
+      })
+      const store = trx.objectStore(storeName)
+      await store.put({ ...(await store.get(1)), [idField]: 5, txid: txid(5) })
+      await trx.done
+      const rows = await readSyncItemsIdb(storage, name, args)
+      expect(rows.map(row => row[idField])).toEqual([5])
+    } finally {
+      await storage.destroy()
+      await deleteDB(storage.dbName)
+    }
+  })
+
   test.each(['instance', 'subclass'])('preserves %s reader customizations', async kind => {
     class CustomStorage extends StorageIdb {
       override async getProvenTxsForUser(): Promise<[]> {
@@ -235,19 +261,17 @@ describe('IndexedDB source sync paging', () => {
       const trx = storage.db!.transaction(['proven_txs', 'transactions'], 'readwrite')
       for (let id = 1; id <= 1000; id++) {
         const timestamps = { created_at: oldTime, updated_at: since }
-        await trx
-          .objectStore('proven_txs')
-          .put({
-            ...timestamps,
-            provenTxId: id,
-            txid: txid(id),
-            height: id,
-            index: 0,
-            rawTx: Array.from({ length: 256 }, () => id % 256),
-            merklePath: [1],
-            blockHash: 'ab'.repeat(32),
-            merkleRoot: 'cd'.repeat(32)
-          })
+        await trx.objectStore('proven_txs').put({
+          ...timestamps,
+          provenTxId: id,
+          txid: txid(id),
+          height: id,
+          index: 0,
+          rawTx: Array.from({ length: 256 }, () => id % 256),
+          merklePath: [1],
+          blockHash: 'ab'.repeat(32),
+          merkleRoot: 'cd'.repeat(32)
+        })
         for (let duplicate = 0; duplicate < 2; duplicate++)
           await trx.objectStore('transactions').put({
             ...timestamps,

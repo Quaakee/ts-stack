@@ -7,6 +7,14 @@ pages continue to use `getSyncChunk` and `processSyncChunk`.
 
 ## Negotiation and limits
 
+For HTTP/1.1 reverse proxies, keep the proxy's idle connection reuse shorter
+than the server's five-second keep-alive timeout. For example, a Caddy upstream
+transport can use `keepalive 2s`. Caddy documents that a longer proxy timeout can
+cause connection resets and HTTP 502 responses for POST requests; successful
+GET health checks do not rule this out. Fix the connection lifetime mismatch
+rather than enabling unconditional write retries. See the
+[Caddy transport documentation](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport).
+
 A migrated Knex-backed `StorageServer` advertises `syncTransfer` in runtime
 settings: `{ version: 1, maxBytes, partBytes, inlineBytes, binaryTransport? }`.
 `binaryTransport: { version: 1, inlineBytes }` advertises raw HTTP sync. These are
@@ -178,8 +186,8 @@ recorded artifacts, raw growth is 1,725 bytes (Vite), 1,521 (esbuild), 1,692
 is added. Only exceeded raw/Brotli ceilings advance; existing gzip allowances
 remain. Hermes compression varies slightly with build paths.
 
-The subsequent IndexedDB source paging and customization guard add 3,656 Vite
-and 2,864 esbuild raw bytes relative to the initial raw-transport candidate. Only
+The subsequent IndexedDB source paging and customization guard add 3,727 Vite
+and 2,915 esbuild raw bytes relative to the initial raw-transport candidate. Only
 these two raw ceilings increase again; gzip and Brotli limits remain unchanged.
 A native large-wallet sample returned the identical 64-record page in 270 ms
 versus 5,539 ms through the original reader. This is one source-query comparison,
@@ -187,8 +195,8 @@ not whole-wallet throughput evidence.
 
 | Artifact | Raw | Gzip | Brotli | Raw ceiling | Gzip ceiling | Brotli ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vite | 1,721,531 | 406,481 | 317,824 | 1,722,000 | 406,500 | 318,000 |
-| esbuild | 1,343,185 | 369,423 | 296,675 | 1,344,000 | 369,500 | 297,000 |
+| Vite | 1,721,602 | 406,496 | 317,914 | 1,722,000 | 406,500 | 318,000 |
+| esbuild | 1,343,236 | 369,437 | 296,723 | 1,344,000 | 369,500 | 297,000 |
 | Metro | 1,768,739 | 449,430 | 348,088 | 1,770,000 | 455,000 | 360,000 |
 | Hermes | 3,589,715 | 1,441,493 | 1,133,833 | 3,591,000 | 1,460,500 | 1,135,000 |
 

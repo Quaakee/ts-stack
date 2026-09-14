@@ -141,6 +141,7 @@ sources. Sync reads select keys, preserve primary-key ordering and inclusive
 timestamps, then load only the selected page's values. Ownership queries are
 batched at 128 requests; temporary key metadata still scales with wallet size.
 This avoids repeatedly loading earlier binary records while advancing a copy.
+Already exhausted key ranges skip ownership joins; later writes remain visible.
 Indexes backfill automatically and preserve stored bytes, tombstones and duplicate
 transaction IDs. Clients requesting schema version 6 or earlier cannot reopen an
 upgraded copy; retain a version-7-compatible client for local data.

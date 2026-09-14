@@ -65,6 +65,12 @@ export async function readSyncItemsIdb(
       args.since == null
         ? await store.getAllKeys()
         : await store.index('updated_at').getAllKeys(IDBKeyRange.lowerBound(args.since))
+    // Ownership can only remove keys. An exhausted upper bound needs no joins,
+    // including when earlier entities are revisited on every later sync page.
+    if (offset >= keys.length) {
+      if (args.trx == null) await trx.done
+      return []
+    }
     // Timestamp index traversal is not BRC-40 primary-key order.
     if (args.since != null) keys.sort((a, b) => indexedDB.cmp(a, b))
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
