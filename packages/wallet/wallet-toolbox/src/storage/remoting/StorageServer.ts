@@ -1,7 +1,7 @@
 import { StorageKnex } from '../StorageKnex'
 import { KnexSyncTransferStore } from './KnexSyncTransferStore'
 import { decodeSyncTransfer, encodeSyncTransfer, syncTransferDigest,
-  SYNC_TRANSFER_MAX_BYTES, SYNC_TRANSFER_PART_BYTES } from './SyncTransfer'
+  SYNC_TRANSFER_MAX_BYTES, SYNC_TRANSFER_PART_BYTES, isBinarySyncMethod, SYNC_BINARY_PATH, SYNC_BINARY_CONTENT_TYPE, SYNC_BINARY_ENCODING, SYNC_BINARY_HEADER } from './SyncTransfer'
 import { syncChunkBinary } from './syncChunkBinary'
 /**
  * StorageServer.ts
@@ -246,9 +246,15 @@ export interface WalletStorageServerOptions {
   maxRpcResponseBytes?: number
   /** Disable the additive durable transfer transport during a mixed-version rollout. Knex only. */
   syncTransfers?: boolean
+  /** Optional inline sync JSON ceiling (at least 1024 bytes), clamped to the HTTP limits. */
+  syncTransferInlineBytes?: number
+  /** Advertise raw sync HTTP only after every replica serves the new endpoint (default true). */
+  syncBinaryTransport?: boolean
   /** Durable BRC-105 replay claims for monetized multi-replica deployments. */
   paymentReplayStore?: PaymentReplayStore
 }
+
+type RpcEncoding = boolean | 'binary-sync'
 
 export class StorageServer {
   private readonly syncTransfers?: KnexSyncTransferStore
@@ -356,14 +362,24 @@ export class StorageServer {
     const jsonBodyLimit = readBodyLimitBytes('WALLET_STORAGE_JSON', profileValue(profile, {
       small: 2 * 1024 * 1024, standard: 8 * 1024 * 1024, highThroughput: 32 * 1024 * 1024
     }))
+    const binaryBodyLimit = readBodyLimitBytes('WALLET_STORAGE_BINARY', 8 * 1024 * 1024)
+    const binarySync = options.syncBinaryTransport !== false && binaryBodyLimit >= 4096
+    const inlineSyncLimit = options.syncTransferInlineBytes ?? 6 * 1024 * 1024
+    if (!Number.isSafeInteger(inlineSyncLimit) || inlineSyncLimit < 1024 || inlineSyncLimit > SYNC_TRANSFER_MAX_BYTES) {
+      throw new RangeError('syncTransferInlineBytes must be an integer from 1024 to 67108864')
+    }
     // Keep legacy configurations working when their envelopes cannot fit even a minimum part.
     if (options.syncTransfers !== false && storage instanceof StorageKnex && jsonBodyLimit >= 4096 &&
       (this.maxRpcResponseBytes === -1 || this.maxRpcResponseBytes >= 4096)) {
       this.syncTransfers = new KnexSyncTransferStore(storage.knex, {
         version: 1, maxBytes: SYNC_TRANSFER_MAX_BYTES,
-        inlineBytes: Math.min(6 * 1024 * 1024, Math.floor(jsonBodyLimit / 2),
+        ...(binarySync ? { binaryTransport: { version: 1 as const,
+          inlineBytes: Math.min(inlineSyncLimit, SYNC_TRANSFER_PART_BYTES, Math.floor(binaryBodyLimit / 2),
+            this.maxRpcResponseBytes === -1 ? SYNC_TRANSFER_PART_BYTES : Math.floor(this.maxRpcResponseBytes / 2)) } } : {}),
+        inlineBytes: Math.min(inlineSyncLimit, Math.floor(jsonBodyLimit / 2),
           this.maxRpcResponseBytes === -1 ? SYNC_TRANSFER_MAX_BYTES : Math.floor(this.maxRpcResponseBytes / 2)),
         partBytes: Math.min(SYNC_TRANSFER_PART_BYTES, Math.floor(jsonBodyLimit / 4),
+          binarySync ? Math.floor(binaryBodyLimit / 2) : SYNC_TRANSFER_PART_BYTES,
           this.maxRpcResponseBytes === -1 ? SYNC_TRANSFER_PART_BYTES : Math.floor(this.maxRpcResponseBytes / 4))
       })
     }
@@ -496,6 +512,14 @@ export class StorageServer {
       )
     )
     this.app.use(authenticatedRateLimit)
+    this.app.post(SYNC_BINARY_PATH, (req, res, next) => {
+      try {
+        this.decodeBinarySyncRequest(req)
+        next()
+      } catch (error: unknown) {
+        this.sendRpcError(res, 'binary-sync', undefined, error)
+      }
+    })
     if (this.monetize) {
       this.app.use(
         createPaymentMiddleware({
@@ -555,11 +579,29 @@ export class StorageServer {
     })
 
     // A single POST endpoint for JSON-RPC:
-    this.app.post('/', this.handleRpcRequest.bind(this))
+    this.app.post('/', async (req, res) => await this.handleRpcRequest(req, res))
+    this.app.post(SYNC_BINARY_PATH, async (req, res) => await this.handleRpcRequest(req, res, 'binary-sync'))
   }
 
-  private async handleRpcRequest(req: Request, res: Response): Promise<Response> {
-    if (!this.telemetry.enabled) return await this.handleRpcRequestCore(req, res)
+  private decodeBinarySyncRequest(req: Request): void {
+    if (this.syncTransfers?.capabilities.binaryTransport?.version !== 1) {
+      throw new TypeError('Binary sync transport is unavailable')
+    }
+    if (!req.is(SYNC_BINARY_CONTENT_TYPE) || !(req.body instanceof Uint8Array)) {
+      throw new TypeError('Binary sync requires an octet-stream body')
+    }
+    const body = decodeSyncTransfer(req.body) as Record<string, unknown>
+    if (body == null || typeof body !== 'object' || typeof body.method !== 'string' || !isBinarySyncMethod(body.method)) {
+      throw new TypeError('Invalid binary sync method')
+    }
+    // Auth has already verified the exact raw request. Pricing and dispatch now see the same
+    // semantic envelope as their JSON counterparts; the transport format remains explicit.
+    req.body = body
+  }
+
+  private async handleRpcRequest(req: Request, res: Response, transport?: 'binary-sync'): Promise<Response> {
+    const body = req.body
+    if (!this.telemetry.enabled) return await this.handleRpcRequestCore(req, res, undefined, transport)
     return await this.telemetry.withSpan(
       'wallet.storage.rpc',
       {
@@ -568,20 +610,21 @@ export class StorageServer {
         carrier: req,
         attributes: {
           'rpc.system': 'wallet-storage',
-          'rpc.method': typeof req.body?.method === 'string' ? req.body.method : 'invalid'
+          'rpc.method': typeof body?.method === 'string' ? body.method : 'invalid'
         }
       },
-      async span => await this.handleRpcRequestCore(req, res, span)
+      async span => await this.handleRpcRequestCore(req, res, span, transport)
     )
   }
 
-  private async handleRpcRequestCore(req: Request, res: Response, rpcSpan?: TelemetrySpan): Promise<Response> {
-    const useBinary = req.header(BINARY_ENCODING_HEADER) === BINARY_ENCODING
+  private async handleRpcRequestCore(req: Request, res: Response, rpcSpan?: TelemetrySpan, transport?: 'binary-sync'): Promise<Response> {
+    const body = req.body
+    const useBinary: RpcEncoding = transport === 'binary-sync' ? transport : req.header(BINARY_ENCODING_HEADER) === BINARY_ENCODING
     const requestUsesBinary = req.header(BINARY_REQUEST_ENCODING_HEADER) === BINARY_ENCODING
-    if (useBinary) res.set(BINARY_ENCODING_HEADER, BINARY_ENCODING)
+    if (useBinary === true) res.set(BINARY_ENCODING_HEADER, BINARY_ENCODING)
 
-    const { jsonrpc, method, id } = req.body
-    const params = (requestUsesBinary ? decodeBinaryJsonValue(req.body.params) : req.body.params) as any[]
+    const { jsonrpc, method, id } = body ?? {}
+    const params = (transport !== 'binary-sync' && requestUsesBinary ? decodeBinaryJsonValue(body?.params) : body?.params) as any[]
     if (jsonrpc !== '2.0' || !method || typeof method !== 'string' || !Array.isArray(params)) {
       return this.sendRpc(res, useBinary, { error: { code: -32600, message: 'Invalid Request' } }, 400)
     }
@@ -608,9 +651,15 @@ export class StorageServer {
         ? syncChunkBinary(dispatch.result as SyncChunk)
         : dispatch.result
       const payload = { jsonrpc: '2.0', result, id }
-      const serialized = escapeRpcJson(stringifyJsonRpc(payload, useBinary))
-      // Apply the response bound before consulting any client transport preference.
-      if (this.maxRpcResponseBytes !== -1 && Buffer.byteLength(serialized, 'utf8') > this.maxRpcResponseBytes) {
+      const serialized = this.serializeRpc(payload, useBinary)
+      const serializedBytes = typeof serialized === 'string' ? Buffer.byteLength(serialized, 'utf8') : serialized.length
+      const transferInlineLimit = method === 'getSyncChunk' && params[0]?.syncTransferVersion === 1
+        ? transport === 'binary-sync' ? this.syncTransfers?.capabilities.binaryTransport?.inlineBytes
+          : this.syncTransfers?.capabilities.inlineBytes : undefined
+      // Negotiated peers use parts before the ordinary response exceeds the advertised
+      // inline ceiling. Legacy peers retain their existing HTTP response boundary.
+      if ((transferInlineLimit != null && serializedBytes > transferInlineLimit) ||
+        (this.maxRpcResponseBytes !== -1 && serializedBytes > this.maxRpcResponseBytes)) {
         return await this.sendOversizedSyncResponse(req, res, useBinary, method, params, payload)
       }
       return this.sendRpc(res, useBinary, payload, 200, serialized)
@@ -619,7 +668,7 @@ export class StorageServer {
     }
   }
 
-  private async sendOversizedSyncResponse(req: Request, res: Response, useBinary: boolean,
+  private async sendOversizedSyncResponse(req: Request, res: Response, useBinary: RpcEncoding,
     method: string, params: any[], payload: { jsonrpc: string; result: unknown; id: unknown }): Promise<Response> {
     // Dispatch already applied normal RPC authorization. Negotiation changes only framing.
     if (method !== 'getSyncChunk' || params[0]?.syncTransferVersion !== 1 || this.syncTransfers == null) {
@@ -663,21 +712,27 @@ export class StorageServer {
     next()
   }
 
-  private sendRpc(res: Response, useBinary: boolean, payload: unknown, status: number = 200,
-    serialized: string = escapeRpcJson(stringifyJsonRpc(payload, useBinary))): Response {
+  private serializeRpc(payload: unknown, encoding: RpcEncoding): string | Uint8Array {
+    return encoding === 'binary-sync' ? encodeSyncTransfer(payload) : escapeRpcJson(stringifyJsonRpc(payload, encoding))
+  }
+
+  private sendRpc(res: Response, useBinary: RpcEncoding, payload: unknown, status: number = 200,
+    serialized: string | Uint8Array = this.serializeRpc(payload, useBinary)): Response {
     res.set('X-Content-Type-Options', 'nosniff')
-    if (this.maxRpcResponseBytes !== -1 && Buffer.byteLength(serialized, 'utf8') > this.maxRpcResponseBytes) {
-      return res.status(413).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32005,
-          message: 'The requested response exceeds the configured service limit.'
-        },
-        id: (payload as { id?: unknown } | null)?.id
-      })
+    const size = typeof serialized === 'string' ? Buffer.byteLength(serialized, 'utf8') : serialized.length
+    if (this.maxRpcResponseBytes !== -1 && size > this.maxRpcResponseBytes) {
+      const error = { jsonrpc: '2.0', error: { code: -32005,
+        message: 'The requested response exceeds the configured service limit.' }, id: (payload as { id?: unknown } | null)?.id }
+      if (useBinary !== 'binary-sync') return res.status(413).json(error)
+      serialized = encodeSyncTransfer(error)
+      status = 413
     }
-    // Normalize with the negotiated binary replacer, then let Express emit
-    // the JSON response through its escaping-aware JSON sink.
+    if (serialized instanceof Uint8Array) {
+      res.set('Content-Type', SYNC_BINARY_CONTENT_TYPE)
+      res.set(SYNC_BINARY_HEADER, SYNC_BINARY_ENCODING)
+      res.set('Cache-Control', 'no-store')
+      return res.status(status).send(Buffer.from(serialized.buffer, serialized.byteOffset, serialized.byteLength))
+    }
     return res.status(status).json(JSON.parse(serialized))
   }
 
@@ -760,7 +815,7 @@ export class StorageServer {
     return limit
   }
 
-  private sendRpcError(res: Response, useBinary: boolean, id: unknown, error: unknown): Response {
+  private sendRpcError(res: Response, useBinary: RpcEncoding, id: unknown, error: unknown): Response {
     /**
      * Convert errors to standard JSON object format that can be converted back
      * to WalletError derived objects on the client side and re-thrown.

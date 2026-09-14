@@ -2,6 +2,8 @@ import type { WalletInterface } from '@bsv/sdk'
 import type { RequestSyncChunkArgs, SyncChunk } from '../../../sdk/WalletStorage.interfaces'
 import { StorageClientBase } from '../StorageClientBase'
 import { encodeSyncTransfer, syncTransferDigest } from '../SyncTransfer'
+import { stringifyJsonRpc } from '../BinaryJson'
+import { syncChunkBinary } from '../syncChunkBinary'
 
 const identityKey = `02${'11'.repeat(32)}`
 const fromStorageIdentityKey = `02${'22'.repeat(32)}`
@@ -50,6 +52,27 @@ class TransferClient extends StorageClientBase {
 function manifest(digest: string, totalBytes: number) {
   return { transferId: 'a'.repeat(64), digest, totalBytes, partBytes: 1024, expiresAt: Date.now() + 60000 }
 }
+
+test('stages a request whose raw frame fits but whose base64 JSON envelope exceeds the inline ceiling', async () => {
+  const client = new TransferClient()
+  const request = args()
+  const page = chunk()
+  const frame = encodeSyncTransfer({ args: request, chunk: syncChunkBinary(page) })
+  const wire = stringifyJsonRpc({ jsonrpc: '2.0', method: 'processSyncChunk', params: [request, syncChunkBinary(page)], id: 1 }, true)
+  expect(new TextEncoder().encode(wire).length).toBeGreaterThan(frame.length)
+  Reflect.set(client, 'settings', { syncTransfer: { ...capabilities, inlineBytes: frame.length } })
+  client.request.mockRejectedValue(new Error('staging selected'))
+  await expect(client.processSyncChunk(request, page)).rejects.toThrow('staging selected')
+  expect(client.request.mock.calls.map(call => call[0])).toEqual(['beginWriteSyncTransfer'])
+})
+
+test('keeps a fitting ordinary request inline and does not replay an ambiguous write failure', async () => {
+  const client = new TransferClient()
+  Reflect.set(client, 'settings', { syncTransfer: { ...capabilities, inlineBytes: 65536 } })
+  client.request.mockRejectedValue(new Error('Timed out waiting for authenticated response.'))
+  await expect(client.processSyncChunk(args(), chunk())).rejects.toThrow('Timed out')
+  expect(client.request.mock.calls.map(call => call[0])).toEqual(['processSyncChunk'])
+})
 
 test.each([
   ['digest', { digest: '0'.repeat(64) }],
@@ -135,5 +158,27 @@ test.each(['userIdentityKey', 'fromStorageIdentityKey', 'toStorageIdentityKey'] 
     })
     await expect(client.getSyncChunk(args())).rejects.toThrow('Wallet sync transfer identities changed')
     expect(client.request.mock.calls.at(-1)?.[0]).toBe('releaseSyncTransfer')
+  }
+)
+
+
+test.each(['Load failed', 'Failed to fetch', 'Timed out waiting for authenticated response.'])(
+  'recovers an idempotent read through parts after %s from a compatible older provider', async message => {
+    const client = new TransferClient()
+    const page = chunk()
+    const bytes = encodeSyncTransfer(syncChunkBinary(page))
+    const readManifest = manifest(syncTransferDigest(bytes), bytes.length)
+    client.request.mockImplementation(async (method, params) => {
+      const input = params[0] as any
+      if (method === 'getSyncChunk') throw new TypeError(message)
+      if (method === 'beginReadSyncTransfer') return readManifest
+      if (method === 'readSyncTransferPart') return { offset: input.offset, bytes: bytes.slice(input.offset, input.offset + 1024) }
+      if (method === 'releaseSyncTransfer') return true
+      throw new Error('Unexpected RPC')
+    })
+    const restored = await client.getSyncChunk(args())
+    expect(restored.transactions?.[0].inputBEEF).toEqual(page.transactions![0].inputBEEF)
+    expect(client.request.mock.calls.filter(call => call[0] === 'getSyncChunk')).toHaveLength(1)
+    expect(client.request.mock.calls.filter(call => call[0] === 'beginReadSyncTransfer')).toHaveLength(1)
   }
 )

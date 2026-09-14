@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto'
+import type { Request } from 'express'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { PrivateKey, ProtoWallet, SimplifiedFetchTransport } from '@bsv/sdk'
@@ -18,21 +19,74 @@ async function local(): Promise<StorageIdb> {
   return s
 }
 
-test.each([0, 1000])('copies an oversized binary record through authenticated HTTP with %i ms request latency and restores it into IndexedDB', async requestLatencyMs => {
+test('advertises a configured inline ceiling bounded by the HTTP response limit', async () => {
+  const remote = await _tu.createSQLiteTestWallet({ databaseName: 'inlineCeiling', dropAll: true })
+  try {
+    for (const [configured, responseLimit, expected] of [[262144, 8388608, 262144], [262144, 65536, 32768]]) {
+      const server = new StorageServer(remote.activeStorage, {
+        port: 0, wallet: remote.wallet, monetize: false,
+        syncTransferInlineBytes: configured, maxRpcResponseBytes: responseLimit
+      })
+      const capabilities = Reflect.get(server, 'syncTransfers').capabilities
+      expect(capabilities.inlineBytes).toBe(expected)
+      expect(capabilities.binaryTransport).toEqual({ version: 1, inlineBytes: expected })
+    }
+    const legacy = new StorageServer(remote.activeStorage, { port: 0, wallet: remote.wallet, monetize: false, syncBinaryTransport: false })
+    const capabilities = Reflect.get(legacy, 'syncTransfers').capabilities
+    expect(capabilities.version).toBe(1)
+    expect(capabilities.binaryTransport).toBeUndefined()
+  } finally {
+    await remote.wallet.destroy()
+  }
+})
+
+test.each([[0, 7 * 1024 * 1024, true], [1000, 7 * 1024 * 1024, true], [0, 3 * 1024 * 1024 + 1024, true], [0, 3 * 1024 * 1024 + 1024, false]] as const)('copies a record through authenticated HTTP with %i ms latency, %i bytes and raw transport %s', async (requestLatencyMs, recordBytes, binarySync) => {
+  const rawRequests: Array<{ contentType: string; bytes: number }> = []
+  const browserTransports = new WeakSet<SimplifiedFetchTransport>()
   const originalSend = SimplifiedFetchTransport.prototype.send
   const delayedTransport = jest.spyOn(SimplifiedFetchTransport.prototype, 'send').mockImplementation(async function (message) {
+    if (!browserTransports.has(this)) {
+      browserTransports.add(this)
+      const originalFetch = this.fetchClient
+      this.fetchClient = async (input, init) => {
+        const headers = new Headers(init?.headers)
+        headers.set('Origin', 'https://wallet.example.test')
+        const response = await originalFetch(input, { ...init, headers })
+        expect(response.headers.get('access-control-allow-origin')).toBe('*')
+        const exposed = (response.headers.get('access-control-expose-headers') ?? '').toLowerCase().split(/,\s*/)
+        // Model browser header visibility while retaining real HTTP and authentication.
+        const visible = new Headers()
+        response.headers.forEach((value, name) => {
+          if (['content-type', 'content-length', 'cache-control'].includes(name) || exposed.includes(name)) visible.set(name, value)
+        })
+        return new Response(response.body, { status: response.status, headers: visible })
+      }
+    }
+    if (message.messageType === 'general') {
+      const request = this.deserializeRequestPayload(message.payload)
+      if (request.urlPostfix.endsWith('/sync/v1')) rawRequests.push({ contentType: request.headers['content-type'], bytes: request.body?.length ?? 0 })
+    }
     if (requestLatencyMs > 0) await new Promise(resolve => setTimeout(resolve, requestLatencyMs))
     return await originalSend.call(this, message)
   })
   const remote = await _tu.createSQLiteTestWallet({ databaseName: 'largeRecordHttp', dropAll: true })
   const source = await local()
   const restored = await local()
+  const pricedBinaryMethods: string[] = []
+  const priceRequest = async (request: Request): Promise<number> => {
+    if (request.path.endsWith('/sync/v1')) {
+      expect(typeof request.body.method).toBe('string')
+      expect(Array.isArray(request.body.params)).toBe(true)
+      pricedBinaryMethods.push(request.body.method)
+    }
+    return 0
+  }
   let server = new StorageServer(remote.activeStorage, {
     port: 0,
     wallet: remote.wallet,
-    monetize: false,
+    monetize: true,
     logRpcRequests: false,
-    calculateRequestPrice: async () => 0
+    calculateRequestPrice: priceRequest
   })
   let client: StorageClient | undefined
   try {
@@ -40,13 +94,14 @@ test.each([0, 1000])('copies an oversized binary record through authenticated HT
     if (!server.server.listening) await once(server.server, 'listening')
     const address = server.server.address()
     if (address == null || typeof address === 'string') throw new Error('fixture did not bind')
-    client = new StorageClient(remote.wallet, `http://localhost:${address.port}`, { binaryRequests: true })
+    client = new StorageClient(remote.wallet, `http://localhost:${address.port}`, { binaryRequests: true, binarySync })
     const identityKey = remote.identityKey
     const manager = new WalletStorageManager(identityKey, source)
     await manager.makeAvailable()
     const { user } = await source.findOrInsertUser(identityKey)
-    // Synthetic storage bytes, never funded, signed or broadcast. Larger than the 8 MiB response cap even in base64.
-    const bytes = new Uint8Array(7 * 1024 * 1024).fill(173)
+    // The smaller fixture crossed the old inline ceiling only after base64 expansion.
+    // Synthetic storage bytes, never funded, signed or broadcast.
+    const bytes = new Uint8Array(recordBytes).fill(173)
     const now = new Date()
     await source.insertTransaction({
       transactionId: 0,
@@ -136,15 +191,15 @@ test.each([0, 1000])('copies an oversized binary record through authenticated HT
     server = new StorageServer(remote.activeStorage, {
       port: 0,
       wallet: remote.wallet,
-      monetize: false,
+      monetize: true,
       logRpcRequests: false,
-      calculateRequestPrice: async () => 0
+      calculateRequestPrice: priceRequest
     })
     server.start()
     if (!server.server.listening) await once(server.server, 'listening')
     const nextAddress = server.server.address()
     if (nextAddress == null || typeof nextAddress === 'string') throw new Error('fixture did not rebind')
-    client = new StorageClient(remote.wallet, `http://localhost:${nextAddress.port}`, { binaryRequests: true })
+    client = new StorageClient(remote.wallet, `http://localhost:${nextAddress.port}`, { binaryRequests: true, binarySync })
     const resumedProgress: number[] = []
     client.onSyncTransferProgress = progress => {
       if (progress.direction === 'write') resumedProgress.push(progress.bytes)
@@ -209,6 +264,14 @@ test.each([0, 1000])('copies an oversized binary record through authenticated HT
     expect(again.updates).toBe(0)
     expect(delayedTransport.mock.calls.length).toBeGreaterThan(20)
     expect(await remote.activeStorage.knex('sync_transfer_parts')).toHaveLength(0)
+    if (binarySync) {
+      expect(pricedBinaryMethods).toEqual(expect.arrayContaining(['getSyncChunk', 'writeSyncTransferPart', 'commitSyncTransfer']))
+      expect(rawRequests.length).toBeGreaterThan(20)
+    } else {
+      expect(pricedBinaryMethods).toEqual([])
+      expect(rawRequests).toEqual([])
+    }
+    expect(rawRequests.every(request => request.contentType === 'application/octet-stream' && request.bytes <= 256 * 1024 + 4096)).toBe(true)
   } finally {
     await client?.destroy()
     await server.close()

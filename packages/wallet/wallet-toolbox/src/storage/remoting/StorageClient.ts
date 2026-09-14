@@ -2,13 +2,6 @@ import { WalletInterface, WalletLoggerInterface } from '@bsv/sdk'
 import { WalletErrorFromJson } from '../../sdk/WalletErrorFromJson'
 import { logWalletError } from '../../WalletLogger'
 import { StorageClientBase, type StorageClientOptions } from './StorageClientBase'
-import {
-  BINARY_ENCODING,
-  BINARY_ENCODING_HEADER,
-  BINARY_REQUEST_ENCODING_HEADER,
-  parseJsonRpc,
-  stringifyJsonRpc
-} from './BinaryJson'
 
 interface RpcLoggerState {
   logger?: WalletLoggerInterface
@@ -49,72 +42,7 @@ export class StorageClient extends StorageClientBase {
       const { logger } = loggerState
 
       try {
-        const id = this.nextId++
-
-        const body = {
-          jsonrpc: '2.0',
-          method,
-          params,
-          id
-        }
-
-        const requestUsesBinary = this.requestUsesBinary(method)
-        const requestBody = await this.traceRpcStep(
-          'wallet.storage.request.serialize',
-          rpcSpan,
-          () => stringifyJsonRpc(body, requestUsesBinary),
-          { 'rpc.encoding': requestUsesBinary ? 'binary-json' : 'json' }
-        )
-
-        let response: Response
-        try {
-          response = await this.traceRpcStep(
-            'wallet.storage.http',
-            rpcSpan,
-            async () =>
-              await this.authClient.fetch(this.endpointUrl, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  [BINARY_ENCODING_HEADER]: BINARY_ENCODING,
-                  ...(requestUsesBinary ? { [BINARY_REQUEST_ENCODING_HEADER]: BINARY_ENCODING } : {})
-                },
-                body: requestBody
-              }),
-            {
-              'http.request.method': 'POST',
-              'rpc.encoding': requestUsesBinary ? 'binary-json' : 'json'
-            }
-          )
-        } catch (error_: unknown) {
-          logWalletError(error_, logger, 'error requesting remote service')
-          throw error_
-        }
-
-        if (!response.ok) {
-          throw this.rpcResponseError(response)
-        }
-
-        const responseUsesBinary = response.headers.get(BINARY_ENCODING_HEADER) === BINARY_ENCODING
-        if (responseUsesBinary) this.serverSupportsBinary = true
-        const responseText = await this.traceRpcStep(
-          'wallet.storage.response.read',
-          rpcSpan,
-          async () => await response.text(),
-          {
-            'http.response.status_code': response.status,
-            'rpc.encoding': responseUsesBinary ? 'binary-json' : 'json'
-          }
-        )
-        const json = await this.traceRpcStep(
-          'wallet.storage.response.parse',
-          rpcSpan,
-          () => parseJsonRpc(responseText, responseUsesBinary),
-          {
-            'rpc.encoding': responseUsesBinary ? 'binary-json' : 'json',
-            'response.size_bytes': responseText.length
-          }
-        )
+        const { response, json, encoding } = await this.exchangeRpc(method, params, rpcSpan)
         if (json.error) {
           logWalletError(json.error, logger, 'error from remote service')
           const werr = WalletErrorFromJson(json.error)
@@ -130,7 +58,7 @@ export class StorageClient extends StorageClientBase {
         rpcSpan?.end({
           attributes: {
             'http.response.status_code': response.status,
-            'rpc.encoding': responseUsesBinary ? 'binary-json' : 'json'
+            'rpc.encoding': encoding
           }
         })
         return json.result

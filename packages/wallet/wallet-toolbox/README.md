@@ -6,26 +6,18 @@
 
 A [BRC-100](https://github.com/bitcoin-sv/BRCs/blob/master/wallet/0100.md) conforming wallet implementation for the BSV blockchain, built on the [BSV SDK](https://bsv-blockchain.github.io/ts-stack/packages/sdk/). Provides persistent storage, protocol-based key derivation, transaction monitoring, chain tracking, and signing — everything needed to build wallet-powered applications on BSV.
 
-## Backup and sync: tested results
+## Backup and sync
 
-**Live E2E testing used a large wallet in the native desktop client**, covering
-complete local copies, restart recovery, and repeat sync. Transfer size and oversized-record recovery were
-measured separately with synthetic fixtures. The latest proof-recovery follow-up
-has synthetic HTTP and read-only source-data validation; its live full-backup
-retest is pending.
+The **2.14.0 candidate** adds authenticated raw binary HTTP for wallet sync:
 
-| Test                         | Verified result                                                                                                                                         |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Full native desktop restores | **Two complete copies; identical entity counts.** Second run: **12m 50s vs 16m 30s (22.3% less time)**.                                                 |
-| Retained local backup        | Completed after cancellation, a connectivity pause, and restart recovery; all **12 entity-store counts preserved** on another restart.                  |
-| Local reads and repeat sync  | Transaction/output reads passed; sampled transaction bytes matched; repeat sync made **0 inserts, 0 updates**.                                          |
-| Transfer size                | **62.7% smaller** encoded byte payload in a synthetic fixture.                                                                                          |
-| Oversized single record      | **7 MiB restored in real browser IndexedDB**, matching SHA-256; interrupted upload resumed, corrupt download rejected, repeat sync unchanged.           |
-| Automated integration        | Authenticated HTTP backup/restore, interrupted pages, lost acknowledgements, binary byte round-trips, user isolation, and legacy compatibility covered. |
+- **About 25% fewer HTTP body bytes** than base64 JSON in a synthetic large-record backup/restore comparison.
+- **Bounded 256 KiB parts**, integrity checks, resumable uploads and checkpoint recovery after interrupted acknowledgements.
+- **Legacy compatibility**, with no additional database migration from 2.13.0.
 
-Timing compares successive candidates, not a controlled comparison against upstream
-`main`. Byte verification was sampled, not database-wide. See
-[test methods and limits](#sync-performance-and-recovery) for details.
+Synthetic authenticated HTTP tests cover large records, added latency, interrupted
+uploads, restart recovery, lost acknowledgements, corruption rejection and repeat
+sync. Fresh native E2E validation of this raw transport is pending. Earlier large-wallet
+E2E results below describe previous implementations; see [methods and limits](#sync-performance-and-recovery).
 
 ## Overview
 
@@ -102,11 +94,17 @@ client bundle cost. The [artifact measurements and limits](./docs/sync-transfer.
 include the combined upstream security fixes. These are explicit feature costs;
 the RPC validation coordinator remains excluded from browser/mobile bundles.
 
-The transfer extension is an **unpublished 2.13.0 candidate**. Published 2.12.0
-has no record-transfer methods. Check exact build provenance and authenticated
-runtime capabilities, not a version label alone. An oversized record on a legacy
-source cannot be rescued by upgrading only its destination; upgrade the source
-before retrying. Records exceeding the negotiated 64 MiB frame limit fail safely
+Toolbox 2.13.0 contains the transfer extension. The unpublished 2.14.0 candidate
+adds negotiated raw binary HTTP for sync pages and parts, without base64 body
+expansion. Raw pages default to a 256 KiB inline ceiling; larger pages use bounded
+parts. Older providers continue using JSON, with transient read failures recovered
+through their advertised transfer support. Providers can also set
+`syncTransferInlineBytes` for a smaller legacy JSON ceiling. Rollout controls and
+remaining size limits are documented in the [transfer guide](./docs/sync-transfer.md).
+No new migration is needed from 2.13.0. Ambiguous writes are never blindly retried;
+resumption rereads the saved checkpoint.
+
+Records exceeding the negotiated 64 MiB frame limit fail safely
 without being skipped or advancing their checkpoint.
 
 Large individual records can use the negotiated

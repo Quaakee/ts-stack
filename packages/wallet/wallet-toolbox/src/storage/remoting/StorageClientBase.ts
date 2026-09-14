@@ -1,7 +1,9 @@
 import { type SyncTransferCapabilities, type SyncTransferManifest, type SyncTransferPart,
   encodeSyncTransfer, syncTransferDigest, receiveSyncTransfer,
-  validateSyncTransferCapabilities, validateSyncTransferManifest } from './SyncTransfer'
+  validateSyncTransferCapabilities, validateSyncTransferManifest, decodeSyncTransfer,
+  isBinarySyncMethod, syncTransferLength, SYNC_BINARY_PATH, SYNC_BINARY_CONTENT_TYPE, SYNC_BINARY_ENCODING, SYNC_BINARY_HEADER } from './SyncTransfer'
 import { syncChunkBinary } from './syncChunkBinary'
+import { stringifyJsonRpc, parseJsonRpc, BINARY_ENCODING, BINARY_ENCODING_HEADER, BINARY_REQUEST_ENCODING_HEADER } from './BinaryJson'
 import { validateSyncCheckpoint } from '../sync/syncCheckpoint'
 import {
   AbortActionArgs,
@@ -99,6 +101,8 @@ export interface StorageClientOptions {
    * still route requests to legacy server instances.
    */
   binaryRequests?: boolean
+  /** Prefer negotiated raw binary sync HTTP (default true). Disable for a legacy-only connection. */
+  binarySync?: boolean
   /**
    * Optional vendor-neutral tracing. Disabled unless an enabled sink is
    * supplied. Request parameters and response payloads are never emitted.
@@ -148,6 +152,7 @@ export abstract class StorageClientBase implements WalletStorageProvider {
   protected nextId = 1
   protected serverSupportsBinary = false
   protected readonly binaryRequests: boolean
+  private readonly binarySync: boolean
   protected readonly telemetry: Telemetry
   private syncChunkRoughSizeLimit?: number
   /** Optional progress/cancellation hook for a bounded transfer; never receives wallet contents. */
@@ -160,6 +165,7 @@ export abstract class StorageClientBase implements WalletStorageProvider {
     this.authClient = new AuthFetch(wallet)
     this.endpointUrl = normalizeStorageEndpointUrl(endpointUrl)
     this.binaryRequests = options.binaryRequests === true
+    this.binarySync = options.binarySync !== false
     this.telemetry = new Telemetry(options.telemetry)
   }
 
@@ -203,6 +209,50 @@ export abstract class StorageClientBase implements WalletStorageProvider {
       },
       callback
     )
+  }
+
+  protected usesBinarySync(method: string): boolean {
+    return this.binarySync && this.settings?.syncTransfer?.binaryTransport?.version === 1 && isBinarySyncMethod(method)
+  }
+
+  /** One authenticated exchange shared by Node, browser and mobile callers. Never replays a request. */
+  protected async exchangeRpc(method: string, params: unknown[], rpcSpan?: TelemetrySpan): Promise<{
+    response: Response; json: any; encoding: string
+  }> {
+    const id = this.nextId++
+    const raw = this.usesBinarySync(method)
+    const binaryJson = this.requestUsesBinary(method)
+    const encoding = raw ? 'binary-sync' : binaryJson ? 'binary-json' : 'json'
+    const body = { jsonrpc: '2.0', method, params, id }
+    const requestBody = await this.traceRpcStep('wallet.storage.request.serialize', rpcSpan,
+      () => raw ? encodeSyncTransfer(body) : stringifyJsonRpc(body, binaryJson), { 'rpc.encoding': encoding })
+    const endpoint = raw ? this.endpointUrl.replace(/\/$/, '') + SYNC_BINARY_PATH : this.endpointUrl
+    const response = await this.traceRpcStep('wallet.storage.http', rpcSpan,
+      async () => await this.authClient.fetch(endpoint, {
+        method: 'POST',
+        headers: raw ? { 'Content-Type': SYNC_BINARY_CONTENT_TYPE } : {
+          'Content-Type': 'application/json', [BINARY_ENCODING_HEADER]: BINARY_ENCODING,
+          ...(binaryJson ? { [BINARY_REQUEST_ENCODING_HEADER]: BINARY_ENCODING } : {})
+        },
+        body: requestBody
+      }), { 'http.request.method': 'POST', 'rpc.encoding': encoding })
+    if (!response.ok) throw this.rpcResponseError(response)
+    const responseBinaryJson = response.headers.get(BINARY_ENCODING_HEADER) === BINARY_ENCODING
+    if (responseBinaryJson) this.serverSupportsBinary = true
+    if (raw && response.headers.get(SYNC_BINARY_HEADER) !== SYNC_BINARY_ENCODING) {
+      throw new Error('Wallet sync server did not return the negotiated binary transport')
+    }
+    const received = await this.traceRpcStep('wallet.storage.response.read', rpcSpan,
+      async () => raw ? new Uint8Array(await response.arrayBuffer()) : await response.text(),
+      { 'http.response.status_code': response.status, 'rpc.encoding': encoding })
+    const json = await this.traceRpcStep('wallet.storage.response.parse', rpcSpan,
+      () => raw ? decodeSyncTransfer(received as Uint8Array) : parseJsonRpc(received as string, responseBinaryJson),
+      { 'rpc.encoding': encoding, 'response.size_bytes': received.length })
+    if (raw && (json == null || typeof json !== 'object' ||
+      Reflect.get(json, 'jsonrpc') !== '2.0' || Reflect.get(json, 'id') !== id)) {
+      throw new Error('Invalid wallet sync binary response envelope')
+    }
+    return { response, json, encoding: raw ? encoding : responseBinaryJson ? 'binary-json' : 'json' }
   }
 
   /**
@@ -671,14 +721,18 @@ export abstract class StorageClientBase implements WalletStorageProvider {
    * @returns whether processing is done, counts of inserts and udpates, and related progress tracking properties.
    */
   async processSyncChunk(args: RequestSyncChunkArgs, chunk: SyncChunk): Promise<ProcessSyncChunkResult> {
-    const wireChunk = this.binaryRequests && this.serverSupportsBinary ? syncChunkBinary(chunk) : chunk
+    const raw = this.usesBinarySync('processSyncChunk')
+    const wireChunk = raw || this.binaryRequests && this.serverSupportsBinary ? syncChunkBinary(chunk) : chunk
     const capabilities = this.syncTransferCapabilities()
-    // Keep ordinary pages on the existing RPC. Only an oversized encoded payload uses staging.
-    const bytes = capabilities == null ? undefined : encodeSyncTransfer({ args, chunk: syncChunkBinary(chunk) })
-    // Legacy numeric byte arrays can require four JSON characters per byte.
-    const expansion = this.binaryRequests && this.serverSupportsBinary ? 1 : 4
-    const r = bytes != null && bytes.length * expansion > (capabilities!.inlineBytes ?? 6 * 1024 * 1024)
-      ? await this.uploadSyncTransfer(args.identityKey, bytes, capabilities!)
+    // JSON peers include base64 expansion; raw peers bound the actual binary RPC envelope.
+    const inlineSize = capabilities == null ? 0 : raw
+      ? syncTransferLength({ jsonrpc: '2.0', method: 'processSyncChunk', params: [args, wireChunk], id: Number.MAX_SAFE_INTEGER })
+      : new TextEncoder().encode(stringifyJsonRpc({
+        jsonrpc: '2.0', method: 'processSyncChunk', params: [args, wireChunk], id: Number.MAX_SAFE_INTEGER
+      }, this.requestUsesBinary('processSyncChunk'))).length
+    const inlineLimit = raw ? capabilities!.binaryTransport!.inlineBytes : capabilities?.inlineBytes ?? 6 * 1024 * 1024
+    const r = capabilities != null && inlineSize > inlineLimit
+      ? await this.uploadSyncTransfer(args.identityKey, encodeSyncTransfer({ args, chunk: raw ? wireChunk : syncChunkBinary(chunk) }), capabilities)
       : await this.rpcCall<ProcessSyncChunkResult>('processSyncChunk', [args, wireChunk])
     if (r.nextCheckpoint != null) r.nextCheckpoint = validateSyncCheckpoint(r.nextCheckpoint, args)
     return r
@@ -704,7 +758,12 @@ export abstract class StorageClientBase implements WalletStorageProvider {
       try {
         return await this.readSyncChunkResponse(requestArgs, args.maxRoughSize, transfer)
       } catch (error: unknown) {
-        if (!isSyncChunkResponseTooLarge(error)) throw error
+        if (!isSyncChunkResponseTooLarge(error)) {
+          if (transfer != null && this.syncTransferRetryDelay(error, 0) != null) {
+            return await this.downloadSyncTransfer(requestArgs, transfer)
+          }
+          throw error
+        }
         const smaller = this.smallerSyncRequest(requestArgs, retries)
         if (smaller != null) { requestArgs = smaller; continue }
         if (transfer == null) throw error
@@ -756,7 +815,7 @@ export abstract class StorageClientBase implements WalletStorageProvider {
 
   private syncTransferRetryDelay(error: unknown, attempt: number): number | undefined {
     const message = error instanceof Error ? error.message : ''
-    if (attempt >= 2 || !/network error (?:429|502|503|504)|timed out waiting for authenticated response|fetch failed|Failed to fetch/i.test(message)) return undefined
+    if (attempt >= 2 || !/network error (?:429|502|503|504)|timed out waiting for authenticated response|fetch failed|Failed to fetch|Load failed/i.test(message)) return undefined
     if (!/network error 429/.test(message)) return 250 * 2 ** attempt
     const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error
     const retryAfter = cause != null && typeof cause === 'object' ? Reflect.get(cause, 'retryAfterMs') : undefined

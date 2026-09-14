@@ -3,8 +3,8 @@
   "id": "wallet.storage.sync-transfer",
   "name": "Negotiated wallet sync transfer v1 binary framing",
   "brc": ["BRC-40"],
-  "version": "1.0.0",
-  "reference_impl": "packages/wallet/wallet-toolbox/src/storage/remoting/SyncTransfer.ts@2.13.0",
+  "version": "1.1.0",
+  "reference_impl": "packages/wallet/wallet-toolbox/src/storage/remoting/SyncTransfer.ts@2.14.0",
   "parity_class": "required",
   "vectors": [
     {
@@ -57,6 +57,53 @@
         "error": "Invalid wallet sync transfer frame"
       },
       "tags": ["error-case", "integrity"]
+    },
+    {
+      "id": "wallet.storage.sync-transfer.http-request",
+      "description": "Raw HTTP envelope uses the existing frame; binary bytes occur once after the UTF-8 header.",
+      "input": {
+        "value": {
+          "jsonrpc": "2.0",
+          "method": "writeSyncTransferPart",
+          "params": [
+            {
+              "offset": 0,
+              "bytes": {
+                "$bsvBinary": "base64",
+                "data": "AH//"
+              }
+            }
+          ],
+          "id": 7
+        }
+      },
+      "expected": {
+        "hex": "000000a87b2276657273696f6e223a312c2276616c7565223a7b226a736f6e727063223a22322e30222c226d6574686f64223a22777269746553796e635472616e7366657250617274222c22706172616d73223a5b7b226f6666736574223a302c226279746573223a6e756c6c7d5d2c226964223a377d2c226669656c6473223a5b7b2270617468223a5b22706172616d73222c302c226279746573225d2c226c656e677468223a337d5d7d007fff",
+        "digest": "5ce91eb8ad76acc7a3ee58e4e1941c41e6699c6df9df9740c4e32b8c61246012"
+      },
+      "tags": ["binary", "integrity", "happy-path"]
+    },
+    {
+      "id": "wallet.storage.sync-transfer.http-response",
+      "description": "Raw HTTP envelope uses the existing frame; binary bytes occur once after the UTF-8 header.",
+      "input": {
+        "value": {
+          "jsonrpc": "2.0",
+          "result": {
+            "offset": 0,
+            "bytes": {
+              "$bsvBinary": "base64",
+              "data": "AH//"
+            }
+          },
+          "id": 7
+        }
+      },
+      "expected": {
+        "hex": "000000837b2276657273696f6e223a312c2276616c7565223a7b226a736f6e727063223a22322e30222c22726573756c74223a7b226f6666736574223a302c226279746573223a6e756c6c7d2c226964223a377d2c226669656c6473223a5b7b2270617468223a5b22726573756c74222c226279746573225d2c226c656e677468223a337d5d7d007fff",
+        "digest": "519e1d753608d75e46603f50ee1d411a96a5aec261abbc4389b7e2ad012da1c6"
+      },
+      "tags": ["binary", "integrity", "happy-path"]
     }
   ]
 }

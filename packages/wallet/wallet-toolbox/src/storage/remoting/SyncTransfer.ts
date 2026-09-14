@@ -1,5 +1,5 @@
 import { Hash, Utils } from '@bsv/sdk'
-import { parseJsonRpc, stringifyJsonRpc } from './BinaryJson'
+import { parseJsonRpc, stringifyJsonRpc, BINARY_ENCODING_HEADER } from './BinaryJson'
 
 /** Versioned transport framing; the reconstructed BRC-40 request/response is unchanged. */
 export interface SyncTransferCapabilities {
@@ -7,6 +7,8 @@ export interface SyncTransferCapabilities {
   maxBytes: number
   partBytes: number
   inlineBytes?: number
+  /** Optional raw HTTP transport. Version 1 preserves the existing frame and checkpoint formats. */
+  binaryTransport?: { version: 1; inlineBytes: number }
 }
 
 export interface SyncTransferManifest {
@@ -24,6 +26,17 @@ export interface SyncTransferPart {
 
 export const SYNC_TRANSFER_MAX_BYTES = 64 * 1024 * 1024
 export const SYNC_TRANSFER_PART_BYTES = 256 * 1024
+export const SYNC_BINARY_PATH = '/sync/v1'
+export const SYNC_BINARY_CONTENT_TYPE = 'application/octet-stream'
+/** BRC-103 signs x-bsv-* response headers; Content-Type alone is not part of that signed set. */
+export const SYNC_BINARY_HEADER = BINARY_ENCODING_HEADER
+export const SYNC_BINARY_ENCODING = 'sync-v1'
+
+/** Restrict the additional transport to the existing sync operations. */
+export function isBinarySyncMethod(method: string): boolean {
+  return ['getSyncChunk', 'processSyncChunk', 'beginReadSyncTransfer', 'readSyncTransferPart',
+    'beginWriteSyncTransfer', 'writeSyncTransferPart', 'commitSyncTransfer', 'releaseSyncTransfer'].includes(method)
+}
 
 export function syncTransferDigest(bytes: Uint8Array): string {
   return Utils.toHex(Hash.sha256(bytes))
@@ -35,7 +48,7 @@ interface BinaryField {
 }
 
 /** A length-prefixed JSON metadata header followed by raw byte fields, without base64 expansion. */
-export function encodeSyncTransfer(value: unknown): Uint8Array {
+function prepareSyncTransfer(value: unknown): { header: Uint8Array; parts: Uint8Array[]; length: number } {
   const fields: BinaryField[] = []
   const parts: Uint8Array[] = []
   const ancestors = new Set<object>()
@@ -60,6 +73,16 @@ export function encodeSyncTransfer(value: unknown): Uint8Array {
   const header = new TextEncoder().encode(stringifyJsonRpc({ version: 1, value: metadata, fields }, true))
   const length = 4 + header.length + parts.reduce((sum, part) => sum + part.length, 0)
   if (length > SYNC_TRANSFER_MAX_BYTES) throw new RangeError('Wallet sync record exceeds the transfer size limit')
+  return { header, parts, length }
+}
+
+/** Exact frame size without copying bulk fields into an intermediate frame. */
+export function syncTransferLength(value: unknown): number {
+  return prepareSyncTransfer(value).length
+}
+
+export function encodeSyncTransfer(value: unknown): Uint8Array {
+  const { header, parts, length } = prepareSyncTransfer(value)
   const frame = new Uint8Array(length)
   new DataView(frame.buffer).setUint32(0, header.length, false)
   frame.set(header, 4)
@@ -135,6 +158,9 @@ export function validateSyncTransferCapabilities(value: SyncTransferCapabilities
       (!Number.isSafeInteger(value.inlineBytes) ||
         value.inlineBytes < 1024 ||
         value.inlineBytes > SYNC_TRANSFER_MAX_BYTES))
+    || (value.binaryTransport?.version === 1 &&
+      (!Number.isSafeInteger(value.binaryTransport.inlineBytes) || value.binaryTransport.inlineBytes < 1024 ||
+        value.binaryTransport.inlineBytes > SYNC_TRANSFER_MAX_BYTES))
   ) {
     throw new TypeError('Unsupported wallet sync transfer capabilities')
   }

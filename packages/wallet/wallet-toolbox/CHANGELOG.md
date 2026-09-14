@@ -6,6 +6,16 @@ attention to changes that materially alter behavior or extend functionality.
 
 ## wallet-toolbox (unreleased)
 
+- Add negotiated raw binary HTTP sync, shared across full, browser and mobile
+  clients, for ordinary pages and bounded resumable parts. Preserve BRC-103
+  authentication, provider pricing, integrity verification and atomic checkpoints.
+  Recover transient inline read failures using advertised transfer support.
+  Retain JSON compatibility; no additional migration from 2.13.0.
+
+- Bound inline sync by serialized JSON size, including base64 expansion. Honor
+  the negotiated read ceiling and allow a smaller provider inline-sync ceiling
+  without changing ordinary RPC limits, validation, timeouts or database schema.
+
 - Integrate upstream security corrections without dropping the sync recovery contracts.
   Record combined browser/mobile artifact costs and limits in the sync transfer guide.
 

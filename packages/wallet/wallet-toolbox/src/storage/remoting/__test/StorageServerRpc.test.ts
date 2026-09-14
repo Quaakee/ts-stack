@@ -1,4 +1,5 @@
 import { parseJsonRpc } from '../BinaryJson'
+import { encodeSyncTransfer, decodeSyncTransfer, SYNC_BINARY_ENCODING, SYNC_BINARY_HEADER } from '../SyncTransfer'
 import { validateSyncChunkEntities } from '../entityValidationHelpers'
 import { type Request, type Response } from 'express'
 import { TelemetryEvent, WalletLoggerInterface, Transaction, Script, MerklePath } from '@bsv/sdk'
@@ -35,6 +36,10 @@ function makeResponse(): CapturedResponse {
     json: (body: unknown) => {
       captured.body = body
       return response
+    },
+    send: (body: unknown) => {
+      captured.body = body
+      return response
     }
   } as unknown as Response
   captured.response = response
@@ -53,6 +58,7 @@ function makeRequest(
     auth: { identityKey },
     body,
     header: (name: string) => normalizedHeaders[name.toLowerCase()],
+    is: (type: string) => normalizedHeaders['content-type'] === type,
     headers: normalizedHeaders,
     ip: '127.0.0.1',
     method: 'POST',
@@ -127,6 +133,34 @@ describe('StorageServer JSON-RPC boundary', () => {
     consoleError.mockRestore()
   })
 
+  test('decodes negotiated sync before pricing and uses a signed binary response marker', async () => {
+    const server = makeServer()
+    Reflect.set(server, 'syncTransfers', { capabilities: { binaryTransport: { version: 1, inlineBytes: 262144 } } })
+    const body = { jsonrpc: '2.0', method: 'processSyncChunk', params: [{ identityKey: 'alice' }, emptyChunk], id: 7 }
+    const request = makeRequest(encodeSyncTransfer(body), { 'content-type': 'application/octet-stream' })
+    await invoke(server, 'decodeBinarySyncRequest', request)
+    expect(request.body).toEqual(body)
+    const captured = makeResponse()
+    await invoke(server, 'handleRpcRequest', request, captured.response, 'binary-sync')
+    expect(captured.statusCode).toBe(200)
+    expect(captured.headers[SYNC_BINARY_HEADER]).toBe(SYNC_BINARY_ENCODING)
+    expect(captured.headers['Content-Type']).toBe('application/octet-stream')
+    expect(captured.body).toBeInstanceOf(Uint8Array)
+    expect(decodeSyncTransfer(captured.body)).toEqual({ jsonrpc: '2.0', id: 7,
+      result: { done: true, inserts: 0, updates: 0 } })
+  })
+
+  test('leaves the legacy endpoint available when raw sync is disabled', async () => {
+    const server = makeServer({}, { syncBinaryTransport: false })
+    const request = makeRequest(encodeSyncTransfer({ jsonrpc: '2.0', method: 'getSyncChunk', params: [], id: 1 }),
+      { 'content-type': 'application/octet-stream' })
+    await expect(invoke(server, 'decodeBinarySyncRequest', request)).rejects.toThrow('unavailable')
+    const captured = makeResponse()
+    await invoke(server, 'handleRpcRequest', makeRequest({ jsonrpc: '2.0', method: 'getSettings', params: [], id: 1 }), captured.response)
+    expect(captured.body.result.storageIdentityKey).toBe('storage-key')
+    expect(captured.headers[SYNC_BINARY_HEADER]).toBeUndefined()
+  })
+
   test('negotiates binary JSON, records trace context, and dispatches a valid RPC', async () => {
     const server = makeServer()
     const captured = makeResponse()
@@ -182,6 +216,30 @@ describe('StorageServer JSON-RPC boundary', () => {
     const captured = makeResponse()
     await invoke(server, 'handleRpcRequest', makeRequest({ jsonrpc: '2.0', method: 'getSettings', params: [], id: 1 }), captured.response)
     expect(captured.statusCode).toBe(413)
+  })
+
+  test.each([true, false])('honors the inline sync ceiling only for negotiated transfers: %s', async negotiated => {
+    const page = { ...emptyChunk, outputs: [{ lockingScript: Array(4096).fill(173) }] }
+    const server = makeServer({ getSyncChunk: async () => page }, { maxRpcResponseBytes: 65536 })
+    const manifest = { transferId: 'a'.repeat(64), digest: 'b'.repeat(64), totalBytes: 4096, partBytes: 1024, expiresAt: Date.now() + 60000 }
+    const beginRead = jest.fn(async () => manifest)
+    Reflect.set(server, 'syncTransfers', { capabilities: { inlineBytes: 2048 }, beginRead })
+    const captured = makeResponse()
+    await invoke(server, 'handleRpcRequest', makeRequest({ jsonrpc: '2.0', method: 'getSyncChunk',
+      params: [{ identityKey: 'alice', maxItems: 1, maxRoughSize: 65536, ...(negotiated ? { syncTransferVersion: 1 } : {}) }], id: 1
+    }, { [BINARY_ENCODING_HEADER]: BINARY_ENCODING }), captured.response)
+    expect(captured.statusCode).toBe(200)
+    if (negotiated) {
+      expect(captured.body.result).toEqual({ syncTransfer: manifest })
+      expect(beginRead).toHaveBeenCalledTimes(1)
+    } else {
+      expect(captured.body.result.outputs[0].lockingScript.$bsvBinary).toBe('base64')
+      expect(beginRead).not.toHaveBeenCalled()
+    }
+  })
+
+  test.each([0, 1023, 1.5, NaN, Infinity, 67108865])('rejects invalid inline sync configuration: %s', value => {
+    expect(() => makeServer({}, { syncTransferInlineBytes: value })).toThrow('syncTransferInlineBytes')
   })
 
   test('advertises compact checkpoints without modifying stored settings and authenticates checkpoint reads', async () => {

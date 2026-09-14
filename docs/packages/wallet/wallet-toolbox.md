@@ -4,9 +4,9 @@ title: '@bsv/wallet-toolbox'
 kind: package
 domain: wallet
 npm: '@bsv/wallet-toolbox'
-version: '2.13.0'
-last_updated: '2026-09-10'
-last_verified: '2026-09-10'
+version: '2.14.0'
+last_updated: '2026-09-14'
+last_verified: '2026-09-14'
 review_cadence_days: 30
 status: stable
 tags: ['wallet', 'brc100']
@@ -14,6 +14,13 @@ repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/wallet/wall
 ---
 
 # @bsv/wallet-toolbox
+
+The unpublished 2.14.0 candidate adds negotiated raw binary HTTP for sync pages
+and bounded transfer parts, with authenticated responses and safe checkpoint
+recovery. Legacy providers retain JSON compatibility; failed inline reads can
+recover through their existing transfer-part support. No additional database
+migration is needed from 2.13.0. See the [transfer guide](https://github.com/bsv-blockchain/ts-stack/blob/main/packages/wallet/wallet-toolbox/docs/sync-transfer.md)
+for rollout controls, limits and compatibility.
 
 `@bsv/wallet-toolbox` is the reference toolkit for building BRC-100 wallets. It connects `@bsv/sdk` primitives to wallet storage, key derivation, signing, services, monitoring, permissions, and authentication flows.
 

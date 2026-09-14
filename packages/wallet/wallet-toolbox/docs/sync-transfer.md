@@ -8,14 +8,46 @@ pages continue to use `getSyncChunk` and `processSyncChunk`.
 ## Negotiation and limits
 
 A migrated Knex-backed `StorageServer` advertises `syncTransfer` in runtime
-settings: `{ version: 1, maxBytes, partBytes, inlineBytes }`. These are transport
-capabilities, not persisted settings columns. `syncTransfers: false` disables
+settings: `{ version: 1, maxBytes, partBytes, inlineBytes, binaryTransport? }`.
+`binaryTransport: { version: 1, inlineBytes }` advertises raw HTTP sync. These are
+transport capabilities, not persisted settings columns. `syncTransfers: false` disables
 advertisement and transfer RPCs during a mixed-version deployment. A client
 must not infer support from compact checkpoints or binary JSON alone.
 
-Version 1 accepts frames up to 64 MiB, with parts no larger than 256 KiB. Parts
-are carried by the existing authenticated binary-JSON codec. The frame itself
-stores binary fields directly, avoiding a second base64 encoding. The server
+`inlineBytes` bounds the serialized JSON-RPC message, not the raw transfer frame.
+Base64 expansion can push a frame below 4 MiB over a 4 MiB inline ceiling.
+`StorageServer` accepts `syncTransferInlineBytes` (1024–67108864 bytes), clamped to
+the existing HTTP-derived ceiling. For example, 262144 favors bounded transfers
+on slower links. Its default retains the existing advertised ceiling; other RPC
+limits, authentication deadlines, validation and schema are unchanged. Old peers
+without transfer negotiation retain their existing response behavior.
+
+New clients prefer raw binary when the provider advertises version 1. They POST
+frames to `/sync/v1` using `application/octet-stream`, for ordinary sync pages
+and all six transfer methods. Responses use the same frame and include the
+BRC-103-signed `x-bsv-binary-encoding: sync-v1` header, already exposed by the
+default browser CORS policy. BRC-103 authentication verifies
+the exact request bytes before decoding; existing authorization, pricing,
+validation and checkpoint logic then process the original RPC object. The body
+is raw bytes on HTTP, with no base64 wrapper. Ordinary wallet RPCs remain JSON.
+
+Raw inline pages default to at most 256 KiB. `binaryTransport.inlineBytes` bounds
+the raw RPC envelope, independently of the legacy JSON ceiling. Larger pages use
+parts of at most 256 KiB plus bounded framing metadata. Both ceilings and part
+size respect configured HTTP body/response limits. `StorageClient` and
+`StorageMobile` accept `binarySync: false` to keep a connection on JSON.
+
+For a rolling deployment, set `syncBinaryTransport: false` until every replica
+and reverse proxy serves `/sync/v1`, then enable advertisement and reconnect
+clients. Legacy providers and unknown future transport versions continue using
+the existing authenticated JSON transfer methods. A failed write is never
+silently resent using another transport. The new route does not require a new
+migration beyond the transfer tables already introduced in 2.13.0; rolling back
+from this release to 2.13.0 preserves those tables and committed wallet data.
+
+Version 1 accepts frames up to 64 MiB. With older peers, parts are carried by the
+existing authenticated binary-JSON codec. The frame itself stores binary fields
+directly, avoiding a second base64 encoding. The server
 uses smaller parts for smaller request or response limits, and leaves this
 feature disabled when either limit is below 4096 bytes. This is bounded transfer of
 large records, not unlimited-size or constant-memory database streaming: the
@@ -42,10 +74,14 @@ binds every request/response to the authenticated session.
 ## RPC sequence
 
 After negotiation a `getSyncChunk` request can include `syncTransferVersion: 1`.
-If its normal response exceeds the HTTP ceiling, the server returns
+If its normal response exceeds the advertised inline ceiling (or HTTP ceiling), the server returns
 `{ syncTransfer: manifest }` in the JSON-RPC result instead of HTTP 413. The
 client reads, verifies and decodes the staged frame before exposing the ordinary
-`SyncChunk` to its caller. Requests without the hint keep their legacy response
+`SyncChunk` to its caller. If an inline read fails with a transient network error
+(including browser `Load failed`), a provider advertising transfer support is
+retried through `beginReadSyncTransfer` and bounded parts. Authentication and
+semantic errors still fail. Immutable part reads/writes have at most three
+attempts with backoff; committing a wallet mutation is never blindly retried. Requests without the hint keep their legacy response
 shape. This avoids repeated oversized responses and repeated source queries.
 
 Every transfer method takes one object in `params`, including the authenticated
@@ -91,8 +127,8 @@ watermark and offsets to match the current durable checkpoint under the page
 transaction; stale commits cannot advance counters twice. Completed transfer
 results are retained until release/expiry, including after a server restart.
 
-Run the wallet migration before enabling the new server code on every replica.
-For rollback, stop transfer traffic, preserve the current database, then use the
+When upgrading from a release **before 2.13.0**, run the wallet migration before
+enabling transfer support on every replica. For rollback to a pre-transfer runtime, stop transfer traffic, preserve the current database, then use the
 new runtime's Knex migration source to run **only** this migration down (including
 its ledger entry) before restarting the old runtime. This removes incomplete
 staging, not wallet records or committed checkpoints; clients can resume those
@@ -113,19 +149,32 @@ IndexedDB replica is not itself a BRC-38 or BRC-39 export file. Passing portable
 export/import regression tests is evidence for those tested paths, not a blanket
 claim that every wallet feature or legacy migration is strictly conformant.
 
+## Reproducing the transport comparison
+
+Run `pnpm --filter @bsv/wallet-toolbox bench:sync-transport`. It uploads and
+restores a synthetic 3.75 MiB record through authenticated loopback HTTP using
+identical 256 KiB parts, alternating raw and base64 JSON across six trials.
+It reports actual request/response body bytes and verifies restored hashes and
+unchanged repeat sync. HTTP headers and TLS overhead are excluded. Wall times
+depend on the machine and concurrent work; this is not a production throughput
+claim or a full-wallet benchmark. The fixture never funds or broadcasts a transaction.
+
 ## Artifact cost requiring review
 
-The framing, integrity checks, adaptive page controller and validated proof-provider
-lookup add portable code. After integrating upstream security fixes, exact packed
-macOS consumers measured the following bytes. Hermes compression varies slightly
-with build paths.
+The raw HTTP exchange adds portable code to the existing framing, integrity,
+adaptive controller and proof-provider support. Exact packed macOS consumers
+measured the following bytes for the 2.14.0 candidate. Relative to the prior
+recorded artifacts, raw growth is 1,730 bytes (Vite), 1,529 (esbuild), 1,696
+(Metro), and 2,714 (Hermes). Browser gzip growth is below 500 bytes. No dependency
+is added. Only exceeded raw/Brotli ceilings advance; existing gzip allowances
+remain. Hermes compression varies slightly with build paths.
 
 | Artifact | Raw | Gzip | Brotli | Raw ceiling | Gzip ceiling | Brotli ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vite | 1,716,150 | 404,965 | 316,747 | 1,717,000 | 406,500 | 317,000 |
-| esbuild | 1,338,800 | 368,089 | 295,540 | 1,339,500 | 369,500 | 296,000 |
-| Metro | 1,767,013 | 448,892 | 347,746 | 1,768,000 | 455,000 | 360,000 |
-| Hermes | 3,586,809 | 1,439,723 | 1,133,805 | 3,588,000 | 1,460,500 | 1,135,000 |
+| Vite | 1,717,880 | 405,414 | 317,200 | 1,719,000 | 406,500 | 318,000 |
+| esbuild | 1,340,329 | 368,548 | 296,133 | 1,341,500 | 369,500 | 297,000 |
+| Metro | 1,768,709 | 449,391 | 348,033 | 1,770,000 | 455,000 | 360,000 |
+| Hermes | 3,589,523 | 1,441,219 | 1,133,688 | 3,591,000 | 1,460,500 | 1,135,000 |
 
 Before upstream integration, Linux CI measured Vite gzip at 404,970 and Hermes
 gzip at 1,457,902, above the corresponding macOS measurements. The combined

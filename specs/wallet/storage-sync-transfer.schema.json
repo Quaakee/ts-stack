@@ -331,6 +331,21 @@
           "type": "integer",
           "minimum": 1024,
           "maximum": 67108864
+        },
+        "binaryTransport": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "inlineBytes": {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 67108864
+            }
+          },
+          "required": ["version", "inlineBytes"]
         }
       },
       "required": ["version", "maxBytes", "partBytes"]

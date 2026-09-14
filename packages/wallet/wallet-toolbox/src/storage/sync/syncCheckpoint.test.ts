@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { decodeSyncTransfer } from '../remoting/SyncTransfer'
 import { StorageServer } from '../remoting/StorageServer'
 import { _tu } from '../../../test/utils/TestUtilsWalletStorage'
 import { PrivateKey } from '@bsv/sdk'
@@ -190,7 +191,7 @@ describe('compact sync checkpoints', () => {
     }
   )
 
-  test('backs up and restores every page through authenticated HTTP with compact committed progress', async () => {
+  test.each([false, true])('backs up and restores every page through authenticated HTTP with compact progress, raw binary %s', async binarySync => {
     const remote = await _tu.createSQLiteTestWallet({ databaseName: 'compactCheckpointHttp', dropAll: true })
     const source = await makeStorage()
     const restored = await makeStorage()
@@ -207,7 +208,7 @@ describe('compact sync checkpoints', () => {
       if (!server.server.listening) await once(server.server, 'listening')
       const address = server.server.address()
       if (address == null || typeof address === 'string') throw new Error('test server did not bind')
-      client = new StorageClient(remote.wallet, `http://localhost:${address.port}`, { binaryRequests: true })
+      client = new StorageClient(remote.wallet, `http://localhost:${address.port}`, { binaryRequests: true, binarySync })
       const identityKey = remote.identityKey
       const manager = new WalletStorageManager(identityKey, source)
       await manager.makeAvailable()
@@ -248,9 +249,17 @@ describe('compact sync checkpoints', () => {
         } as never
       )
       expect(process.mock.calls[0][1].outputs?.[0].lockingScript).toEqual(bytes)
-      const body = JSON.parse(String(fetchSpy.mock.calls[0][1]?.body))
-      expect(body.params[1].outputs[0].lockingScript.$bsvBinary).toBe('base64')
-      expect(JSON.stringify(body).length).toBeLessThan(JSON.stringify(bytes).length)
+      const wire = fetchSpy.mock.calls[0][1]?.body
+      if (binarySync) {
+        expect(wire).toBeInstanceOf(Uint8Array)
+        const body = decodeSyncTransfer(wire as Uint8Array) as { params: [unknown, { outputs: [{ lockingScript: Uint8Array }] }] }
+        expect(body.params[1].outputs[0].lockingScript).toEqual(Uint8Array.from(bytes))
+        expect((wire as Uint8Array).length).toBeLessThan(bytes.length + 1024)
+      } else {
+        const body = JSON.parse(String(wire))
+        expect(body.params[1].outputs[0].lockingScript.$bsvBinary).toBe('base64')
+        expect(JSON.stringify(body).length).toBeLessThan(JSON.stringify(bytes).length)
+      }
     } finally {
       await client?.destroy()
       await server.close()
