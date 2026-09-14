@@ -96,7 +96,7 @@ the RPC validation coordinator remains excluded from browser/mobile bundles.
 
 Toolbox 2.13.0 contains the transfer extension. The unpublished 2.14.0 candidate
 adds negotiated raw binary HTTP for sync pages and parts, without base64 body
-expansion. Raw pages default to a 256 KiB inline ceiling; larger pages use bounded
+expansion. Raw pages default to a 1 MiB inline ceiling; larger pages use bounded
 parts. Older providers continue using JSON, with transient read failures recovered
 through their advertised transfer support. Providers can also set
 `syncTransferInlineBytes` for a smaller legacy JSON ceiling. Rollout controls and

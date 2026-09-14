@@ -374,8 +374,10 @@ export class StorageServer {
       this.syncTransfers = new KnexSyncTransferStore(storage.knex, {
         version: 1, maxBytes: SYNC_TRANSFER_MAX_BYTES,
         ...(binarySync ? { binaryTransport: { version: 1 as const,
-          inlineBytes: Math.min(inlineSyncLimit, SYNC_TRANSFER_PART_BYTES, Math.floor(binaryBodyLimit / 2),
-            this.maxRpcResponseBytes === -1 ? SYNC_TRANSFER_PART_BYTES : Math.floor(this.maxRpcResponseBytes / 2)) } } : {}),
+          // Keep ordinary pages on one authenticated exchange; oversized records
+          // still use smaller, resumable parts. Inline and part budgets differ.
+          inlineBytes: Math.min(inlineSyncLimit, 1024 * 1024, Math.floor(binaryBodyLimit / 2),
+            this.maxRpcResponseBytes === -1 ? 1024 * 1024 : Math.floor(this.maxRpcResponseBytes / 2)) } } : {}),
         inlineBytes: Math.min(inlineSyncLimit, Math.floor(jsonBodyLimit / 2),
           this.maxRpcResponseBytes === -1 ? SYNC_TRANSFER_MAX_BYTES : Math.floor(this.maxRpcResponseBytes / 2)),
         partBytes: Math.min(SYNC_TRANSFER_PART_BYTES, Math.floor(jsonBodyLimit / 4),

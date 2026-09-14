@@ -22,7 +22,7 @@ async function local(): Promise<StorageIdb> {
 test('advertises a configured inline ceiling bounded by the HTTP response limit', async () => {
   const remote = await _tu.createSQLiteTestWallet({ databaseName: 'inlineCeiling', dropAll: true })
   try {
-    for (const [configured, responseLimit, expected] of [[262144, 8388608, 262144], [262144, 65536, 32768]]) {
+    for (const [configured, responseLimit, expected] of [[262144, 8388608, 262144], [262144, 65536, 32768], [1048576, 8388608, 1048576]]) {
       const server = new StorageServer(remote.activeStorage, {
         port: 0, wallet: remote.wallet, monetize: false,
         syncTransferInlineBytes: configured, maxRpcResponseBytes: responseLimit
@@ -36,6 +36,55 @@ test('advertises a configured inline ceiling bounded by the HTTP response limit'
     expect(capabilities.version).toBe(1)
     expect(capabilities.binaryTransport).toBeUndefined()
   } finally {
+    await remote.wallet.destroy()
+  }
+})
+
+test.each([256 * 1024, 1024 * 1024])('copies a medium page with a %i byte inline ceiling without unnecessary staging', async inlineBytes => {
+  const remote = await _tu.createSQLiteTestWallet({ databaseName: 'mediumPageHttp', dropAll: true })
+  const source = await local()
+  const restored = await local()
+  const server = new StorageServer(remote.activeStorage, {
+    port: 0, wallet: remote.wallet, monetize: false, syncTransferInlineBytes: inlineBytes
+  })
+  let client: StorageClient | undefined
+  try {
+    server.start()
+    if (!server.server.listening) await once(server.server, 'listening')
+    const address = server.server.address()
+    if (address == null || typeof address === 'string') throw new Error('fixture did not bind')
+    client = new StorageClient(remote.wallet, `http://localhost:${address.port}`)
+    const identityKey = remote.identityKey
+    const manager = new WalletStorageManager(identityKey, source)
+    await manager.makeAvailable()
+    const { user } = await source.findOrInsertUser(identityKey)
+    const bytes = new Uint8Array(512 * 1024).fill(73)
+    const now = new Date()
+    await source.insertTransaction({
+      transactionId: 0, userId: user.userId, created_at: now, updated_at: now,
+      reference: 'medium-synthetic', status: 'nosend', isOutgoing: true,
+      satoshis: 0, description: 'synthetic medium record', inputBEEF: Array.from(bytes), rawTx: [1, 2, 3]
+    })
+    const directions = new Set<string>()
+    client.onSyncTransferProgress = progress => { directions.add(progress.direction) }
+    await manager.syncToWriter({ identityKey }, client)
+    const restoreManager = new WalletStorageManager(identityKey, restored)
+    await restoreManager.makeAvailable()
+    await restoreManager.syncFromReader(identityKey, client)
+    expect(directions).toEqual(inlineBytes === 256 * 1024 ? new Set(['write', 'read']) : new Set())
+    const rows = await restored.findTransactions({ partial: { reference: 'medium-synthetic' } })
+    expect(rows).toHaveLength(1)
+    expect(syncTransferDigest(Uint8Array.from(rows[0].inputBEEF!))).toBe(syncTransferDigest(bytes))
+    const repeat = await manager.syncToWriter({ identityKey }, client)
+    expect(repeat.inserts).toBe(0)
+    expect(repeat.updates).toBe(0)
+  } finally {
+    await client?.destroy()
+    await server.close()
+    await source.destroy()
+    await source.dropAllData()
+    await restored.destroy()
+    await restored.dropAllData()
     await remote.wallet.destroy()
   }
 })

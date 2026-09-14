@@ -31,7 +31,8 @@ the exact request bytes before decoding; existing authorization, pricing,
 validation and checkpoint logic then process the original RPC object. The body
 is raw bytes on HTTP, with no base64 wrapper. Ordinary wallet RPCs remain JSON.
 
-Raw inline pages default to at most 256 KiB. `binaryTransport.inlineBytes` bounds
+Raw inline pages default to at most 1 MiB. This avoids staging ordinary medium
+pages across several authenticated round trips. `binaryTransport.inlineBytes` bounds
 the raw RPC envelope, independently of the legacy JSON ceiling. Larger pages use
 parts of at most 256 KiB plus bounded framing metadata. Both ceilings and part
 size respect configured HTTP body/response limits. `StorageClient` and
@@ -164,17 +165,17 @@ claim or a full-wallet benchmark. The fixture never funds or broadcasts a transa
 The raw HTTP exchange adds portable code to the existing framing, integrity,
 adaptive controller and proof-provider support. Exact packed macOS consumers
 measured the following bytes for the 2.14.0 candidate. Relative to the prior
-recorded artifacts, raw growth is 1,730 bytes (Vite), 1,529 (esbuild), 1,696
-(Metro), and 2,714 (Hermes). Browser gzip growth is below 500 bytes. No dependency
+recorded artifacts, raw growth is 1,725 bytes (Vite), 1,521 (esbuild), 1,692
+(Metro), and 2,718 (Hermes). Browser gzip growth is below 500 bytes. No dependency
 is added. Only exceeded raw/Brotli ceilings advance; existing gzip allowances
 remain. Hermes compression varies slightly with build paths.
 
 | Artifact | Raw | Gzip | Brotli | Raw ceiling | Gzip ceiling | Brotli ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Vite | 1,717,880 | 405,414 | 317,200 | 1,719,000 | 406,500 | 318,000 |
-| esbuild | 1,340,329 | 368,548 | 296,133 | 1,341,500 | 369,500 | 297,000 |
-| Metro | 1,768,709 | 449,391 | 348,033 | 1,770,000 | 455,000 | 360,000 |
-| Hermes | 3,589,523 | 1,441,219 | 1,133,688 | 3,591,000 | 1,460,500 | 1,135,000 |
+| Vite | 1,717,875 | 405,424 | 317,213 | 1,719,000 | 406,500 | 318,000 |
+| esbuild | 1,340,321 | 368,546 | 296,088 | 1,341,500 | 369,500 | 297,000 |
+| Metro | 1,768,705 | 449,402 | 348,240 | 1,770,000 | 455,000 | 360,000 |
+| Hermes | 3,589,527 | 1,441,377 | 1,133,706 | 3,591,000 | 1,460,500 | 1,135,000 |
 
 Before upstream integration, Linux CI measured Vite gzip at 404,970 and Hermes
 gzip at 1,457,902, above the corresponding macOS measurements. The combined
