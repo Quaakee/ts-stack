@@ -93,9 +93,10 @@ export class HTTPSOverlayBroadcastFacilitator implements OverlayBroadcastFacilit
     const defaultClient =
       typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
         ? globalThis.fetch.bind(globalThis)
-        : undefined
-    if (!httpClient && !defaultClient) throw new Error('Fetch API is unavailable')
-    this.httpClient = httpClient ?? defaultClient!
+        : (async () => {
+            throw new Error('Fetch API is unavailable')
+          }) as typeof fetch
+    this.httpClient = httpClient ?? defaultClient
     this.allowHTTP = allowHTTP
   }
 
