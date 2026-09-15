@@ -86,6 +86,19 @@ existing remote backup survived checkpoint recovery; its unchanged repeat made
 zero inserts and zero updates. This replay spanned
 interruptions and tuning revisions, so it is not a fresh-upload timing benchmark.
 
+An independent tester report (2026-09-15), using Toolbox `633099bf` and desktop
+`191ef496`, also completed device and remote backups, unchanged repeats with zero
+inserts/updates, and a fresh isolated restore of **25,001 records across all 12
+categories** in **27m 8s**. The primary was preserved and cleanup verified.
+Intermittent legacy source-read failures recovered through bounded parts. Remote
+reads consumed over 99% of restore time despite the restore source advertising
+raw binary transport; further latency diagnosis is needed. Eleven category counts
+matched the retained local copy; two additional remote transaction proofs remain
+unexplained. These are tester-reported results, not an independently repeated run
+or proof of record-by-record equality. See the desktop
+[review handoff](https://github.com/p2ppsr/metanet-client-desktop/blob/feat/backup-storage-and-primary-swap/docs/backup-sync-handoff.md)
+for follow-up work and release prerequisites.
+
 The controlled HTTP body comparison and identical-page source-read measurement
 below isolate particular gains. Different native runs used different data and
 settings; no controlled whole-wallet speedup is claimed. The candidate still
