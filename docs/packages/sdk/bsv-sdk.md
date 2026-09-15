@@ -3,7 +3,7 @@ id: bsv-sdk
 title: '@bsv/sdk'
 kind: package
 domain: sdk
-version: '2.6.0'
+version: '2.6.1'
 npm: '@bsv/sdk'
 last_updated: '2026-09-10'
 last_verified: '2026-09-10'
@@ -23,6 +23,19 @@ Security-sensitive consumers require affirmative cryptographic verdicts.
 `IdentityClient` will not publish a certificate whose certifier signature is
 invalid, and `GlobalKVStore` discards untrusted overlay entries unless their
 controller signature verifies as valid.
+
+The local 2.6.1 patch candidate supports zero-field certificate proofs only in
+initial responses, after checking the locally retained issuer/type/field
+request and expected peer identity. It validates the signed encrypted core
+without revealing or decrypting field values. Holder `proveCertificate`
+permission checks remain mandatory. Custom session stores need to preserve
+`PeerSession.requestedCertificates` to support zero-field proofs. Legacy stores
+that omit the snapshot keep existing nonempty-disclosure and no-certificate
+behavior, while zero-field validation fails closed.
+Standalone and mid-session metadata-only responses remain unsupported; the
+patch does not establish replay protection or change listener admission
+ordering. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-local-source-candidate)
+for the precise limitations. Source preparation is not publication.
 
 ## Install
 

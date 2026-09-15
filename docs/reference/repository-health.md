@@ -69,8 +69,11 @@ full-audit commands. Structural and generated-content checks remain global.
 
 `governance/repository-health/baselines.json` records the dated starting
 measurements for CI, conformance, lint, TypeScript, coverage, security,
-SonarCloud, governance, and published package versions. Update a measurement
-only from authoritative evidence and retain the evidence URL.
+SonarCloud, and governance. Its `publicPackageVersions` inventory tracks public
+package **source manifest** versions and must match those manifests; it is not
+registry publication evidence. Published baselines are recorded separately in
+`governance/package-release-notes.json`. Update a measurement only from
+authoritative evidence and retain the evidence URL.
 
 The lint record retains the original 846-warning baseline while ratcheting the
 current authored-code result to zero across 1,909 files. The TypeScript checker

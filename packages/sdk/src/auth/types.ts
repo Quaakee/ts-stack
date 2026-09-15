@@ -41,4 +41,6 @@ export interface PeerSession {
   lastUpdate: number
   certificatesRequired?: boolean
   certificatesValidated?: boolean
+  /** Local snapshot of the initial certificate request, never taken from a response. */
+  requestedCertificates?: RequestedCertificateSet
 }

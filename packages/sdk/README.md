@@ -31,6 +31,46 @@ in UMD; their reviewed ceilings are 742,500 and 556,000 bytes respectively.
 The combined sync and security candidate measures 560,560 raw bytes with esbuild;
 its reviewed raw ceiling is 561,000 bytes. Compression ceilings are unchanged.
 
+## Zero-field certificate proofs (local source candidate)
+
+The local 2.6.1 patch candidate supports BRC-52 zero-field proofs in the
+`initialResponse` handshake path. A locally retained request must name the
+exact issuer and certificate type with `fields=[]`. Validation checks the
+subject and issuer-signed encrypted core, then accepts an empty or nullish
+keyring without calling `decryptFields` or the verifier wallet's `decrypt`.
+Any keyring entry is refused for that zero-field request. This proves no hidden
+plaintext field value. Existing nonempty-field decryption is unchanged.
+
+The holder still calls `proveCertificate` with the exact verifier, certificate,
+and empty field list. Wallet permission denial must propagate; zero disclosure
+does not bypass that permission decision. The SDK tests use real cryptography
+with fixture certificate storage and permission decisions; they do not prove
+wallet-toolbox or DCAP integration.
+
+The initiator snapshots its request when starting the handshake. For zero-field support, custom
+`AsyncSessionManager` implementations must preserve the optional
+`PeerSession.requestedCertificates` snapshot. Legacy stores that omit it retain
+existing nonempty-disclosure and no-certificate behavior, but zero-field
+validation fails closed. A response from a different explicitly requested identity is refused.
+
+Standalone `certificateResponse` messages with an empty or nullish keyring
+remain unsupported, including responses to mid-session zero-field requests.
+That path has no authoritative response-bound request, and the inbound
+`requestedCertificates` field must not enable zero-field acceptance. The
+existing nonempty standalone path is retained. This candidate does not fix
+standalone request provenance ([upstream #491](https://github.com/bsv-blockchain/ts-stack/issues/491)),
+listener admission ordering ([#492](https://github.com/bsv-blockchain/ts-stack/issues/492)),
+or provide replay protection. An initial-response replay can still reach the
+certificate listener; `verifyNonce` checks token provenance, not single use.
+Consumers remain responsible for session authorization and freshness.
+
+The initial-response implementation reuses local metadata bindings and releases
+waiters directly after certificate validation. This reduces its browser artifact
+without changing validation guards, callback order, or package budgets.
+
+This is a local source candidate, not a published or deployed version. There is
+no wire-format change, and full zero-field BRC-103 support remains incomplete.
+
 ## Table of Contents
 
 1. [Objective](#objective)

@@ -4,9 +4,13 @@ import { VerifiableCertificate } from '../certificates/VerifiableCertificate.js'
 
 /**
  * Validates and processes the certificates received from a peer.
+ * An exact, locally retained request for zero fields validates the signed core
+ * without decryption. Callers must authenticate and bind the message to that
+ * request; a peer-supplied requestedCertificates member is not request authority.
  *
  * @private
  * @param {AuthMessage} message - The message containing the certificates to validate.
+ * @param {boolean} allowZeroFields - Whether the caller has retained a trusted request for zero-field validation.
  * @returns {Promise<void>}
  * @throws Will throw an error if certificate validation or field decryption fails.
  */
@@ -14,7 +18,8 @@ export const validateCertificates = async (
   verifierWallet: WalletInterface,
   message: AuthMessage,
   certificatesRequested?: RequestedCertificateSet,
-  originator?: OriginatorDomainNameStringUnder250Bytes
+  originator?: OriginatorDomainNameStringUnder250Bytes,
+  allowZeroFields: boolean = true
 ): Promise<void> => {
   if ((message.certificates == null) || message.certificates.length === 0) {
     throw new Error('No certificates were provided in the AuthMessage.')
@@ -63,6 +68,20 @@ export const validateCertificates = async (
           throw new Error(
             `Certificate with type ${certToVerify.type} was not requested`
           )
+        }
+
+        // BRC-52 permits zero revealed fields and an empty or omitted keyring.
+        // The signed core and requested issuer/type have already been checked.
+        if (allowZeroFields && Array.isArray(requestedFields) && requestedFields.length === 0) {
+          const { keyring } = certToVerify
+          if (keyring != null && (
+            typeof keyring !== 'object' ||
+            Array.isArray(keyring) ||
+            Object.keys(keyring).length > 0
+          )) {
+            throw new Error('Unexpected keyring.')
+          }
+          return
         }
       }
 

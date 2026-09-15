@@ -214,6 +214,15 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+- Local 2.6.1 patch candidate: support zero-field BRC-52 proofs in initial
+  responses using a retained local request and expected peer identity. Empty or
+  omitted keyrings require the exact issuer/type/empty-field request and no
+  decryption occurs. Keep the holder's exact-verifier `proveCertificate` call.
+  Refuse metadata-only standalone responses; mid-session zero-field proofs and
+  replay protection remain unsupported. Custom session stores must preserve
+  `PeerSession.requestedCertificates` for zero-field support; legacy nonempty
+  and no-certificate behavior remains compatible. No wire-format change or publication.
+
 - Stop late certificate work and session recovery from dispatching requests after
   an AuthFetch authentication timeout. Preserve the original gateway error and
   do not automatically replay failed writes.
