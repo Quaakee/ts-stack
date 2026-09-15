@@ -203,7 +203,7 @@ describe('localKVStore', () => {
 
     beforeEach(() => {
       // Get the mock instance that will be created by `new PushDrop()`
-      pushDropInstance = new (PushDrop as any)()
+      _pushDropInstance = new (PushDrop as any)()
     })
 
     it('should create a new encrypted output if none exists', async () => {
@@ -594,7 +594,7 @@ describe('localKVStore', () => {
 
     beforeEach(() => {
       // Get the mock instance that will be created by `new PushDrop()`
-      pushDropInstance = new (PushDrop as any)()
+      _pushDropInstance = new (PushDrop as any)()
     })
 
     it('should do nothing and return void if key does not exist', async () => {
