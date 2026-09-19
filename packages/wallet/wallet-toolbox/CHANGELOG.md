@@ -4,6 +4,17 @@ This document captures the history of significant changes to the wallet-toolbox 
 The git commit history contains the details but is unable to draw
 attention to changes that materially alter behavior or extend functionality.
 
+## 2.10.2-atlas.520.1 (ATLAS maintained artifact)
+
+- Extend existing `createAction` `sendWith` to recover a validated failed signed
+  action by requeueing exactly its stored bytes and restoring reservations
+  atomically, resolving known ancestry from wallet storage and rechecking complete
+  output lineage and the original user/action binding after asynchronous work.
+  Reconcile exact-tx known responses and retain ambiguous broadcasts
+  as pending. No replacement action or new public wallet API is introduced.
+- Distribution is an immutable ATLAS tarball, not an upstream npm release.
+  See [exact-retry compatibility and limitations](docs/atlas-exact-resume.md).
+
 ## wallet-toolbox (unreleased)
 
 - Integrate upstream security corrections without dropping the sync recovery contracts.
