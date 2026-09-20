@@ -223,9 +223,16 @@ All notable changes to this project will be documented in this file. The format 
   `PeerSession.requestedCertificates` for zero-field support; legacy nonempty
   and no-certificate behavior remains compatible. No wire-format change or publication.
 
-- Stop late certificate work and session recovery from dispatching requests after
-  an AuthFetch authentication timeout. Preserve the original gateway error and
-  do not automatically replay failed writes.
+- Give each AuthFetch authenticated request a private cancellation lifecycle.
+  Abort handshake and application fetches at the 30-second deadline, cancel
+  pending-certificate polling, and prevent late wallet, session, or certificate
+  work from dispatching the application request. Preserve the exact timeout
+  message while adding non-secret request ID and `not-dispatched` or
+  `possibly-dispatched` details. Wallet prompts are not cancelled; late results
+  are ignored. Preserve immediate gateway and wallet-denial errors and never
+  automatically replay a write after its deadline. The exact packed browser
+  graph measures 743,033 Vite / 560,939 esbuild / 555,978 UMD raw bytes; only
+  the reviewed Vite raw ceiling moves, from 742,500 to 743,500 bytes.
 
 ### Added
 

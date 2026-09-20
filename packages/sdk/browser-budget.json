@@ -16,7 +16,7 @@
   "prohibitedExports": [],
   "maximumBytes": {
     "vite": {
-      "raw": 742500,
+      "raw": 743500,
       "gzip": 185000,
       "brotli": 150000
     },

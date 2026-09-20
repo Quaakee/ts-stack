@@ -45,34 +45,41 @@ export class SimplifiedFetchTransport implements Transport {
    *
    * @throws Will throw an error if no listener has been registered via `onData`.
    */
-  async send(message: AuthMessage): Promise<void> {
+  async send(message: AuthMessage, signal?: AbortSignal): Promise<void> {
     if (this.onDataCallback == null) {
       throw new Error(
         'Listen before you start speaking. God gave you two ears and one mouth for a reason.'
       )
     }
-    if (message.messageType !== 'general') return await this.sendAuthMessage(message)
-    await this.sendGeneralMessage(message)
+    if (message.messageType !== 'general') {
+      return await this.sendAuthMessage(message, signal)
+    }
+    await this.sendGeneralMessage(message, signal)
   }
 
-  private async fetchAuthMessage(url: string, message: AuthMessage): Promise<Response> {
+  private async fetchAuthMessage(
+    url: string,
+    message: AuthMessage,
+    signal?: AbortSignal
+  ): Promise<Response> {
     try {
       return await this.fetchClient(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: stringifyBRC100(message)
+        body: stringifyBRC100(message),
+        signal
       })
     } catch (error) {
       throw this.createNetworkError(url, error)
     }
   }
 
-  private async sendAuthMessage(message: AuthMessage): Promise<void> {
+  private async sendAuthMessage(message: AuthMessage, signal?: AbortSignal): Promise<void> {
     return await new Promise((resolve, reject) => {
       void (async () => {
         try {
           const url = `${this.baseUrl}/.well-known/auth`
-          const responsePromise = this.fetchAuthMessage(url, message)
+          const responsePromise = this.fetchAuthMessage(url, message, signal)
           if (message.messageType !== 'initialRequest') resolve()
 
           const response = await responsePromise
@@ -125,12 +132,17 @@ export class SimplifiedFetchTransport implements Transport {
     return request
   }
 
-  private async fetchGeneralResponse(url: string, request: any): Promise<Response> {
+  private async fetchGeneralResponse(
+    url: string,
+    request: any,
+    signal?: AbortSignal
+  ): Promise<Response> {
     try {
       return await this.fetchClient(url, {
         method: request.method,
         headers: request.headers,
-        body: request.body
+        body: request.body,
+        signal
       })
     } catch (error) {
       throw this.createNetworkError(url, error)
@@ -221,10 +233,10 @@ export class SimplifiedFetchTransport implements Transport {
     return message
   }
 
-  private async sendGeneralMessage(message: AuthMessage): Promise<void> {
+  private async sendGeneralMessage(message: AuthMessage, signal?: AbortSignal): Promise<void> {
     const request = this.prepareGeneralRequest(message)
     const url = `${this.baseUrl}${request.urlPostfix}`
-    const response = await this.fetchGeneralResponse(url, request)
+    const response = await this.fetchGeneralResponse(url, request, signal)
     const body = Array.from(new Uint8Array(await response.arrayBuffer()))
     this.validateResponseAuthentication(url, response, body)
     await this.onDataCallback!(this.createGeneralResponseMessage(url, response, body))

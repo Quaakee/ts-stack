@@ -29,7 +29,7 @@ export interface AuthMessage {
 }
 
 export interface Transport {
-  send: (message: AuthMessage) => Promise<void>
+  send: (message: AuthMessage, signal?: AbortSignal) => Promise<void>
   onData: (callback: (message: AuthMessage) => Promise<void>) => Promise<void>
 }
 

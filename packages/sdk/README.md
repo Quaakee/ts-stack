@@ -16,9 +16,20 @@ emits a portable `number[]` settlement artifact so HTTP, WebSocket, Message Box,
 and JSON transports preserve identical transaction bytes. The same boundary
 protects overlay lookup queries and JSON BEEF responses.
 
-AuthFetch stops pending certificate dispatch and session recovery after its
-request deadline. An already dispatched request may still complete on the
-server; callers must resolve its outcome before retrying a non-idempotent write.
+AuthFetch gives each authenticated request a private 30-second cancellation
+lifecycle. The deadline aborts handshake or request fetches and prevents the
+application request from being dispatched when pending certificate, session,
+or wallet work finishes late. It does not cancel an already displayed wallet
+approval prompt; the late result is ignored. The timeout message remains
+`Timed out waiting for authenticated response.` and its non-secret `details`
+contain the request ID plus `dispatchState: 'not-dispatched'` or
+`'possibly-dispatched'`. The latter means the server may still complete the
+request, so callers must resolve its outcome before retrying a non-idempotent
+write. AuthFetch does not automatically retry after the deadline.
+The exact packed browser graph measures 743,033 raw bytes with Vite, 560,939
+with esbuild, and 555,978 in UMD. The reviewed raw ceilings are 743,500,
+561,000, and 556,000 bytes respectively; only the Vite raw ceiling moved
+(from 742,500), while every gzip and Brotli ceiling remains unchanged.
 
 For signature payloads of at least 64 KiB, `ProtoWallet` uses asynchronous
 platform SHA-256 when Web Crypto is available, avoiding long synchronous
