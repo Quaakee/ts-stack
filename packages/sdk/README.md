@@ -34,16 +34,20 @@ delayed or cancellation-ignoring custom transports. The server may still
 complete such a request; callers must resolve its outcome before retrying a
 non-idempotent write. AuthFetch does not automatically retry after the deadline.
 
-The in-memory `SessionManager` atomically removes a cancelled handshake only
-while it remains unauthenticated. Durable `AsyncSessionManager` implementations
-may provide optional `removeSessionIfUnauthenticated(sessionNonce)` with the
-same atomic compare-and-remove behavior. Legacy async stores remain compatible;
-Peer leaves their cancelled unauthenticated row for normal TTL or session
-maintenance instead of issuing a racy get-then-remove.
+The in-memory `SessionManager` atomically coordinates authentication and
+cancellation. Durable `AsyncSessionManager` implementations may provide the
+optional pair `updateSessionIfUnauthenticated(session)` and
+`removeSessionIfUnauthenticated(sessionNonce)`. Both operations must be atomic:
+the update returns `true` only when it transitioned the still-unauthenticated
+row, while the remove deletes only that state. Peer enables durable cleanup
+only when both methods exist. Legacy or partially upgraded async stores remain
+compatible; Peer leaves their cancelled row for normal TTL or session
+maintenance instead of risking a delete followed by a stale authenticated
+upsert from another replica.
 
-The exact packed browser graph measures 744,619 raw bytes with Vite, 562,126
-with esbuild, and 557,165 in UMD. The reviewed raw ceilings are 745,000,
-562,500, and 557,500 bytes respectively; every gzip and Brotli ceiling remains
+The exact packed browser graph measures 745,578 raw bytes with Vite, 562,797
+with esbuild, and 557,845 in UMD. The reviewed raw ceilings are 746,000,
+564,000, and 558,500 bytes respectively; every gzip and Brotli ceiling remains
 unchanged.
 
 For signature payloads of at least 64 KiB, `ProtoWallet` uses asynchronous

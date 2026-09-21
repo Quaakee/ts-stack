@@ -435,8 +435,25 @@ export class Peer {
         throwIfSendAborted(signal)
         await this.transport.send(initialRequest, signal)
       })
-      const [responseNonce] = await Promise.all([initialResponse, send])
-      return responseNonce
+      const handshake = Promise.all([initialResponse, send])
+      if (signal == null) {
+        const [responseNonce] = await handshake
+        return responseNonce
+      }
+
+      let removeAbortListener = (): void => {}
+      const abort = new Promise<never>((_resolve, reject) => {
+        const onAbort = (): void => reject(signal.reason)
+        signal.addEventListener('abort', onAbort, { once: true })
+        removeAbortListener = () => signal.removeEventListener('abort', onAbort)
+        if (signal.aborted) onAbort()
+      })
+      try {
+        const [responseNonce] = await Promise.race([handshake, abort])
+        return responseNonce
+      } finally {
+        removeAbortListener()
+      }
     } catch (error) {
       this.stopListeningForInitialResponsesByNonce(sessionNonce)
       this.cancelledInitialResponseSessions.add(sessionNonce)
@@ -448,7 +465,13 @@ export class Peer {
         const removeSessionIfUnauthenticated = (
           this.sessionManager as SessionManager & AsyncSessionManager
         ).removeSessionIfUnauthenticated
-        if (typeof removeSessionIfUnauthenticated === 'function') {
+        const updateSessionIfUnauthenticated = (
+          this.sessionManager as SessionManager & AsyncSessionManager
+        ).updateSessionIfUnauthenticated
+        if (
+          typeof removeSessionIfUnauthenticated === 'function' &&
+          typeof updateSessionIfUnauthenticated === 'function'
+        ) {
           await removeSessionIfUnauthenticated.call(this.sessionManager, sessionNonce)
         }
       } finally {
@@ -715,22 +738,40 @@ export class Peer {
       )
     }
 
-    // --- Transport authentication complete ---
-    peerSession.peerNonce = initialNonce
-    peerSession.peerIdentityKey = identityKey
-    peerSession.isAuthenticated = true
-
     const requestedCertificates = peerSession.requestedCertificates ?? this.certificatesToRequest
-    peerSession.certificatesRequired =
+    const certificatesRequired =
       Array.isArray(requestedCertificates?.certifiers) &&
       requestedCertificates.certifiers.length > 0
 
-    // IMPORTANT: validation defaults to false if certs are required
-    peerSession.certificatesValidated = !peerSession.certificatesRequired
+    // --- Transport authentication complete ---
+    const authenticatedSession: PeerSession = {
+      ...peerSession,
+      peerNonce: initialNonce,
+      peerIdentityKey: identityKey,
+      isAuthenticated: true,
+      certificatesRequired,
+      // IMPORTANT: validation defaults to false if certs are required
+      certificatesValidated: !certificatesRequired,
+      lastUpdate: Date.now()
+    }
 
-    peerSession.lastUpdate = Date.now()
-    await sessionManager.updateSession(peerSession)
-    return peerSession
+    const coordinatedManager = sessionManager as SessionManager & AsyncSessionManager
+    const updateSessionIfUnauthenticated = coordinatedManager.updateSessionIfUnauthenticated
+    if (
+      typeof updateSessionIfUnauthenticated === 'function' &&
+      typeof coordinatedManager.removeSessionIfUnauthenticated === 'function'
+    ) {
+      const updated = await updateSessionIfUnauthenticated.call(
+        sessionManager,
+        authenticatedSession
+      )
+      if (!updated) {
+        throw new Error(`Peer session is no longer pending for peer: ${identityKey}`)
+      }
+    } else {
+      await sessionManager.updateSession(authenticatedSession)
+    }
+    return authenticatedSession
   }
 
   private async validateInitialResponseCertificates(

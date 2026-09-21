@@ -17,12 +17,19 @@ import { PeerSession } from './types.js'
 export interface AsyncSessionManager {
   addSession: (session: PeerSession) => Promise<void>
   updateSession: (session: PeerSession) => Promise<void>
+  /**
+   * Atomically updates a nonce-owned session only while its stored state is
+   * unauthenticated. Returns false when the row is absent or already
+   * transitioned. Implement together with `removeSessionIfUnauthenticated`.
+   */
+  updateSessionIfUnauthenticated?: (session: PeerSession) => Promise<boolean>
   getSession: (identifier: string) => Promise<PeerSession | undefined>
   removeSession: (session: PeerSession) => Promise<void>
   /**
    * Atomically removes the nonce-owned session only if it is still
    * unauthenticated. Durable stores may implement this to clean cancelled
-   * handshakes without racing a concurrent authentication update.
+   * handshakes without racing a concurrent authentication update. Implement
+   * together with `updateSessionIfUnauthenticated`.
    */
   removeSessionIfUnauthenticated?: (sessionNonce: string) => Promise<void>
   hasSession: (identifier: string) => Promise<boolean>
@@ -88,6 +95,15 @@ export class SessionManager {
     // Remove the old references (if any) and re-add
     this.removeSession(session)
     this.addSession(session)
+  }
+
+  /** Atomically transitions an existing unauthenticated session. */
+  updateSessionIfUnauthenticated (session: PeerSession): boolean {
+    if (typeof session.sessionNonce !== 'string') return false
+    const current = this.sessionNonceToSession.get(session.sessionNonce)
+    if (current?.isAuthenticated !== false) return false
+    this.updateSession(session)
+    return true
   }
 
   /**
