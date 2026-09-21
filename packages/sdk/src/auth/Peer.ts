@@ -145,6 +145,8 @@ export class Peer {
    *
    * @param {number[]} message - The message payload to send.
    * @param {string} [identityKey] - The identity public key of the peer. If not provided, uses lastInteractedWithPeer (if any).
+   * @param {AbortSignal} [signal] - Optional internal cancellation signal forwarded to the transport.
+   * @param {() => void} [onDispatch] - Optional internal marker invoked immediately before the general-message transport send.
    * @returns {Promise<void>}
    * @throws Will throw an error if the message fails to send.
    */
@@ -410,27 +412,31 @@ export class Peer {
       certificatesValidated: !certificatesRequired,
       requestedCertificates
     })
-    throwIfSendAborted(signal)
-
-    const identityPublicKey = await this.getIdentityPublicKey()
-
-    const initialRequest: AuthMessage = {
-      version: AUTH_VERSION,
-      messageType: 'initialRequest',
-      identityKey: identityPublicKey,
-      initialNonce: sessionNonce,
-      requestedCertificates: JSON.parse(requestJSON)
-    }
-
-    // Register before sending: an in-memory or otherwise synchronous transport
-    // can deliver the response before send() resolves.
-    const initialResponse = this.waitForInitialResponse(sessionNonce)
     try {
+      throwIfSendAborted(signal)
+
+      const identityPublicKey = await this.getIdentityPublicKey()
+
+      const initialRequest: AuthMessage = {
+        version: AUTH_VERSION,
+        messageType: 'initialRequest',
+        identityKey: identityPublicKey,
+        initialNonce: sessionNonce,
+        requestedCertificates: JSON.parse(requestJSON)
+      }
+
+      // Register before sending: an in-memory or otherwise synchronous transport
+      // can deliver the response before send() resolves.
+      const initialResponse = this.waitForInitialResponse(sessionNonce)
       throwIfSendAborted(signal)
       await this.transport.send(initialRequest, signal)
       return await initialResponse
     } catch (error) {
       this.stopListeningForInitialResponsesByNonce(sessionNonce)
+      const session = await this.sessionManager.getSession(sessionNonce)
+      if (session?.isAuthenticated === false) {
+        await this.sessionManager.removeSession(session)
+      }
       throw error
     }
   }
