@@ -52,7 +52,7 @@ cancellable new-session handshakes fail before creating a row or sending until
 the store implements both methods. This prevents a delayed response from
 authenticating or disclosing certificates after cancellation.
 
-The exact packed browser graph measures 748,819 raw bytes with Vite, 564,990
+The exact packed browser graph measures 748,809 raw bytes with Vite, 564,990
 with esbuild, and 560,055 in UMD. The reviewed raw ceilings are 749,000,
 566,000, and 560,500 bytes respectively; every gzip and Brotli ceiling remains
 unchanged.
