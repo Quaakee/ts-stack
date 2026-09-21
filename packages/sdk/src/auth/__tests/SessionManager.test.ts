@@ -146,6 +146,53 @@ describe('SessionManager', () => {
     })
   })
 
+  describe('removeSessionIfUnauthenticated', () => {
+    it('removes an unauthenticated session', () => {
+      sessionManager.addSession(validSession)
+
+      sessionManager.removeSessionIfUnauthenticated('testSessionNonce')
+
+      expect(sessionManager.getSession('testSessionNonce')).toBeUndefined()
+      expect(sessionManager.getSession('testPeerIdentityKey')).toBeUndefined()
+    })
+
+    it('preserves an authenticated session', () => {
+      validSession.isAuthenticated = true
+      sessionManager.addSession(validSession)
+
+      sessionManager.removeSessionIfUnauthenticated('testSessionNonce')
+
+      expect(sessionManager.getSession('testSessionNonce')).toBe(validSession)
+      expect(sessionManager.getSession('testPeerIdentityKey')).toBe(validSession)
+    })
+  })
+
+  describe('updateSessionIfUnauthenticated', () => {
+    it('updates only an existing unauthenticated session', () => {
+      sessionManager.addSession(validSession)
+      const authenticatedSession = {
+        ...validSession,
+        isAuthenticated: true
+      }
+
+      expect(
+        sessionManager.updateSessionIfUnauthenticated(authenticatedSession)
+      ).toBe(true)
+      expect(sessionManager.getSession('testSessionNonce')).toBe(
+        authenticatedSession
+      )
+      expect(
+        sessionManager.updateSessionIfUnauthenticated(validSession)
+      ).toBe(false)
+      expect(
+        sessionManager.updateSessionIfUnauthenticated({
+          ...validSession,
+          sessionNonce: 'missing'
+        })
+      ).toBe(false)
+    })
+  })
+
   describe('hasSession', () => {
     it('should return true if a session exists for the identifier', () => {
       sessionManager.addSession(validSession)

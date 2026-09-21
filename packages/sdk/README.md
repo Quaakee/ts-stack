@@ -16,9 +16,46 @@ emits a portable `number[]` settlement artifact so HTTP, WebSocket, Message Box,
 and JSON transports preserve identical transaction bytes. The same boundary
 protects overlay lookup queries and JSON BEEF responses.
 
-AuthFetch stops pending certificate dispatch and session recovery after its
-request deadline. An already dispatched request may still complete on the
-server; callers must resolve its outcome before retrying a non-idempotent write.
+AuthFetch gives each authenticated request a private 30-second cancellation
+lifecycle. The deadline prevents application dispatch when pending
+certificate, session, or wallet work finishes late. The maintained
+`SimplifiedFetchTransport` also forwards the optional abort signal to handshake
+and application fetches. Stale-session recovery and authenticated-to-plain
+fallback keep the original absolute deadline; they do not receive a fresh
+30-second window, and plain fallback I/O is aborted when that budget expires.
+The built-in AuthFetch certificate listener also receives the signal, so a late
+wallet result cannot dispatch certificate disclosure. Custom certificate-request
+listeners should honor their optional third signal argument. AuthFetch does not cancel an
+already displayed wallet approval prompt; the late result is ignored. Custom `Transport`
+implementations must check the optional signal before any delayed side-effect
+dispatch and forward it to cancellation-aware I/O. A transport that ignores
+the signal after `send` begins may still dispatch after the AuthFetch promise
+times out. The timeout message remains
+`Timed out waiting for authenticated response.` and its non-secret `details`
+contain the request ID plus `dispatchState: 'not-dispatched'` or
+`'possibly-dispatched'`. For the application request, Peer marks the latter
+immediately before entering the transport, so it conservatively includes
+delayed or cancellation-ignoring custom transports and remains cumulative
+across stale-session recovery attempts. The server may still
+complete such a request; callers must resolve its outcome before retrying a
+non-idempotent write. AuthFetch does not automatically retry after the deadline.
+
+The in-memory `SessionManager` atomically coordinates authentication and
+cancellation. Durable `AsyncSessionManager` implementations may provide the
+optional pair `updateSessionIfUnauthenticated(session)` and
+`removeSessionIfUnauthenticated(sessionNonce)`. Both operations must be atomic:
+the update returns `true` only when it transitioned the still-unauthenticated
+row, while the remove deletes only that state. Peer enables durable cleanup
+only when both methods exist. Legacy or partially upgraded async stores remain
+source-compatible for non-cancellable Peer flows, but AuthFetch and other
+cancellable new-session handshakes fail before creating a row or sending until
+the store implements both methods. This prevents a delayed response from
+authenticating or disclosing certificates after cancellation.
+
+The exact packed browser graph measures 748,809 raw bytes with Vite, 564,990
+with esbuild, and 560,055 in UMD. The reviewed raw ceilings are 749,000,
+566,000, and 560,500 bytes respectively; every gzip and Brotli ceiling remains
+unchanged.
 
 For signature payloads of at least 64 KiB, `ProtoWallet` uses asynchronous
 platform SHA-256 when Web Crypto is available, avoiding long synchronous

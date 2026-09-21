@@ -12,13 +12,28 @@ import { PeerSession } from './types.js'
  *
  * {@link Peer} accepts `SessionManager | AsyncSessionManager` and awaits every
  * call internally, so sync stores incur no extra latency while async stores
- * work transparently.
+ * work transparently. Cancellable new-session handshakes require both optional
+ * atomic methods below; legacy implementations remain usable for
+ * non-cancellable Peer flows.
  */
 export interface AsyncSessionManager {
   addSession: (session: PeerSession) => Promise<void>
   updateSession: (session: PeerSession) => Promise<void>
+  /**
+   * Atomically updates a nonce-owned session only while its stored state is
+   * unauthenticated. Returns false when the row is absent or already
+   * transitioned. Implement together with `removeSessionIfUnauthenticated`.
+   */
+  updateSessionIfUnauthenticated?: (session: PeerSession) => Promise<boolean>
   getSession: (identifier: string) => Promise<PeerSession | undefined>
   removeSession: (session: PeerSession) => Promise<void>
+  /**
+   * Atomically removes the nonce-owned session only if it is still
+   * unauthenticated. Durable stores may implement this to clean cancelled
+   * handshakes without racing a concurrent authentication update. Implement
+   * together with `updateSessionIfUnauthenticated`.
+   */
+  removeSessionIfUnauthenticated?: (sessionNonce: string) => Promise<void>
   hasSession: (identifier: string) => Promise<boolean>
 }
 
@@ -84,6 +99,15 @@ export class SessionManager {
     this.addSession(session)
   }
 
+  /** Atomically transitions an existing unauthenticated session. */
+  updateSessionIfUnauthenticated (session: PeerSession): boolean {
+    if (typeof session.sessionNonce !== 'string') return false
+    const current = this.sessionNonceToSession.get(session.sessionNonce)
+    if (current?.isAuthenticated !== false) return false
+    this.updateSession(session)
+    return true
+  }
+
   /**
    * Retrieves a session based on a given identifier, which can be:
    *  - A sessionNonce, or
@@ -143,6 +167,14 @@ export class SessionManager {
           this.identityKeyToNonces.delete(session.peerIdentityKey)
         }
       }
+    }
+  }
+
+  /** Atomically removes a cancelled handshake that has not authenticated. */
+  removeSessionIfUnauthenticated (sessionNonce: string): void {
+    const session = this.sessionNonceToSession.get(sessionNonce)
+    if (session?.isAuthenticated === false) {
+      this.removeSession(session)
     }
   }
 

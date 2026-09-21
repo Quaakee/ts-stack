@@ -223,9 +223,32 @@ All notable changes to this project will be documented in this file. The format 
   `PeerSession.requestedCertificates` for zero-field support; legacy nonempty
   and no-certificate behavior remains compatible. No wire-format change or publication.
 
-- Stop late certificate work and session recovery from dispatching requests after
-  an AuthFetch authentication timeout. Preserve the original gateway error and
-  do not automatically replay failed writes.
+- Give each AuthFetch authenticated request a private cancellation lifecycle.
+  Cancel pending-certificate polling and prevent late wallet, session, or
+  certificate work from entering the transport. The maintained fetch transport
+  forwards the deadline signal to handshake and application fetches; custom
+  transports must honor the optional signal before delayed side-effect dispatch
+  and in their I/O. Preserve the exact timeout message while adding non-secret
+  request ID and conservative `not-dispatched` or `possibly-dispatched` details.
+  Wallet prompts are not cancelled; late results are ignored. Preserve immediate
+  gateway and wallet-denial errors and never automatically replay a write after
+  its deadline. Keep stale-session retry and authenticated-to-plain fallback on
+  the original absolute deadline, abort fallback I/O when it expires, and carry
+  cancellation through initial-response certificate selection so late wallet
+  approval cannot dispatch disclosure. Coordinate cancellation with in-progress
+  initial-response work
+  and atomically clean up an aborted unauthenticated handshake when the session
+  manager supports paired conditional authentication and removal, without
+  deleting one that completed authentication or allowing a stale cross-replica
+  authentication upsert. Durable async stores may implement the optional atomic
+  pair. Legacy or partially upgraded stores remain compatible for non-cancellable
+  Peer flows, while cancellable new-session handshakes fail before row creation
+  or transport send. Preserve cumulative `possibly-dispatched` state across
+  stale-session recovery attempts.
+  The exact packed browser
+  graph measures 748,809 Vite / 564,990 esbuild / 560,055 UMD raw bytes. The
+  reviewed raw ceilings are 749,000 / 566,000 / 560,500 bytes; compression
+  ceilings remain unchanged.
 
 ### Added
 

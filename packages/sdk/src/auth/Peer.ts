@@ -20,6 +20,15 @@ const AUTH_VERSION = '0.1'
 const BufferCtor =
   typeof globalThis === 'undefined' ? undefined : (globalThis as any).Buffer
 
+function throwIfSendAborted (signal?: AbortSignal): void {
+  if (signal == null) return
+  if (typeof signal.throwIfAborted === 'function') {
+    signal.throwIfAborted()
+  } else if (signal.aborted) {
+    throw signal.reason ?? new Error('The operation was aborted.')
+  }
+}
+
 /**
  * Represents a peer capable of performing mutual authentication.
  * Manages sessions, handles authentication handshakes, certificate requests and responses,
@@ -53,7 +62,8 @@ export class Peer {
   number,
   (
     senderPublicKey: string,
-    requestedCertificates: RequestedCertificateSet
+    requestedCertificates: RequestedCertificateSet,
+    signal?: AbortSignal
   ) => void | Promise<void>
   > = new Map()
 
@@ -61,6 +71,10 @@ export class Peer {
   number,
   { callback: (sessionNonce: string) => void, sessionNonce: string }
   > = new Map()
+
+  private readonly initialResponseTasks: Map<string, Set<Promise<void>>> = new Map()
+  private readonly cancelledInitialResponseSessions: Set<string> = new Set()
+  private readonly initialResponseSignals: Map<string, AbortSignal> = new Map()
 
   // Promise-based mechanism for waiting on certificate validation
   private readonly certificateValidationPromises: Map<
@@ -141,12 +155,16 @@ export class Peer {
    *
    * @param {number[]} message - The message payload to send.
    * @param {string} [identityKey] - The identity public key of the peer. If not provided, uses lastInteractedWithPeer (if any).
+   * @param {AbortSignal} [signal] - Optional internal cancellation signal forwarded to the transport.
+   * @param {() => void} [onDispatch] - Optional internal marker invoked immediately before the general-message transport send.
    * @returns {Promise<void>}
    * @throws Will throw an error if the message fails to send.
    */
   async toPeer (
     message: number[],
-    identityKey?: string
+    identityKey?: string,
+    signal?: AbortSignal,
+    onDispatch?: () => void
   ): Promise<void> {
     if (
       this.autoPersistLastSession &&
@@ -156,7 +174,8 @@ export class Peer {
       identityKey = this.lastInteractedWithPeer
     }
 
-    const peerSession = await this.getAuthenticatedSession(identityKey)
+    const peerSession = await this.getAuthenticatedSession(identityKey, signal)
+    throwIfSendAborted(signal)
 
     if (peerSession.peerIdentityKey == null) {
       throw new Error('Peer identity is not established')
@@ -176,11 +195,15 @@ export class Peer {
       keyID: `${requestNonce} ${peerSession.peerNonce ?? ''}`,
       counterparty: peerSession.peerIdentityKey
     }, this.originator)
+    throwIfSendAborted(signal)
+
+    const identityPublicKey = await this.getIdentityPublicKey()
+    throwIfSendAborted(signal)
 
     const generalMessage: AuthMessage = {
       version: AUTH_VERSION,
       messageType: 'general',
-      identityKey: await this.getIdentityPublicKey(),
+      identityKey: identityPublicKey,
       nonce: requestNonce,
       yourNonce: peerSession.peerNonce,
       payload: message,
@@ -191,7 +214,12 @@ export class Peer {
     await this.sessionManager.updateSession(peerSession)
 
     try {
-      await this.transport.send(generalMessage)
+      // The marker and send invocation are intentionally synchronous with the
+      // final abort check. Once marked, callers must treat the outcome as
+      // indeterminate even if cancellation wins the response race.
+      throwIfSendAborted(signal)
+      onDispatch?.()
+      await this.transport.send(generalMessage, signal)
     } catch (error: unknown) {
       this.propagateTransportError(peerSession.peerIdentityKey, error)
     }
@@ -264,7 +292,8 @@ export class Peer {
    * @returns {Promise<PeerSession>} - A promise that resolves with an authenticated `PeerSession`.
    */
   async getAuthenticatedSession (
-    identityKey?: string
+    identityKey?: string,
+    signal?: AbortSignal
   ): Promise<PeerSession> {
     if (this.transport === undefined) {
       throw new Error('Peer transport is not connected!')
@@ -278,7 +307,8 @@ export class Peer {
     // If that session doesn't exist or isn't authenticated, initiate handshake
     if (peerSession?.isAuthenticated !== true) {
       // This will create a brand-new session
-      const sessionNonce = await this.initiateHandshake(identityKey)
+      const sessionNonce = await this.initiateHandshake(identityKey, signal)
+      throwIfSendAborted(signal)
       // Now retrieve it by the sessionNonce
       peerSession = await this.sessionManager.getSession(sessionNonce)
       if (peerSession?.isAuthenticated !== true) {
@@ -338,13 +368,14 @@ export class Peer {
   /**
    * Registers a callback to listen for certificates requested from peers.
    *
-   * @param {(senderPublicKey: string, requestedCertificates: RequestedCertificateSet) => void | Promise<void>} callback - The function to call when a certificate request is received
+   * @param {(senderPublicKey: string, requestedCertificates: RequestedCertificateSet, signal?: AbortSignal) => void | Promise<void>} callback - The function to call when a certificate request is received
    * @returns {number} The ID of the callback listener.
    */
   listenForCertificatesRequested (
     callback: (
       senderPublicKey: string,
-      requestedCertificates: RequestedCertificateSet
+      requestedCertificates: RequestedCertificateSet,
+      signal?: AbortSignal
     ) => void | Promise<void>
   ): number {
     const callbackID = this.callbackIdCounter++
@@ -369,9 +400,23 @@ export class Peer {
    * @returns {Promise<string>} A promise that resolves to the session nonce.
    */
   private async initiateHandshake (
-    identityKey?: string
+    identityKey?: string,
+    signal?: AbortSignal
   ): Promise<string> {
+    throwIfSendAborted(signal)
+    if (signal != null) {
+      const sessionManager = this.sessionManager as SessionManager & AsyncSessionManager
+      if (
+        typeof sessionManager.updateSessionIfUnauthenticated !== 'function' ||
+        typeof sessionManager.removeSessionIfUnauthenticated !== 'function'
+      ) {
+        throw new Error(
+          'Cancellable handshakes require a session manager implementing both updateSessionIfUnauthenticated and removeSessionIfUnauthenticated.'
+        )
+      }
+    }
     const sessionNonce = await createNonce(this.wallet, undefined, this.originator)
+    throwIfSendAborted(signal)
 
     const now = Date.now()
     // Snapshot exactly the JSON request sent on the wire, with independent
@@ -390,23 +435,72 @@ export class Peer {
       certificatesValidated: !certificatesRequired,
       requestedCertificates
     })
-
-    const initialRequest: AuthMessage = {
-      version: AUTH_VERSION,
-      messageType: 'initialRequest',
-      identityKey: await this.getIdentityPublicKey(),
-      initialNonce: sessionNonce,
-      requestedCertificates: JSON.parse(requestJSON)
-    }
-
-    // Register before sending: an in-memory or otherwise synchronous transport
-    // can deliver the response before send() resolves.
-    const initialResponse = this.waitForInitialResponse(sessionNonce)
     try {
-      await this.transport.send(initialRequest)
-      return await initialResponse
+      throwIfSendAborted(signal)
+
+      const identityPublicKey = await this.getIdentityPublicKey()
+
+      const initialRequest: AuthMessage = {
+        version: AUTH_VERSION,
+        messageType: 'initialRequest',
+        identityKey: identityPublicKey,
+        initialNonce: sessionNonce,
+        requestedCertificates: JSON.parse(requestJSON)
+      }
+
+      // Register before sending: an in-memory or otherwise synchronous transport
+      // can deliver the response before send() resolves.
+      if (signal != null) {
+        this.initialResponseSignals.set(sessionNonce, signal)
+      }
+      const initialResponse = this.waitForInitialResponse(sessionNonce, signal)
+      const send = Promise.resolve().then(async () => {
+        throwIfSendAborted(signal)
+        await this.transport.send(initialRequest, signal)
+      })
+      const handshake = Promise.all([initialResponse, send])
+      if (signal == null) {
+        const [responseNonce] = await handshake
+        return responseNonce
+      }
+
+      let removeAbortListener = (): void => {}
+      const abort = new Promise<never>((_resolve, reject) => {
+        const onAbort = (): void => reject(signal.reason)
+        signal.addEventListener('abort', onAbort, { once: true })
+        removeAbortListener = () => signal.removeEventListener('abort', onAbort)
+        if (signal.aborted) onAbort()
+      })
+      try {
+        const [responseNonce] = await Promise.race([handshake, abort])
+        return responseNonce
+      } finally {
+        removeAbortListener()
+      }
     } catch (error) {
       this.stopListeningForInitialResponsesByNonce(sessionNonce)
+      this.cancelledInitialResponseSessions.add(sessionNonce)
+      try {
+        const tasks = this.initialResponseTasks.get(sessionNonce)
+        if (tasks != null) {
+          await Promise.allSettled(tasks)
+        }
+        const removeSessionIfUnauthenticated = (
+          this.sessionManager as SessionManager & AsyncSessionManager
+        ).removeSessionIfUnauthenticated
+        const updateSessionIfUnauthenticated = (
+          this.sessionManager as SessionManager & AsyncSessionManager
+        ).updateSessionIfUnauthenticated
+        if (
+          typeof removeSessionIfUnauthenticated === 'function' &&
+          typeof updateSessionIfUnauthenticated === 'function'
+        ) {
+          await removeSessionIfUnauthenticated.call(this.sessionManager, sessionNonce)
+        }
+      } finally {
+        this.cancelledInitialResponseSessions.delete(sessionNonce)
+        this.initialResponseSignals.delete(sessionNonce)
+      }
       throw error
     }
   }
@@ -418,13 +512,25 @@ export class Peer {
    * @returns {Promise<string>} A promise that resolves with the session nonce when the initial response is received.
    */
   private async waitForInitialResponse (
-    sessionNonce: string
+    sessionNonce: string,
+    signal?: AbortSignal
   ): Promise<string> {
-    return await new Promise(resolve => {
-      const callbackID = this.listenForInitialResponse(sessionNonce, nonce => {
+    throwIfSendAborted(signal)
+    return await new Promise((resolve, reject) => {
+      const cleanup = (): void => {
         this.stopListeningForInitialResponses(callbackID)
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const onAbort = (): void => {
+        cleanup()
+        reject(signal?.reason)
+      }
+      const callbackID = this.listenForInitialResponse(sessionNonce, nonce => {
+        cleanup()
         resolve(nonce)
       })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted === true) onAbort()
     })
   }
 
@@ -656,22 +762,40 @@ export class Peer {
       )
     }
 
-    // --- Transport authentication complete ---
-    peerSession.peerNonce = initialNonce
-    peerSession.peerIdentityKey = identityKey
-    peerSession.isAuthenticated = true
-
     const requestedCertificates = peerSession.requestedCertificates ?? this.certificatesToRequest
-    peerSession.certificatesRequired =
+    const certificatesRequired =
       Array.isArray(requestedCertificates?.certifiers) &&
       requestedCertificates.certifiers.length > 0
 
-    // IMPORTANT: validation defaults to false if certs are required
-    peerSession.certificatesValidated = !peerSession.certificatesRequired
+    // --- Transport authentication complete ---
+    const authenticatedSession: PeerSession = {
+      ...peerSession,
+      peerNonce: initialNonce,
+      peerIdentityKey: identityKey,
+      isAuthenticated: true,
+      certificatesRequired,
+      // IMPORTANT: validation defaults to false if certs are required
+      certificatesValidated: !certificatesRequired,
+      lastUpdate: Date.now()
+    }
 
-    peerSession.lastUpdate = Date.now()
-    await sessionManager.updateSession(peerSession)
-    return peerSession
+    const coordinatedManager = sessionManager as SessionManager & AsyncSessionManager
+    const updateSessionIfUnauthenticated = coordinatedManager.updateSessionIfUnauthenticated
+    if (
+      typeof updateSessionIfUnauthenticated === 'function' &&
+      typeof coordinatedManager.removeSessionIfUnauthenticated === 'function'
+    ) {
+      const updated = await updateSessionIfUnauthenticated.call(
+        sessionManager,
+        authenticatedSession
+      )
+      if (!updated) {
+        throw new Error(`Peer session is no longer pending for peer: ${identityKey}`)
+      }
+    } else {
+      await sessionManager.updateSession(authenticatedSession)
+    }
+    return authenticatedSession
   }
 
   private async validateInitialResponseCertificates(
@@ -708,7 +832,10 @@ export class Peer {
     }
   }
 
-  private async answerInitialCertificateRequest(message: AuthMessage): Promise<void> {
+  private async answerInitialCertificateRequest(
+    message: AuthMessage,
+    signal?: AbortSignal
+  ): Promise<void> {
     const { requestedCertificates, identityKey } = message
     if (
       requestedCertificates == null ||
@@ -717,12 +844,18 @@ export class Peer {
     ) {
       return
     }
+    throwIfSendAborted(signal)
     if (this.onCertificateRequestReceivedCallbacks.size > 0) {
       for (const callback of this.onCertificateRequestReceivedCallbacks.values()) {
-        await callback(
-          identityKey,
-          requestedCertificates as RequestedCertificateSet
-        )
+        if (signal == null) {
+          await callback(identityKey, requestedCertificates as RequestedCertificateSet)
+        } else {
+          await callback(
+            identityKey,
+            requestedCertificates as RequestedCertificateSet,
+            signal
+          )
+        }
       }
       return
     }
@@ -732,14 +865,52 @@ export class Peer {
       identityKey,
       this.originator
     )
+    throwIfSendAborted(signal)
     // An empty response has no value and can race with a subsequent request
     // that shares the same initial nonce.
     if (verifiableCertificates.length > 0) {
-      await this.sendCertificateResponse(identityKey, verifiableCertificates)
+      await this.sendCertificateResponse(identityKey, verifiableCertificates, signal)
     }
   }
 
   private async processInitialResponse(message: AuthMessage): Promise<void> {
+    const sessionNonce = message.yourNonce
+    if (typeof sessionNonce !== 'string') {
+      return await this.processUntrackedInitialResponse(message)
+    }
+    if (this.cancelledInitialResponseSessions.has(sessionNonce)) {
+      throw new Error('Initial response received for a cancelled session.')
+    }
+
+    const signal = this.initialResponseSignals.get(sessionNonce)
+    const task = this.processInitialResponseAuthentication(message)
+    let tasks = this.initialResponseTasks.get(sessionNonce)
+    if (tasks == null) {
+      tasks = new Set()
+      this.initialResponseTasks.set(sessionNonce, tasks)
+    }
+    tasks.add(task)
+    try {
+      await task
+    } finally {
+      tasks.delete(task)
+      if (tasks.size === 0) {
+        this.initialResponseTasks.delete(sessionNonce)
+      }
+    }
+    try {
+      await this.answerInitialCertificateRequest(message, signal)
+    } finally {
+      this.initialResponseSignals.delete(sessionNonce)
+    }
+  }
+
+  private async processUntrackedInitialResponse(message: AuthMessage): Promise<void> {
+    await this.processInitialResponseAuthentication(message)
+    await this.answerInitialCertificateRequest(message)
+  }
+
+  private async processInitialResponseAuthentication(message: AuthMessage): Promise<void> {
     const peerSession = await this.authenticateInitialResponse(message)
     await this.validateInitialResponseCertificates(message, peerSession)
     this.lastInteractedWithPeer = message.identityKey
@@ -748,7 +919,6 @@ export class Peer {
         entry.callback(peerSession.sessionNonce)
       }
     })
-    await this.answerInitialCertificateRequest(message)
   }
 
   /**
@@ -818,13 +988,16 @@ export class Peer {
    *
    * @param {string} verifierIdentityKey - The identity key of the peer requesting the certificates.
    * @param {VerifiableCertificate[]} certificates - The list of certificates to include in the response.
+   * @param {AbortSignal} [signal] - Optional cancellation signal checked before transport dispatch.
    * @throws Will throw an error if the transport fails to send the message.
    */
   async sendCertificateResponse (
     verifierIdentityKey: string,
-    certificates: VerifiableCertificate[]
+    certificates: VerifiableCertificate[],
+    signal?: AbortSignal
   ): Promise<void> {
-    const peerSession = await this.getAuthenticatedSession(verifierIdentityKey)
+    const peerSession = await this.getAuthenticatedSession(verifierIdentityKey, signal)
+    throwIfSendAborted(signal)
     const requestNonce = Utils.toBase64(Random(32))
     const { signature } = await this.wallet.createSignature({
       data: Peer.utf8ToBytes(JSON.stringify(certificates)),
@@ -832,11 +1005,15 @@ export class Peer {
       keyID: `${requestNonce} ${peerSession.peerNonce ?? ''}`,
       counterparty: peerSession.peerIdentityKey
     }, this.originator)
+    throwIfSendAborted(signal)
+
+    const identityPublicKey = await this.getIdentityPublicKey()
+    throwIfSendAborted(signal)
 
     const certificateResponse: AuthMessage = {
       version: AUTH_VERSION,
       messageType: 'certificateResponse',
-      identityKey: await this.getIdentityPublicKey(),
+      identityKey: identityPublicKey,
       nonce: requestNonce,
       initialNonce: peerSession.sessionNonce,
       yourNonce: peerSession.peerNonce,
@@ -847,9 +1024,10 @@ export class Peer {
     // Update usage
     peerSession.lastUpdate = Date.now()
     await this.sessionManager.updateSession(peerSession)
+    throwIfSendAborted(signal)
 
     try {
-      await this.transport.send(certificateResponse)
+      await this.transport.send(certificateResponse, signal)
     } catch (error: unknown) {
       this.propagateTransportError(peerSession.peerIdentityKey, error)
     }
