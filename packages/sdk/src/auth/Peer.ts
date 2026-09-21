@@ -66,6 +66,9 @@ export class Peer {
   { callback: (sessionNonce: string) => void, sessionNonce: string }
   > = new Map()
 
+  private readonly initialResponseTasks: Map<string, Set<Promise<void>>> = new Map()
+  private readonly cancelledInitialResponseSessions: Set<string> = new Set()
+
   // Promise-based mechanism for waiting on certificate validation
   private readonly certificateValidationPromises: Map<
   string,
@@ -427,15 +430,29 @@ export class Peer {
 
       // Register before sending: an in-memory or otherwise synchronous transport
       // can deliver the response before send() resolves.
-      const initialResponse = this.waitForInitialResponse(sessionNonce)
-      throwIfSendAborted(signal)
-      await this.transport.send(initialRequest, signal)
-      return await initialResponse
+      const initialResponse = this.waitForInitialResponse(sessionNonce, signal)
+      const send = Promise.resolve().then(async () => {
+        throwIfSendAborted(signal)
+        await this.transport.send(initialRequest, signal)
+      })
+      const [responseNonce] = await Promise.all([initialResponse, send])
+      return responseNonce
     } catch (error) {
       this.stopListeningForInitialResponsesByNonce(sessionNonce)
-      const session = await this.sessionManager.getSession(sessionNonce)
-      if (session?.isAuthenticated === false) {
-        await this.sessionManager.removeSession(session)
+      this.cancelledInitialResponseSessions.add(sessionNonce)
+      try {
+        const tasks = this.initialResponseTasks.get(sessionNonce)
+        if (tasks != null) {
+          await Promise.allSettled(tasks)
+        }
+        const removeSessionIfUnauthenticated = (
+          this.sessionManager as SessionManager & AsyncSessionManager
+        ).removeSessionIfUnauthenticated
+        if (typeof removeSessionIfUnauthenticated === 'function') {
+          await removeSessionIfUnauthenticated.call(this.sessionManager, sessionNonce)
+        }
+      } finally {
+        this.cancelledInitialResponseSessions.delete(sessionNonce)
       }
       throw error
     }
@@ -448,13 +465,25 @@ export class Peer {
    * @returns {Promise<string>} A promise that resolves with the session nonce when the initial response is received.
    */
   private async waitForInitialResponse (
-    sessionNonce: string
+    sessionNonce: string,
+    signal?: AbortSignal
   ): Promise<string> {
-    return await new Promise(resolve => {
-      const callbackID = this.listenForInitialResponse(sessionNonce, nonce => {
+    signal?.throwIfAborted()
+    return await new Promise((resolve, reject) => {
+      const cleanup = (): void => {
         this.stopListeningForInitialResponses(callbackID)
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const onAbort = (): void => {
+        cleanup()
+        reject(signal?.reason)
+      }
+      const callbackID = this.listenForInitialResponse(sessionNonce, nonce => {
+        cleanup()
         resolve(nonce)
       })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted === true) onAbort()
     })
   }
 
@@ -770,6 +799,32 @@ export class Peer {
   }
 
   private async processInitialResponse(message: AuthMessage): Promise<void> {
+    const sessionNonce = message.yourNonce
+    if (typeof sessionNonce !== 'string') {
+      return await this.processUntrackedInitialResponse(message)
+    }
+    if (this.cancelledInitialResponseSessions.has(sessionNonce)) {
+      throw new Error('Initial response received for a cancelled session.')
+    }
+
+    const task = this.processUntrackedInitialResponse(message)
+    let tasks = this.initialResponseTasks.get(sessionNonce)
+    if (tasks == null) {
+      tasks = new Set()
+      this.initialResponseTasks.set(sessionNonce, tasks)
+    }
+    tasks.add(task)
+    try {
+      await task
+    } finally {
+      tasks.delete(task)
+      if (tasks.size === 0) {
+        this.initialResponseTasks.delete(sessionNonce)
+      }
+    }
+  }
+
+  private async processUntrackedInitialResponse(message: AuthMessage): Promise<void> {
     const peerSession = await this.authenticateInitialResponse(message)
     await this.validateInitialResponseCertificates(message, peerSession)
     this.lastInteractedWithPeer = message.identityKey
