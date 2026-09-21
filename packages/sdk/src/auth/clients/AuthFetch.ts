@@ -193,7 +193,8 @@ export class AuthFetch {
   private async fetchWithinDeadline(
     url: string,
     config: SimplifiedFetchRequestOptions,
-    deadline?: number
+    deadline?: number,
+    priorDispatchState: AuthFetchDispatchState = 'not-dispatched'
   ): Promise<Response> {
     if (typeof config.retryCounter === 'number') {
       if (config.retryCounter <= 0) {
@@ -206,7 +207,7 @@ export class AuthFetch {
     const response = await new Promise<Response>((resolve, reject) => {
       let peerToUse: AuthPeer | undefined
       let listenerId: number | undefined
-      let dispatchState: AuthFetchDispatchState = 'not-dispatched'
+      let dispatchState: AuthFetchDispatchState = priorDispatchState
       let settled = false
       const controller = new AbortController()
       let responseTimeout: ReturnType<typeof setTimeout> | undefined
@@ -448,7 +449,7 @@ export class AuthFetch {
       }
       delete this.peers[baseURL]
       config.retryCounter ??= 3
-      return await this.fetchWithinDeadline(url, config, deadline)
+      return await this.fetchWithinDeadline(url, config, deadline, dispatchState)
     }
     if (error instanceof Error && error.message.includes('HTTP server failed to authenticate')) {
       const remaining = deadline - Date.now()
