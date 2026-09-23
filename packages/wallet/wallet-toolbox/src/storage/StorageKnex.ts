@@ -495,11 +495,10 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
     // A cold caller may already own SQLite's only connection. Read settings
     // through that transaction without caching uncommitted state or starting
     // the background backfill before the caller commits.
-    const settings = this.isAvailable()
-      ? this.getSettings()
-      : trx != null
-        ? await this.readSettings(trx)
-        : await this.makeAvailable()
+    let settings: TableSettings
+    if (this.isAvailable()) settings = this.getSettings()
+    else if (trx != null) settings = await this.readSettings(trx)
+    else settings = await this.makeAvailable()
     if (hasOffset) {
       return await this.getRawTxSlice(txid, offset as number, length as number, settings.dbtype, trx)
     }
