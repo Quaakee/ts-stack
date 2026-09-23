@@ -237,6 +237,20 @@ serialized RPC response exceeds the service ceiling, remote clients retry the
 read-only request with a smaller chunk budget and remember the working limit
 for the rest of the session.
 
+Output synchronization requires a local mapping for every non-null source basket
+ID. A missing mapping rejects the page so its transaction and checkpoint can roll
+back; retry after transferring the missing basket. Newer source updates apply
+basket changes, including explicit removal. Same-time or older updates preserve
+local relinquishment. Previously unbasketed records require a verified newer
+source update to repair; no heuristic rewrites existing wallet state.
+
+`StorageKnex.getRawTxOfKnownValidTransaction()` can read a cold store while the
+caller holds a transaction, including SQLite's single-connection pool. Settings
+are read through that transaction without entering the shared cache or starting
+prepared-BEEF background work; ordinary `makeAvailable()` remains the explicit
+store-wide startup operation. An absent optional `inputBEEF` does not prevent
+returning stored raw transaction bytes.
+
 IndexedDB schema version 6 adds a non-unique transaction-ID/user index. Sync
 identity lookups, commissions, and relation maps use selective indexes or exact
 keys instead of scanning the growing wallet for each row. Proof batch checks
