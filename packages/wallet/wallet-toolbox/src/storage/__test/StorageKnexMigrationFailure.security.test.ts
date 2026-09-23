@@ -5,6 +5,22 @@ function storageWithKnex(knex: object): StorageKnex {
 }
 
 describe('StorageKnex migration failure boundaries', () => {
+  test('retains MySQL transaction settings without SQLite pragmas', async () => {
+    const knex = {
+      client: { config: { client: 'mysql2' } },
+      raw: jest.fn(),
+      migrate: {
+        latest: jest.fn().mockResolvedValue([1, ['fixture']]),
+        currentVersion: jest.fn().mockResolvedValue('fixture')
+      }
+    }
+    await expect(StorageKnex.prototype.migrate.call(storageWithKnex(knex), 'wallet', '1'.repeat(64))).resolves.toBe(
+      'fixture'
+    )
+    expect(knex.migrate.latest).toHaveBeenCalledWith(expect.objectContaining({ disableTransactions: false }))
+    expect(knex.raw).not.toHaveBeenCalled()
+  })
+
   test('dropAllData stops only at the explicit empty-schema state', async () => {
     const knex = {
       client: { config: { client: 'better-sqlite3' } },
@@ -51,9 +67,9 @@ describe('StorageKnex migration failure boundaries', () => {
       }
     }
 
-    await expect(
-      StorageKnex.prototype.migrate.call(storageWithKnex(knex), 'wallet', '1'.repeat(64))
-    ).rejects.toThrow('migration failed')
+    await expect(StorageKnex.prototype.migrate.call(storageWithKnex(knex), 'wallet', '1'.repeat(64))).rejects.toThrow(
+      'migration failed'
+    )
     expect(knex.raw).toHaveBeenLastCalledWith('PRAGMA foreign_keys = ON;')
   })
 })

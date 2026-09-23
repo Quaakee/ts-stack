@@ -6,6 +6,12 @@ attention to changes that materially alter behavior or extend functionality.
 
 ## wallet-toolbox (unreleased)
 
+- Restore transactional SQLite migrations in the unpublished 2.13.2 candidate.
+  DDL, migration journal and lock changes roll back after an interrupted attempt;
+  foreign-key enforcement is restored after success or failure. Existing stores
+  with unjournaled partial schema need operator-reviewed recovery; this change
+  does not delete or automatically reconcile historical wallet data.
+
 - Implement `BHServiceClient.findChainTipHash()` by delegating to its existing
   `findChainTipHeader()` call against `/api/v1/chain/tip/longest`, instead of
   throwing `Not implemented`. `ChaintracksChainTracker.getVerificationContextToken()`

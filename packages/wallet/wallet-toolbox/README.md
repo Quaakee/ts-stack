@@ -27,6 +27,20 @@ Timing compares successive candidates, not a controlled comparison against upstr
 `main`. Byte verification was sampled, not database-wide. See
 [test methods and limits](#sync-performance-and-recovery) for details.
 
+### SQLite migration recovery
+
+The unpublished 2.13.2 candidate runs SQLite migration DDL and the migration
+journal update transactionally. Foreign-key enforcement is disabled before the
+migration transaction for table rebuilds and restored after success or failure.
+Failed migrations can be retried after reopening the database without partial
+schema objects from that attempt. MySQL's existing transaction configuration
+is unchanged.
+
+This prevents future partial migrations. It does not automatically repair a
+store already left with unjournaled schema objects by an older version. Preserve
+the database and verified backups and reconcile the exact schema and migration
+journal before recovery; do not delete journal rows or wallet data blindly.
+
 ## Overview
 
 The Wallet Toolbox is the reference implementation of the BRC-100 wallet interface. It connects the BSV SDK's cryptographic primitives to real storage backends, network services, and signing flows so that application developers don't have to wire these layers together themselves.

@@ -1598,17 +1598,22 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
     const clientName = (this.knex.client as { config?: { client?: string } }).config?.client ?? ''
     const isSQLite = clientName.includes('sqlite')
 
-    // For SQLite, disable transactions during migrations and turn off foreign keys.
-    // PRAGMA foreign_keys is silently ignored inside transactions, so we must
-    // disable transactions for the migration to allow the PRAGMA to take effect.
-    // See: https://github.com/knex/knex/issues/4155
+    // For SQLite, turn foreign keys off for the duration of the migration.
+    // PRAGMA foreign_keys is silently ignored *when executed inside* a
+    // transaction (https://github.com/knex/knex/issues/4155), so it is issued
+    // here, outside migrate.latest(). SQLite's single-connection pool means
+    // knex's per-migration transaction runs on this same connection and
+    // inherits the setting, and knex's own SQLite alter-table rebuild leaves an
+    // ambient pragma alone while transacting (sqlite3/schema/ddl.js: alter()
+    // uses `enforceForeignCheck = this.client.transacting ? null : false`).
     if (isSQLite) {
       await this.knex.raw('PRAGMA foreign_keys = OFF;')
     }
     try {
       const config = {
         migrationSource: new KnexMigrations(this.chain, storageName, storageIdentityKey, 1024),
-        disableTransactions: isSQLite
+        // Keep DDL and its migration journal entry in the same transaction.
+        disableTransactions: false
       }
       await this.knex.migrate.latest(config)
       return await this.knex.migrate.currentVersion(config)
