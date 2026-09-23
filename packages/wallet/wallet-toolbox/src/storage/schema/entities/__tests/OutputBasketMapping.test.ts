@@ -29,6 +29,21 @@ function captureStorage() {
 }
 
 describe('output basket mapping during synchronization', () => {
+  test('compares a spent output using both its basket and spending-transaction mappings', () => {
+    const source = incoming().api
+    source.spentBy = 8
+    const local = new EntityOutput({ ...source, transactionId: 1, basketId: 77, spentBy: 2 })
+    const syncMap = mapping()
+    syncMap.outputBasket.idMap[9] = 77
+    syncMap.transaction.idMap[8] = 2
+    expect(local.equals(source, syncMap)).toBe(true)
+    syncMap.transaction.idMap[8] = 3
+    expect(local.equals(source, syncMap)).toBe(false)
+    source.spentBy = undefined
+    local.spentBy = undefined
+    expect(local.equals(source, syncMap)).toBe(true)
+  })
+
   test.each([undefined, 0, -1, 1.5])(
     'rejects invalid mapped basket %s before changing the incoming entity',
     async mapped => {

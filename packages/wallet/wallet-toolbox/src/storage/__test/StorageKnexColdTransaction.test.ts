@@ -1,4 +1,4 @@
-import { knex } from 'knex'
+import { knex, type Knex } from 'knex'
 import { StorageKnex } from '../StorageKnex'
 
 const txid = 'ab'.repeat(32)
@@ -35,6 +35,44 @@ async function coldStorage(proven = true): Promise<StorageKnex> {
 }
 
 describe('cold transaction-owned raw transaction reads', () => {
+  test('compiles MySQL slices from transaction-local settings without populating the global cache', async () => {
+    const database = knex({ client: 'mysql2' })
+    const storage = new StorageKnex({ ...StorageKnex.defaultOptions(), chain: 'test', knex: database })
+    const queries: Knex.Sql[] = []
+    jest.spyOn(database.client, 'runner').mockImplementation(query => ({
+      run: async () => {
+        const compiled = (query as Knex.QueryBuilder).toSQL()
+        queries.push(compiled)
+        if (compiled.sql.includes('`settings`')) {
+          return [
+            {
+              created_at: new Date('2026-09-01'),
+              updated_at: new Date('2026-09-01'),
+              storageName: 'transaction-local',
+              storageIdentityKey: '1'.repeat(64),
+              chain: 'test',
+              dbtype: 'MySQL',
+              maxOutputScript: 1000
+            }
+          ]
+        }
+        return [{ rawTx: Buffer.from([1, 2, 128]) }]
+      }
+    }))
+    try {
+      await expect(storage.getRawTxOfKnownValidTransaction(txid, 1, 3, database)).resolves.toEqual([1, 2, 128])
+      expect(queries).toHaveLength(2)
+      expect(queries[0].sql).toBe('select * from `settings`')
+      expect(queries[1].sql).toBe(
+        'select substring(`rawTx` from ? for ?) as `rawTx` from `proven_txs` where `txid` = ?'
+      )
+      expect(queries[1].bindings).toEqual([2, 3, txid])
+      expect(storage.isAvailable()).toBe(false)
+    } finally {
+      await storage.destroy()
+    }
+  })
+
   test.each([true, false])('reads full and sliced bytes from proven=%s without a second connection', async proven => {
     const storage = await coldStorage(proven)
     const background = jest.spyOn(storage, 'startPreparedBeefBackfill')
