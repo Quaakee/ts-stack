@@ -1,13 +1,28 @@
 import { CWIStyleWalletManager, UMPTokenInteractor } from './CWIStyleWalletManager'
 import { PrivilegedKeyManager } from './sdk/PrivilegedKeyManager'
-import { WalletInterface, Random, Utils, Transaction, RPuzzle, PrivateKey, BigNumber, TelemetryConfig } from '@bsv/sdk'
+import {
+  WalletInterface,
+  Random,
+  Beef,
+  Transaction,
+  RPuzzle,
+  PrivateKey,
+  PublicKey,
+  CachedKeyDeriver,
+  TelemetryConfig,
+  completeBoundAction
+} from '@bsv/sdk'
+import { toArray, toBase64, toHex } from '@bsv/sdk/primitives/utils'
 import { WABClient, WABOperationResponse } from './wab-client/WABClient'
 import { WABClientError } from './wab-client/WABTransport'
+import { validateWABOperationResponse } from './wab-client/WABResponseValidation'
 import {
   AuthMethodInteractor,
   AuthPayload,
   CompleteAuthResponse
 } from './wab-client/auth-method-interactors/AuthMethodInteractor'
+import { ScriptTemplateBRC29 } from './utility/ScriptTemplateBRC29'
+import { maxPossibleSatoshis } from './storage/methods/generateChange'
 
 const DEFAULT_AUTH_SESSION_TTL_MS = 10 * 60 * 1000
 const MAX_AUTH_SESSION_TTL_MS = 60 * 60 * 1000
@@ -16,6 +31,181 @@ const AUTH_EVENT = 'wallet-toolbox.authentication.'
 const EXISTING_USER = 'existing-user'
 const NEW_USER = 'new-user'
 const PENDING_REGISTRATION = 'pending'
+const WAB_FAUCET_RECOVERY_BASKET = 'wab faucet recovery'
+const WAB_FAUCET_RECOVERY_VERSION = 1
+const MAX_WAB_FAUCET_RECOVERY_BEEF_BYTES = 16 * 1024 * 1024
+
+interface WABFaucetRecoveryInstructions {
+  version: number
+  faucetOutpoint: string
+  derivationPrefix: string
+  derivationSuffix: string
+  senderIdentityKey: string
+}
+
+function parseFaucetRecoveryInstructions(value: unknown): WABFaucetRecoveryInstructions | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return undefined
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const record = parsed as Record<string, unknown>
+  if (
+    record.version !== WAB_FAUCET_RECOVERY_VERSION ||
+    typeof record.faucetOutpoint !== 'string' ||
+    !/^[0-9a-f]{64}\.(?:0|[1-9]\d*)$/i.test(record.faucetOutpoint) ||
+    typeof record.derivationPrefix !== 'string' ||
+    typeof record.derivationSuffix !== 'string' ||
+    typeof record.senderIdentityKey !== 'string'
+  ) {
+    return undefined
+  }
+  try {
+    const prefix = toArray(record.derivationPrefix, 'base64')
+    const suffix = toArray(record.derivationSuffix, 'base64')
+    if (
+      prefix.length === 0 ||
+      prefix.length > 64 ||
+      suffix.length === 0 ||
+      suffix.length > 64 ||
+      toBase64(prefix) !== record.derivationPrefix ||
+      toBase64(suffix) !== record.derivationSuffix ||
+      PublicKey.fromString(record.senderIdentityKey).toString() !== record.senderIdentityKey
+    ) {
+      return undefined
+    }
+  } catch {
+    return undefined
+  }
+  return record as unknown as WABFaucetRecoveryInstructions
+}
+
+function transactionInputOutpoint(transaction: Transaction, inputIndex: number): string | undefined {
+  const input = transaction.inputs[inputIndex]
+  if (input == null || !Number.isSafeInteger(input.sourceOutputIndex) || input.sourceOutputIndex < 0) return undefined
+  const sourceTxid = input.sourceTXID ?? input.sourceTransaction?.id('hex')
+  if (sourceTxid == null || !/^[0-9a-f]{64}$/i.test(sourceTxid)) return undefined
+  return `${sourceTxid.toLowerCase()}.${input.sourceOutputIndex}`
+}
+
+async function recoverWABFaucetPayment(
+  wallet: WalletInterface,
+  faucetOutpoint: string,
+  adminOriginator: string,
+  resumeNosend = true
+): Promise<boolean> {
+  const label = `wab faucet ${faucetOutpoint.slice(0, 64)}`
+  const listed = await wallet.listOutputs(
+    {
+      basket: WAB_FAUCET_RECOVERY_BASKET,
+      include: 'entire transactions',
+      includeCustomInstructions: true,
+      limit: 100
+    },
+    adminOriginator
+  )
+  if (!Array.isArray(listed.outputs)) throw new Error('Wallet returned invalid faucet recovery outputs.')
+  const candidates = listed.outputs.flatMap(output => {
+    const instructions = parseFaucetRecoveryInstructions(output.customInstructions)
+    return instructions?.faucetOutpoint.toLowerCase() === faucetOutpoint ? [{ output, instructions }] : []
+  })
+  if (candidates.length > 1) throw new Error('Wallet returned ambiguous faucet recovery outputs.')
+  if (candidates.length === 1) {
+    if (
+      !Array.isArray(listed.BEEF) ||
+      listed.BEEF.length === 0 ||
+      listed.BEEF.length > MAX_WAB_FAUCET_RECOVERY_BEEF_BYTES
+    ) {
+      throw new Error('Wallet omitted bounded faucet recovery transaction evidence.')
+    }
+    const { output, instructions } = candidates[0]
+    const match = /^([0-9a-f]{64})\.(0|[1-9]\d*)$/i.exec(output.outpoint)
+    if (match == null) throw new Error('Wallet returned an invalid faucet recovery outpoint.')
+    const outputIndex = Number(match[2])
+    if (!Number.isSafeInteger(outputIndex) || outputIndex > 0xffffffff) {
+      throw new Error('Wallet returned an invalid faucet recovery output index.')
+    }
+    const beef = Beef.fromBinaryStrict(listed.BEEF)
+    const transaction = beef.findTxid(match[1].toLowerCase())?.tx
+    const transactionOutput = transaction?.outputs[outputIndex]
+    if (
+      transaction == null ||
+      transactionOutput == null ||
+      transactionOutput.satoshis !== output.satoshis ||
+      transaction.inputs.filter((_, index) => transactionInputOutpoint(transaction, index) === faucetOutpoint)
+        .length !== 1
+    ) {
+      throw new Error('Wallet returned unrelated faucet recovery transaction evidence.')
+    }
+    const result = await wallet.internalizeAction(
+      {
+        tx: beef.toBinaryAtomic(transaction.id('hex')),
+        outputs: [
+          {
+            outputIndex,
+            protocol: 'wallet payment',
+            paymentRemittance: {
+              derivationPrefix: instructions.derivationPrefix,
+              derivationSuffix: instructions.derivationSuffix,
+              senderIdentityKey: instructions.senderIdentityKey
+            }
+          }
+        ],
+        description: 'Recover WAB faucet funding'
+      },
+      adminOriginator
+    )
+    if (result.accepted !== true) throw new Error('Wallet did not accept its recovered WAB faucet payment.')
+    return true
+  }
+
+  const actions = await wallet.listActions(
+    {
+      labels: [label],
+      includeLabels: true,
+      includeInputs: true,
+      includeOutputs: true,
+      includeOutputLockingScripts: true,
+      limit: 10
+    },
+    adminOriginator
+  )
+  if (!Array.isArray(actions.actions)) throw new Error('Wallet returned invalid faucet recovery actions.')
+  const matchingActions = actions.actions.filter(action => action.labels?.includes(label))
+  if (matchingActions.length === 0) return false
+  if (matchingActions.length !== 1) throw new Error('Wallet returned ambiguous faucet recovery actions.')
+  const action = matchingActions[0]
+  const matchingInputs = action.inputs?.filter(input => input.sourceOutpoint.toLowerCase() === faucetOutpoint) ?? []
+  const matchingOutputs =
+    action.outputs?.filter(output => {
+      const instructions = parseFaucetRecoveryInstructions(output.customInstructions)
+      return instructions?.faucetOutpoint.toLowerCase() === faucetOutpoint
+    }) ?? []
+  if (matchingInputs.length !== 1 || matchingOutputs.length !== 1) {
+    throw new Error('Wallet returned unrelated faucet recovery action evidence.')
+  }
+  if (
+    (action.status === 'completed' || action.status === 'sending' || action.status === 'unproven') &&
+    matchingOutputs[0].basket === 'default'
+  ) {
+    return true
+  }
+  if (action.status === 'nosend') {
+    if (!resumeNosend) throw new Error('Prior WAB faucet action remained unsent after broadcast retry.')
+    await wallet.createAction(
+      {
+        description: 'Resume WAB faucet broadcast',
+        options: { sendWith: [action.txid], acceptDelayedBroadcast: false }
+      },
+      adminOriginator
+    )
+    return await recoverWABFaucetPayment(wallet, faucetOutpoint, adminOriginator, false)
+  }
+  throw new Error('Prior WAB faucet action requires reconciliation before retrying.')
+}
 
 export interface WalletAuthenticationManagerOptions {
   telemetry?: TelemetryConfig
@@ -111,7 +301,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
       passwordRetriever,
       // Here, we provide a custom new wallet funder that uses the Secret Server
       async (presentationKey: number[], wallet: WalletInterface, adminOriginator: string) => {
-        const faucetResponse = await this.wabClient.requestFaucet(Utils.toHex(presentationKey))
+        const faucetResponse = await this.wabClient.requestFaucet(toHex(presentationKey))
         const paymentData = faucetResponse.paymentData
         const faucetSucceeded: unknown = faucetResponse.success
 
@@ -135,46 +325,151 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
         }
 
         try {
+          if (!/^[0-9a-f]{64}$/i.test(paymentData.txid)) {
+            throw new Error('Faucet transaction ID is invalid.')
+          }
+          if (!/^[0-9a-f]{1,64}$/i.test(paymentData.k)) {
+            throw new Error('Faucet R-puzzle scalar is invalid.')
+          }
+          const faucetK = new PrivateKey(paymentData.k, 16, 'be', 'error')
+          if (faucetK.isZero()) {
+            throw new Error('Faucet R-puzzle scalar is invalid.')
+          }
           const tx = Transaction.fromAtomicBEEF(paymentData.tx)
-          const faucetRedeemTXCreationResult = await wallet.createAction(
+          const txid = tx.id('hex')
+          if (txid !== paymentData.txid.toLowerCase()) {
+            throw new Error('Faucet transaction ID does not match its transaction data.')
+          }
+          const faucetOutput = tx.outputs[0]
+          if (faucetOutput == null) {
+            throw new Error('Faucet transaction output 0 is missing.')
+          }
+          const faucetSatoshis = faucetOutput.satoshis
+          if (
+            typeof faucetSatoshis !== 'number' ||
+            !Number.isSafeInteger(faucetSatoshis) ||
+            faucetSatoshis <= 0 ||
+            faucetSatoshis > 21e14
+          ) {
+            throw new Error('Faucet transaction output 0 has an invalid amount.')
+          }
+          let rValue = faucetK.toPublicKey().getX().toArray()
+          if (rValue[0] > 127) rValue = [0, ...rValue]
+          const faucetRedemptionPuzzle = new RPuzzle()
+          if (faucetOutput.lockingScript.toHex() !== faucetRedemptionPuzzle.lock(rValue).toHex()) {
+            throw new Error('Faucet transaction output 0 does not match its R-puzzle scalar.')
+          }
+          const randomRedemptionPrivateKey = PrivateKey.fromRandom()
+          const faucetRedeemUnlocker = faucetRedemptionPuzzle.unlock(faucetK, randomRedemptionPrivateKey)
+          const outpoint = `${txid}.0`
+          if (paymentData.outputIndex !== undefined && paymentData.outputIndex !== 0) {
+            throw new Error('Faucet response output index does not match output 0.')
+          }
+          if (paymentData.amount !== undefined && paymentData.amount !== faucetSatoshis) {
+            throw new Error('Faucet response amount does not match output 0.')
+          }
+          if (await recoverWABFaucetPayment(wallet, outpoint, adminOriginator)) return
+
+          const identityResult = await wallet.getPublicKey({ identityKey: true }, adminOriginator)
+          const identityKey = PublicKey.fromString(identityResult.publicKey).toString()
+          const paymentSender = PrivateKey.fromRandom()
+          const derivationPrefix = toBase64(Random(16))
+          const derivationSuffix = toBase64(Random(16))
+          const paymentTemplate = new ScriptTemplateBRC29({
+            derivationPrefix,
+            derivationSuffix,
+            keyDeriver: new CachedKeyDeriver(paymentSender)
+          })
+          const paymentLock = paymentTemplate.lock(paymentSender.toString(), identityKey).toHex()
+          const recoveryInstructions = JSON.stringify({
+            version: 1,
+            faucetOutpoint: outpoint,
+            derivationPrefix,
+            derivationSuffix,
+            senderIdentityKey: paymentSender.toPublicKey().toString()
+          })
+          const signed = await completeBoundAction(
+            wallet,
             {
               inputBEEF: tx.toBEEF(),
               inputs: [
                 {
-                  outpoint: `${paymentData.txid}.0`,
+                  outpoint,
                   unlockingScriptLength: 108,
                   inputDescription: 'Fund from faucet'
                 }
               ],
+              outputs: [
+                {
+                  lockingScript: paymentLock,
+                  satoshis: maxPossibleSatoshis,
+                  outputDescription: 'Receive WAB faucet funds',
+                  basket: 'wab faucet recovery',
+                  customInstructions: recoveryInstructions
+                }
+              ],
+              labels: [`wab faucet ${txid}`],
               description: 'Fund wallet',
               options: {
-                acceptDelayedBroadcast: false
+                acceptDelayedBroadcast: false,
+                noSend: true,
+                randomizeOutputs: false
+              }
+            },
+            {
+              inputSigners: {
+                [outpoint]: async (transaction, inputIndex) => await faucetRedeemUnlocker.sign(transaction, inputIndex)
+              },
+              outputSatoshisRanges: {
+                0: {
+                  minimumSatoshis: 1,
+                  maximumSatoshis: faucetSatoshis
+                }
               }
             },
             adminOriginator
           )
-
-          if (faucetRedeemTXCreationResult.signableTransaction == null) {
-            throw new Error('Faucet redemption was not signable.')
-          }
-
-          const faucetRedeemTX = Transaction.fromAtomicBEEF(faucetRedeemTXCreationResult.signableTransaction.tx)
-          const faucetRedemptionPuzzle = new RPuzzle()
-          const randomRedemptionPrivateKey = PrivateKey.fromRandom()
-          const faucetRedeemUnlocker = faucetRedemptionPuzzle.unlock(
-            new BigNumber(paymentData.k, 16),
-            randomRedemptionPrivateKey
-          )
-          const faucetRedeemUnlockingScript = await faucetRedeemUnlocker.sign(faucetRedeemTX, 0)
-
-          await wallet.signAction({
-            reference: faucetRedeemTXCreationResult.signableTransaction.reference,
-            spends: {
-              0: {
-                unlockingScript: faucetRedeemUnlockingScript.toHex()
-              }
-            }
+          const matches = signed.outputs.flatMap((output, outputIndex) => {
+            const outputSatoshis = output.satoshis
+            return output.lockingScript.toHex() === paymentLock &&
+              typeof outputSatoshis === 'number' &&
+              outputSatoshis >= 1 &&
+              outputSatoshis <= faucetSatoshis
+              ? [outputIndex]
+              : []
           })
+          if (matches.length !== 1) {
+            throw new Error('Faucet redemption omitted or duplicated its wallet-owned output.')
+          }
+          const redemptionTxid = signed.id('hex')
+          await wallet.createAction(
+            {
+              description: 'Broadcast WAB faucet funding',
+              options: { sendWith: [redemptionTxid], acceptDelayedBroadcast: false }
+            },
+            adminOriginator
+          )
+          const internalized = await wallet.internalizeAction(
+            {
+              tx: signed.toAtomicBEEF(),
+              outputs: [
+                {
+                  outputIndex: matches[0],
+                  protocol: 'wallet payment',
+                  paymentRemittance: {
+                    derivationPrefix,
+                    derivationSuffix,
+                    senderIdentityKey: paymentSender.toPublicKey().toString()
+                  }
+                }
+              ],
+              description: 'Receive WAB faucet funding'
+            },
+            adminOriginator
+          )
+          if (internalized.accepted !== true) {
+            throw new Error('Wallet did not accept its WAB faucet payment.')
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           throw new Error(`Faucet redemption failed: ${message}`)
@@ -452,7 +747,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
     const pending = this.readPendingPhoneChange(result)
     let usePending = false
     try {
-      await this.providePresentationKey(Utils.toArray(result.presentationKey!, 'hex'), lookupOptions)
+      await this.providePresentationKey(toArray(result.presentationKey!, 'hex'), lookupOptions)
     } catch (error) {
       if (pending == null) throw error
       usePending = true
@@ -462,7 +757,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
       pending != null &&
       (usePending || (wabAccountStatus === EXISTING_USER && this.authenticationFlow !== EXISTING_USER))
     ) {
-      await this.providePresentationKey(Utils.toArray(pending.presentationKey, 'hex'), lookupOptions)
+      await this.providePresentationKey(toArray(pending.presentationKey, 'hex'), lookupOptions)
       if (this.authenticationFlow === EXISTING_USER) {
         await this.finalizePendingPhoneChange(result.presentationKey!, pending)
       }
@@ -487,7 +782,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
   public async startPhoneNumberChange(phoneNumber: string): Promise<void> {
     if (!this.authenticated) throw new Error('Not authenticated')
     const normalizedPhone = phoneNumber.trim()
-    const currentPresentationKey = Utils.toHex(await this.getFactor('presentationKey'))
+    const currentPresentationKey = toHex(await this.getFactor('presentationKey'))
     const response = await this.phoneChange<WABOperationResponse>('start', {
       presentationKey: currentPresentationKey,
       phoneNumber: normalizedPhone
@@ -523,7 +818,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
         Number.isSafeInteger(authorization.pendingPhoneChangeId) &&
         authorization.pendingPhoneChangeId! > 0
       if (resumable) {
-        session.newKey = Utils.toArray(authorization.pendingPresentationKey!, 'hex')
+        session.newKey = toArray(authorization.pendingPresentationKey!, 'hex')
         session.changeId = authorization.pendingPhoneChangeId
       } else if (typeof authorization.changeToken === 'string' && authorization.changeToken.length > 0) {
         session.changeToken = authorization.changeToken
@@ -537,7 +832,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
       const committed = await this.phoneChange<WABPhoneChangeCommit>('commit', {
         changeToken: session.changeToken,
         presentationKey: session.presentationKey,
-        newPresentationKey: Utils.toHex(session.newKey)
+        newPresentationKey: toHex(session.newKey)
       })
       if (committed.success !== true || !Number.isSafeInteger(committed.changeId) || committed.changeId! <= 0) {
         throw new Error(committed.message || 'Phone change failed')
@@ -554,7 +849,7 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
     const finalized = await this.phoneChange<WABPhoneChangeCommit>('finalize', {
       changeId,
       presentationKey: session.presentationKey,
-      newPresentationKey: Utils.toHex(session.newKey)
+      newPresentationKey: toHex(session.newKey)
     })
     if (finalized.success !== true || finalized.changeId !== changeId) {
       throw new Error(finalized.message || 'Phone change failed')
@@ -574,11 +869,12 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
     super.destroy()
   }
 
-  private phoneChange<T>(phase: string, body: unknown): Promise<T> {
-    return this.wabClient.transport.request<T>(`/auth/phone-change/${phase}`, {
+  private async phoneChange<T extends WABOperationResponse>(phase: string, body: unknown): Promise<T> {
+    const response = await this.wabClient.transport.request<unknown>(`/auth/phone-change/${phase}`, {
       operation: 'phone-change',
       body
     })
+    return validateWABOperationResponse(response, `phone-change-${phase}`) as T
   }
 
   private inferAccountStatus(
@@ -633,6 +929,6 @@ export class WalletAuthenticationManager extends CWIStyleWalletManager {
   private generateTemporaryPresentationKey(): string {
     // For the 'startAuth' call, we can generate a random 32 bytes → 64 hex chars.
     const randomBytes = Random(32) // array of length 32
-    return Utils.toHex(randomBytes)
+    return toHex(randomBytes)
   }
 }

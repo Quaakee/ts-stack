@@ -1,12 +1,16 @@
 import {
+  type ValidCreateActionArgs,
+  type ValidSignActionArgs,
+  validateSignActionArgs
+} from '@bsv/sdk/wallet/validationHelpers'
+import {
   AtomicBEEF,
   Beef,
   SendWithResult,
   SignActionArgs,
   SignActionResult,
   TelemetrySpan,
-  TXIDHexString,
-  Validation
+  TXIDHexString
 } from '@bsv/sdk'
 import { processAction } from './createAction'
 import { AuthId, ReviewActionResult } from '../../sdk/WalletStorage.interfaces'
@@ -76,7 +80,7 @@ async function signActionCore(
   const beef =
     prior.dcr.inputBeef instanceof Uint8Array
       ? Beef.fromBinaryView(prior.dcr.inputBeef)
-      : Beef.fromBinary(prior.dcr.inputBeef)
+      : Beef.fromBinaryStrict(prior.dcr.inputBeef)
   beef.mergeTransaction(prior.tx)
 
   await traceSignActionStep(
@@ -116,10 +120,7 @@ async function traceSignActionStep<T>(
   )
 }
 
-function mergePriorOptions(
-  caVargs: Validation.ValidCreateActionArgs,
-  saArgs: SignActionArgs
-): Validation.ValidSignActionArgs {
+function mergePriorOptions(caVargs: ValidCreateActionArgs, saArgs: SignActionArgs): ValidSignActionArgs {
   const saOptions = (saArgs.options ||= {})
   saOptions.acceptDelayedBroadcast ??= caVargs.options.acceptDelayedBroadcast
   saOptions.returnTXIDOnly ??= caVargs.options.returnTXIDOnly
@@ -134,5 +135,5 @@ function mergePriorOptions(
     }
     saOptions.noSend = true
   }
-  return Validation.validateSignActionArgs(saArgs)
+  return validateSignActionArgs(saArgs)
 }

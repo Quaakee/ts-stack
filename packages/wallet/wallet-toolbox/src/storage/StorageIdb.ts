@@ -1,3 +1,4 @@
+import { type ValidListActionsArgs, type ValidListOutputsArgs } from '@bsv/sdk/wallet/validationHelpers'
 import { deleteDB, IDBPDatabase, IDBPObjectStore, IDBPTransaction, openDB } from 'idb'
 import {
   matchesCertificateFieldPartial,
@@ -17,7 +18,7 @@ import {
   upgradeAllStoresV1,
   upgradeActionBatchStoresV2
 } from './idbHelpers'
-import { ListActionsResult, ListOutputsResult, Validation } from '@bsv/sdk'
+import { ListActionsResult, ListOutputsResult } from '@bsv/sdk'
 import {
   TableCertificate,
   TableCertificateField,
@@ -38,7 +39,7 @@ import {
   TableUser
 } from './schema/tables'
 import { TableActionBatch, TableActionBatchBlob, TableActionBatchOutput } from './schema/tables/TableActionBatch'
-import { verifyOneOrNone } from '../utility/utilityHelpers'
+import { verifyId, verifyOneOrNone } from '../utility/utilityHelpers'
 import { StorageAdminStats, StorageProvider, StorageProviderOptions } from './StorageProvider'
 import { StorageIdbSchema } from './schema/StorageIdbSchema'
 import { DBType } from './StorageReader'
@@ -261,7 +262,7 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     return db
   }
 
-  private async migrateManagedChangeDefaults (db: IDBPDatabase<StorageIdbSchema>): Promise<void> {
+  private async migrateManagedChangeDefaults(db: IDBPDatabase<StorageIdbSchema>): Promise<void> {
     if (this.managedChangeDefaultsMigrated) return
     const trx = db.transaction('output_baskets', 'readwrite')
     let cursor = await trx.store.openCursor()
@@ -385,24 +386,26 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     const provenIndex = dbTrx.objectStore('proven_txs').index('txid')
     const requestIndex = dbTrx.objectStore('proven_tx_reqs').index('txid')
     const usableStatuses = new Set(['unsent', 'unmined', 'unconfirmed', 'sending', 'nosend', 'completed'])
-    await Promise.all(unique.map(async txid => {
-      const proven = await provenIndex.get(txid) as TableProvenTx | undefined
-      if (proven != null) {
-        results.set(txid, { proven: this.validateEntity(proven), rawTx: undefined, inputBEEF: undefined })
-        return
-      }
-      const request = await requestIndex.get(txid) as TableProvenTxReq | undefined
-      if (request != null && usableStatuses.has(request.status)) {
-        const validated = this.validateEntity(request)
-        results.set(txid, {
-          proven: undefined,
-          rawTx: Array.from(validated.rawTx),
-          inputBEEF: validated.inputBEEF == null ? undefined : Array.from(validated.inputBEEF)
-        })
-        return
-      }
-      results.set(txid, { proven: undefined, rawTx: undefined, inputBEEF: undefined })
-    }))
+    await Promise.all(
+      unique.map(async txid => {
+        const proven = (await provenIndex.get(txid)) as TableProvenTx | undefined
+        if (proven != null) {
+          results.set(txid, { proven: this.validateEntity(proven), rawTx: undefined, inputBEEF: undefined })
+          return
+        }
+        const request = (await requestIndex.get(txid)) as TableProvenTxReq | undefined
+        if (request != null && usableStatuses.has(request.status)) {
+          const validated = this.validateEntity(request)
+          results.set(txid, {
+            proven: undefined,
+            rawTx: Array.from(validated.rawTx),
+            inputBEEF: validated.inputBEEF == null ? undefined : Array.from(validated.inputBEEF)
+          })
+          return
+        }
+        results.set(txid, { proven: undefined, rawTx: undefined, inputBEEF: undefined })
+      })
+    )
     if (trx == null) await dbTrx.done
     return results
   }
@@ -449,16 +452,9 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     const labels: TableTxLabel[] = []
     for (const txLabelId of labelIds) {
       // verifyOneOrNone: a map row may reference a label that was later soft-deleted.
-      // Knex/Bun drop it via JOIN; we must do the same silently or we'd break the whole
-      // listActions response. Skip + log so persistent orphans still produce a signal.
+      // Knex/Bun drop it via JOIN; match that behavior without leaking row identifiers.
       const label = verifyOneOrNone(await this.findTxLabels({ partial: { txLabelId, isDeleted: false }, trx }))
-      if (label != null) {
-        labels.push(label)
-      } else {
-        console.debug(
-          `[StorageIdb] orphan tx_labels_map row skipped: transactionId=${String(transactionId)} txLabelId=${txLabelId}`
-        )
-      }
+      if (label != null) labels.push(label)
     }
     return labels
   }
@@ -469,23 +465,17 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     const tags: TableOutputTag[] = []
     for (const outputTagId of tagIds) {
       const tag = verifyOneOrNone(await this.findOutputTags({ partial: { outputTagId, isDeleted: false }, trx }))
-      if (tag != null) {
-        tags.push(tag)
-      } else {
-        console.debug(
-          `[StorageIdb] orphan output_tags_map row skipped: outputId=${outputId} outputTagId=${outputTagId}`
-        )
-      }
+      if (tag != null) tags.push(tag)
     }
     return tags
   }
 
-  async listActions(auth: AuthId, vargs: Validation.ValidListActionsArgs): Promise<ListActionsResult> {
+  async listActions(auth: AuthId, vargs: ValidListActionsArgs): Promise<ListActionsResult> {
     if (auth.userId == null) throw new WERR_UNAUTHORIZED()
     return await listActionsIdb(this, auth, vargs)
   }
 
-  async listOutputs(auth: AuthId, vargs: Validation.ValidListOutputsArgs): Promise<ListOutputsResult> {
+  async listOutputs(auth: AuthId, vargs: ValidListOutputsArgs): Promise<ListOutputsResult> {
     if (auth.userId == null) throw new WERR_UNAUTHORIZED()
     return await listOutputsIdb(this, auth, vargs)
   }
@@ -531,16 +521,12 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
   ): Promise<Record<string, TableOutput>> {
     const byOutpoint: Record<string, TableOutput> = {}
     if (outpoints.length === 0) return byOutpoint
-    const dbTrx = this.toDbTrx(
-      noScript ? ['outputs'] : ['outputs', 'proven_txs', 'proven_tx_reqs'],
-      'readonly',
-      trx
-    )
+    const dbTrx = this.toDbTrx(noScript ? ['outputs'] : ['outputs', 'proven_txs', 'proven_tx_reqs'], 'readonly', trx)
     const index = dbTrx.objectStore('outputs').index('txid_vout_userId')
     const unique = [...new Map(outpoints.map(outpoint => [`${outpoint.txid}.${outpoint.vout}`, outpoint])).values()]
-    const rows = await Promise.all(unique.map(async outpoint =>
-      await index.get([outpoint.txid, outpoint.vout, userId])
-    ))
+    const rows = await Promise.all(
+      unique.map(async outpoint => await index.get([outpoint.txid, outpoint.vout, userId]))
+    )
     for (const row of rows) {
       if (row == null) continue
       if (!noScript) await this.validateOutputScript(row, dbTrx)
@@ -575,6 +561,19 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
       throw new WERR_UNAUTHORIZED()
     args.partial.userId = auth.userId
     return await this.findCertificates(args)
+  }
+
+  override async findProvenTxReqsAuth(auth: AuthId, args: FindProvenTxReqsArgs): Promise<TableProvenTxReq[]> {
+    const userId = verifyId(auth.userId)
+    const results: TableProvenTxReq[] = []
+    await this.filterProvenTxReqs(
+      args,
+      row => {
+        results.push(this.validateEntity(row))
+      },
+      userId
+    )
+    return results
   }
 
   async findOutputBasketsAuth(auth: AuthId, args: FindOutputBasketsArgs): Promise<TableOutputBasket[]> {
@@ -1437,7 +1436,8 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
         (batch.status === 'active' || batch.status === 'prepared') &&
         batch.expiresAt.getTime() > now &&
         batch.hardExpiresAt.getTime() > now
-      ) reserved.push(outputId)
+      )
+        reserved.push(outputId)
     }
     if (trx == null) await tx.done
     return reserved
@@ -1755,9 +1755,7 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
           .openCursor([partial.transactionId, partial.vout, partial.userId], direction)
       }
       if (partial?.txid != null && partial.txid !== '' && partial?.vout !== undefined) {
-        return store
-          .index('txid_vout_userId')
-          .openCursor([partial.txid, partial.vout, partial.userId], direction)
+        return store.index('txid_vout_userId').openCursor([partial.txid, partial.vout, partial.userId], direction)
       }
       if (partial?.basketId !== undefined) {
         return store.index('userId_basketId').openCursor([partial.userId, partial.basketId], direction)
@@ -1779,9 +1777,8 @@ export class StorageIdb extends StorageProvider implements WalletStorageProvider
     const validTransactionIds = new Set<number>()
     const transactions = dbTrx.objectStore('transactions')
     for (const status of args.txStatus) {
-      const index = args.partial.userId === undefined
-        ? transactions.index('status')
-        : transactions.index('status_userId')
+      const index =
+        args.partial.userId === undefined ? transactions.index('status') : transactions.index('status_userId')
       const key = args.partial.userId === undefined ? status : [status, args.partial.userId]
       for (const transactionId of await index.getAllKeys(key)) validTransactionIds.add(Number(transactionId))
     }

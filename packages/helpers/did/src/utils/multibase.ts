@@ -1,7 +1,13 @@
-import { PublicKey, Utils } from '@bsv/sdk'
+import { PublicKey } from '@bsv/sdk/primitives'
+import { fromBase58, toBase58 } from '@bsv/sdk/primitives/utils'
 import type { PublicKeyInput } from '../types.js'
+import { assertBoundedString, snapshotBytes } from '../validation.js'
+import { normalizePublicKey as normalizePublicKeyInput } from './crypto.js'
 
-export const SECP256K1_PUB_MULTICODEC_PREFIX = [0xe7, 0x01]
+const MAX_MULTIBASE_BYTES = 1_048_576
+const MAX_DID_BYTES = 2_048
+
+export const SECP256K1_PUB_MULTICODEC_PREFIX: readonly number[] = Object.freeze([0xe7, 0x01])
 export const MULTIBASE_BASE58BTC_PREFIX = 'z'
 
 export interface DecodedDidKey {
@@ -11,26 +17,28 @@ export interface DecodedDidKey {
 }
 
 export function normalizePublicKey(publicKey: PublicKeyInput | PublicKey): number[] {
-  if (publicKey instanceof PublicKey) {
-    return publicKey.toDER() as number[]
-  }
-
-  const bytes =
-    typeof publicKey === 'string' ? Utils.toArray(publicKey, 'hex') : Array.from(publicKey)
-
-  const key = PublicKey.fromDER(bytes)
-  return key.toDER() as number[]
+  return normalizePublicKeyInput(publicKey).toDER() as number[]
 }
 
 export function encodeBase58Multibase(bytes: number[]): string {
-  return `${MULTIBASE_BASE58BTC_PREFIX}${Utils.toBase58(bytes)}`
+  return `${MULTIBASE_BASE58BTC_PREFIX}${toBase58(
+    snapshotBytes(bytes, 'Multibase input', MAX_MULTIBASE_BYTES)
+  )}`
 }
 
 export function decodeBase58Multibase(value: string): number[] {
+  assertBoundedString(value, 'Multibase value', MAX_MULTIBASE_BYTES * 2)
   if (!value.startsWith(MULTIBASE_BASE58BTC_PREFIX)) {
-    throw new Error('Only base58-btc multibase values are supported')
+    throw new Error('Only base58-btc multibase is supported')
   }
-  return Utils.fromBase58(value.slice(1))
+  const encoded = value.slice(1)
+  if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(encoded)) {
+    throw new Error('Invalid base58-btc multibase value')
+  }
+  const decoded = fromBase58(encoded)
+  if (decoded.length > MAX_MULTIBASE_BYTES) throw new Error('Multibase value exceeds the limit')
+  if (toBase58(decoded) !== encoded) throw new Error('Noncanonical base58-btc multibase value')
+  return decoded
 }
 
 // Implements did:key Identifier Syntax, section "did:key Identifier Syntax":
@@ -49,6 +57,7 @@ export function verificationMethodForDid(did: string): string {
 // Implements did:key "Decode Public Key Algorithm":
 // https://w3c-ccg.github.io/did-key-spec/#decode-public-key-algorithm
 export function decodeDidKey(did: string): DecodedDidKey {
+  assertBoundedString(did, 'did:key identifier', MAX_DID_BYTES)
   const parts = did.split(':')
   if (parts.length !== 3 || parts[0] !== 'did' || parts[1] !== 'key') {
     throw new Error('Invalid did:key identifier')
@@ -62,7 +71,7 @@ export function decodeDidKey(did: string): DecodedDidKey {
     prefixA !== SECP256K1_PUB_MULTICODEC_PREFIX[0] ||
     prefixB !== SECP256K1_PUB_MULTICODEC_PREFIX[1]
   ) {
-    throw new Error('Unsupported did:key multicodec; expected secp256k1-pub')
+    throw new Error('Unsupported did:key multicodec')
   }
 
   if (publicKeyBytes.length !== 33) {
@@ -84,7 +93,12 @@ export function publicKeyFromDid(did: string): PublicKey {
 }
 
 export function didFromVerificationMethod(verificationMethod: string): string {
-  const [did, fragment] = verificationMethod.split('#')
+  assertBoundedString(verificationMethod, 'Verification method', MAX_DID_BYTES * 2)
+  const parts = verificationMethod.split('#')
+  if (parts.length !== 2) {
+    throw new Error('Verification method must be a DID URL with a fragment')
+  }
+  const [did, fragment] = parts
   if (fragment == null || fragment.length === 0) {
     throw new Error('Verification method must be a DID URL with a fragment')
   }

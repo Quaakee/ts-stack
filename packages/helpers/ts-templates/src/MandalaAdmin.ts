@@ -1,17 +1,14 @@
-import {
-  WalletInterface,
-  WalletProtocol,
+import { hash160, hash256, sha256 } from '@bsv/sdk/primitives/Hash'
+import { Signature, TransactionSignature } from '@bsv/sdk/primitives'
+import { toArray, toHex, toUTF8 } from '@bsv/sdk/primitives/utils'
+import { LockingScript, OP, UnlockingScript } from '@bsv/sdk/script'
+import type ScriptTemplateUnlock from '@bsv/sdk/script/ScriptTemplateUnlock'
+import type Transaction from '@bsv/sdk/transaction/Transaction'
+import type {
   WalletCounterparty,
-  Hash,
-  Utils,
-  LockingScript,
-  UnlockingScript,
-  OP,
-  ScriptTemplateUnlock,
-  Transaction,
-  TransactionSignature,
-  Signature
-} from '@bsv/sdk'
+  WalletInterface,
+  WalletProtocol
+} from '@bsv/sdk/wallet/Wallet.interfaces'
 import { buildSighashPreimage } from './mandala-signing.js'
 import { createMinimallyEncodedScriptChunk } from './mandala-encoding.js'
 
@@ -98,7 +95,7 @@ export class MandalaAdmin {
   }
 
   static commitment(actionDetails: MandalaActionDetails): string {
-    return Utils.toHex(Hash.sha256(Utils.toArray(MandalaAdmin.canonicalize(actionDetails), 'utf8')))
+    return toHex(sha256(toArray(MandalaAdmin.canonicalize(actionDetails), 'utf8')))
   }
 
   // Build a P2PKH locking script bound to the action `data`. The locking key is
@@ -113,7 +110,7 @@ export class MandalaAdmin {
       { protocolID: ADMIN_PROTOCOL, keyID, counterparty },
       originator
     )
-    const pubKeyHash = Hash.hash160(Utils.toArray(publicKey, 'hex'))
+    const pubKeyHash = hash160(toArray(publicKey, 'hex'))
     const p2pkh = [
       { op: OP.OP_DUP },
       { op: OP.OP_HASH160 },
@@ -123,7 +120,7 @@ export class MandalaAdmin {
     ]
     if (publicData == null) return new LockingScript(p2pkh)
     // Public metadata: pushed then dropped — purely informational, no spend effect.
-    const blob = Utils.toArray(JSON.stringify(publicData), 'utf8')
+    const blob = toArray(JSON.stringify(publicData), 'utf8')
     return new LockingScript([
       createMinimallyEncodedScriptChunk(blob),
       { op: OP.OP_DROP },
@@ -141,7 +138,7 @@ export class MandalaAdmin {
         throw new Error('not a MandalaAdmin script: bad publicData prefix')
       const data = c[0].data
       if (data == null) throw new Error('not a MandalaAdmin script: empty publicData push')
-      publicData = JSON.parse(Utils.toUTF8(data))
+      publicData = JSON.parse(toUTF8(data))
       p2pkh = c.slice(2)
     } else if (c.length !== 5) {
       throw new Error('not a MandalaAdmin script: wrong chunk count')
@@ -175,7 +172,7 @@ export class MandalaAdmin {
         const keyID = MandalaAdmin.commitment(data)
         const { signature: bareSignature } = await wallet.createSignature(
           {
-            hashToDirectlySign: Hash.hash256(preimage),
+            hashToDirectlySign: hash256(preimage),
             protocolID: ADMIN_PROTOCOL,
             keyID,
             counterparty
@@ -193,7 +190,7 @@ export class MandalaAdmin {
           { protocolID: ADMIN_PROTOCOL, keyID, counterparty, forSelf: true },
           originator
         )
-        const pubkey = Utils.toArray(publicKey, 'hex')
+        const pubkey = toArray(publicKey, 'hex')
         return new UnlockingScript([
           { op: sigForScript.length, data: sigForScript },
           { op: pubkey.length, data: pubkey }

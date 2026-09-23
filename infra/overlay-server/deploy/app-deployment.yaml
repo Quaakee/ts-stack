@@ -64,6 +64,16 @@ spec:
                 configMapKeyRef:
                   name: overlay-config
                   key: gasp-enabled
+            - name: MANDALA_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: overlay-config
+                  key: mandala-enabled
+            - name: MANDALA_STATIC_DENYLIST_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: overlay-config
+                  key: mandala-static-denylist-json
             - name: KNEX_URL
               valueFrom:
                 secretKeyRef:
@@ -79,6 +89,18 @@ spec:
                 secretKeyRef:
                   name: overlay-secrets
                   key: server-private-key
+            - name: MANDALA_VERIFIER_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: overlay-secrets
+                  key: mandala-verifier-private-key
+                  optional: true
+            - name: MANDALA_ADMIN_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: overlay-secrets
+                  key: mandala-admin-private-key
+                  optional: true
             - name: ARC_API_KEY
               valueFrom:
                 secretKeyRef:

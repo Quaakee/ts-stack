@@ -23,7 +23,14 @@ The documentation is split into various pages, each covering a set of related fu
 ## Open RPC
 
 `StorageClient` implements `WalletStorageProvider` over HTTPS using JSON-RPC.
-Its maintained API documentation is in the [Storage reference](./storage.md#class-storageclient).
+Every response must complete BRC-103 mutual authentication. By default, the
+first authenticated server identity reached through the configured HTTPS
+endpoint is authoritative for the client instance; callers with an
+independently validated key can pass `serverIdentityKey` to pin it from the
+first response. The distinct storage identity advertised through that
+authenticated response is authoritative by default and can be independently
+pinned with the `storageIdentityKey` option. Its maintained API documentation is in the
+[Storage reference](./storage.md#class-storageclient).
 
 ## Getting Started
 

@@ -3,7 +3,7 @@ id: pkg-gasp
 title: '@bsv/gasp'
 kind: package
 domain: overlays
-version: '1.3.6'
+version: '1.3.7'
 source_repo: 'bsv-blockchain/ts-stack'
 last_updated: '2026-08-27'
 last_verified: '2026-08-27'
@@ -232,6 +232,11 @@ await gaspSequential.sync('https://peer.example.com')
 6. **Graph validation must throw** — If invalid, `validateGraphAnchor()` must throw; returning gracefully doesn't stop sync
 7. **Unidirectional limitation** — Don't call `submitNode()` in unidirectional mode; remote won't process
 8. **Sequential overhead** — Sequential mode slower; use only if parallel causes DB locking
+
+In bidirectional mode, `submitNode()` does not carry the `spentBy` parent
+outpoint. The receiver must already have the parent needed to validate a pushed
+child, request it in a subsequent synchronization round, or reject the graph.
+Never infer or accept an unknown parent edge from the pushed child alone.
 
 ## Related packages
 

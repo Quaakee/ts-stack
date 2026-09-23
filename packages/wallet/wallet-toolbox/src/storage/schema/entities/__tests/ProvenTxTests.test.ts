@@ -123,19 +123,7 @@ describe('ProvenTx class method tests', () => {
       getMerklePath: async (requestedTxid: string) => {
         if (requestedTxid === txid) {
           return {
-            merklePath: {
-              path: [[{ hash: txid, offset: 0 }]],
-              blockHeight: height,
-              toBinary: () => merklePathBinary,
-              computeRoot: () => merkleRoot,
-              verifyProof: () => true,
-              toHex: () => Buffer.from(merklePathBinary).toString('hex'),
-              indexOf: () => 0,
-              findOrComputeLeaf: () => ({ hash: txid, offset: 0 }),
-              verify: () => true,
-              combine: () => ({}) as bsv.MerklePath,
-              trim: () => ({}) as bsv.MerklePath
-            } as unknown as bsv.MerklePath,
+            merklePath: bsv.MerklePath.fromBinary(merklePathBinary),
             header: {
               version: 1,
               previousHash: 'prev-hash',

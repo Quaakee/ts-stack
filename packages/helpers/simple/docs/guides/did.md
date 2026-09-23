@@ -19,6 +19,17 @@ The DID lifecycle uses a chain of UTXO spends:
 
 Any resolver can follow this output-0-spend chain to discover the latest DID Document.
 
+> **Resolver trust boundary:** the current resolver response does not include
+> raw transactions, inclusion proofs, or a proof that the reported output is
+> still unspent. The configured universal resolver, application proxy, and
+> WhatsOnChain transaction/spend index are therefore authoritative trust
+> sources. The library bounds and validates their JSON, binds documents to the
+> requested DID, and checks reported output-0 linkage, but those checks cannot
+> detect a compromised provider that fabricates or rolls back its whole view.
+> Do not use a remotely resolved key as the sole authentication or irreversible
+> payment authority; require an independently trusted confirmation or resolver
+> policy.
+
 ## Creating a DID
 
 ```typescript
@@ -27,8 +38,8 @@ import { createWallet } from '@bsv/simple/browser'
 const wallet = await createWallet()
 
 const result = await wallet.createDID()
-console.log(result.did)          // 'did:bsv:<txid>'
-console.log(result.document)     // Full W3C DID Document
+console.log(result.did) // 'did:bsv:<txid>'
+console.log(result.document) // Full W3C DID Document
 console.log(result.identityCode) // Internal identity code
 ```
 
@@ -38,13 +49,18 @@ With services:
 const result = await wallet.createDID({
   services: [
     {
-      id: 'did:bsv:<txid>#messaging',
+      id: '#messaging',
       type: 'MessagingService',
       serviceEndpoint: 'https://example.com/messages'
     }
   ]
 })
 ```
+
+`createDID()` binds fragment-relative service IDs to the issued DID (for example,
+`#messaging` becomes `did:bsv:<issued-txid>#messaging`). This avoids requiring the
+caller to predict the issuance transaction ID. Absolute service IDs for another DID
+are rejected before the issuance transaction is created.
 
 ## DID Document Structure (V2)
 
@@ -78,7 +94,7 @@ Resolving your own DID checks the local basket first — no network calls needed
 
 ```typescript
 const result = await wallet.resolveDID('did:bsv:<your-txid>')
-console.log(result.didDocument)         // DID Document
+console.log(result.didDocument) // DID Document
 console.log(result.didDocumentMetadata) // { created, updated, versionId }
 ```
 
@@ -123,6 +139,7 @@ export const GET = handler.GET
 ```
 
 That's it. The handler automatically:
+
 - Tries the nChain Universal Resolver first (10s timeout)
 - Falls back to WoC chain-following on failure (parses OP_RETURN, follows output-0 spend chain)
 - Handles deactivated DIDs (returns `deactivated: true`)
@@ -131,14 +148,20 @@ That's it. The handler automatically:
 **API:** `GET ?did=did:bsv:<txid>` → `DIDResolutionResult`
 
 **Custom config (optional):**
+
 ```typescript
 createDIDResolverHandler({
-  resolverUrl: 'https://custom-resolver.com',  // nChain Universal Resolver by default
-  wocBaseUrl: 'https://api.whatsonchain.com',   // WoC fallback
-  resolverTimeout: 10000,                        // ms
-  maxHops: 100                                   // chain-following limit
+  resolverUrl: 'https://custom-resolver.com', // nChain Universal Resolver by default
+  wocBaseUrl: 'https://api.whatsonchain.com', // WoC fallback
+  resolverTimeout: 10000, // ms
+  maxHops: 100 // chain-following limit
 })
 ```
+
+Custom resolver URLs are credential-free HTTPS endpoints and are treated as
+authoritative. The optional `fetch` override is a fully trusted escape hatch for
+controlled tests/local development; it must provide equivalent origin, redirect,
+deadline, and network-destination controls in production.
 
 ### 2. Configure the Wallet
 
@@ -167,8 +190,8 @@ console.log(did) // 'did:bsv:d803b04a...'
 
 // Wallet B resolves it (goes through proxy → WoC chain-following)
 const result = await walletB.resolveDID(did)
-console.log(result.didDocument)          // Full DID Document
-console.log(result.didDocumentMetadata)  // { created, updated, versionId }
+console.log(result.didDocument) // Full DID Document
+console.log(result.didDocumentMetadata) // { created, updated, versionId }
 ```
 
 ## Updating a DID
@@ -220,7 +243,7 @@ const doc = DID.buildDocument(txid, subjectPubKeyHex)
 const did = DID.fromTxid('d803b04a...')
 
 // Parse and validate
-DID.parse('did:bsv:d803b04a...')  // { method: 'bsv', identifier: 'd803b04a...' }
+DID.parse('did:bsv:d803b04a...') // { method: 'bsv', identifier: 'd803b04a...' }
 DID.isValid('did:bsv:d803b04a...') // true
 ```
 
@@ -237,6 +260,15 @@ await wallet.registerDID()
 const result = await wallet.resolveDID('did:bsv:02a1b2c3...')
 ```
 
+Earlier `registerDID()` releases persisted the short certificate type returned
+by `DID.getCertificateType()` (`ZGlkOmJzdg==`). New registrations use the
+canonical 32-byte type returned by `DID.getCanonicalCertificateType()`. During
+migration, use the short identifier only to recognize records exported from
+the storage version that created them. Current SDK wallet methods reject short
+certificate types, so do not include it in wallet lookup, acquisition, proof,
+or relinquishment calls. Reissue/import canonical replacements explicitly; no
+existing certificate is rewritten automatically.
+
 ## Server-Side Usage (Without Proxy)
 
 When using `@bsv/simple` on the server (e.g., in a Node.js script), no proxy is needed. The SDK calls resolvers directly:
@@ -251,16 +283,17 @@ const result = await wallet.resolveDID('did:bsv:<txid>')
 ```
 
 The resolution order without a proxy is:
+
 1. Local basket
 2. nChain Universal Resolver (direct)
 3. WhatsOnChain chain-following (direct)
 
 ## Troubleshooting
 
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| Cross-wallet resolve fails with CORS error | Browser calling WoC directly | Set up the `/api/resolve-did` proxy route |
-| nChain returns HTTP 500 | Their infrastructure is down | The proxy automatically falls back to WoC |
-| WoC returns HTTP 429 | Browser rate-limited | Use the server-side proxy (no browser rate limits) |
-| `resolveDID` returns `notYetAvailable` | Document TX hasn't propagated | Wait a few seconds and retry |
-| Own DID resolves but others don't | No `didProxyUrl` configured | Pass `didProxyUrl: '/api/resolve-did'` to `createWallet()` |
+| Problem                                    | Cause                         | Solution                                                   |
+| ------------------------------------------ | ----------------------------- | ---------------------------------------------------------- |
+| Cross-wallet resolve fails with CORS error | Browser calling WoC directly  | Set up the `/api/resolve-did` proxy route                  |
+| nChain returns HTTP 500                    | Their infrastructure is down  | The proxy automatically falls back to WoC                  |
+| WoC returns HTTP 429                       | Browser rate-limited          | Use the server-side proxy (no browser rate limits)         |
+| `resolveDID` returns `notYetAvailable`     | Document TX hasn't propagated | Wait a few seconds and retry                               |
+| Own DID resolves but others don't          | No `didProxyUrl` configured   | Pass `didProxyUrl: '/api/resolve-did'` to `createWallet()` |

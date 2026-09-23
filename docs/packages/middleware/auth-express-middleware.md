@@ -3,10 +3,10 @@ id: pkg-auth-express-middleware
 title: '@bsv/auth-express-middleware'
 kind: package
 domain: middleware
-version: '2.2.3'
+version: '2.2.5'
 source_repo: 'bsv-blockchain/ts-stack'
-last_updated: '2026-08-27'
-last_verified: '2026-08-27'
+last_updated: '2026-09-16'
+last_verified: '2026-09-16'
 review_cadence_days: 30
 npm: 'https://www.npmjs.com/package/@bsv/auth-express-middleware'
 repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/middleware/auth-express-middleware'
@@ -30,6 +30,10 @@ npm install @bsv/auth-express-middleware @bsv/sdk express
 Node.js 22 or newer and Express 4.18 or newer are required. The package uses
 the application's peer-provided Express runtime and type graph and provides
 native ESM and CommonJS entry points with matching declarations.
+
+Version 2.2.4 requires `@bsv/sdk` 2.7.1 or later so the identity assigned to
+`req.auth.identityKey` is the identity bound to the verified peer session, not
+unsigned BRC-104 transport metadata.
 
 ## Quick start
 
@@ -63,6 +67,7 @@ app.use(
     sessionManager,
     certificatesToRequest,
     onCertificatesReceived,
+    certificateApprovalStore,
     logger,
     logLevel: 'error',
     transportLimits: {
@@ -81,6 +86,12 @@ with a signed `413`. The default is 8 MiB. Operators may set it to `-1` only
 when the embedding service enforces an equivalent response budget. Malformed
 requests are rejected before state allocation. At capacity, the middleware
 fails closed with `503`.
+
+When `onCertificatesReceived` is configured, approval is retained against the
+exact validated session nonce and identity. The default bounded approval store
+is process-local. Load-balanced services must inject a shared
+`certificateApprovalStore` as well as a shared `AsyncSessionManager`; malformed
+or unavailable approval-store results fail closed.
 
 The exact `/.well-known/auth` endpoint remains public because it establishes
 the session. Similar path prefixes receive normal auth treatment.
@@ -142,6 +153,15 @@ CORS. CSP is primarily a document policy and is not a substitute for API CORS.
 
 - Use HTTPS; mutual authentication does not encrypt all HTTP data.
 - Parse bodies before auth so signed and routed values match.
+- Use matching parsers and only flat string fields for URL-encoded bodies;
+  lossy nested/array coercions and unsupported nonempty bodies are rejected.
+- Do not authorize from `Host`, `Cookie`, forwarding headers, or other metadata
+  omitted by the BRC-104 v0.1 signed frame. This subset is deliberate because
+  browser and webpage libraries often cannot safely observe those values when
+  signing. Pin the authority at the edge and compare required values with exact
+  signed `x-bsv-*` or `Authorization` fields. Response authentication likewise
+  covers only the declared signed header set, not arbitrary standard response
+  headers or the complete browser/proxy context.
 - Install one auth wrapper per request path.
 - Keep finite timeouts/response sizes/capacity and alert on `408`, `413`, and
   `503`.
@@ -155,12 +175,14 @@ Runtime:
 
 - `createAuthMiddleware`
 - `ExpressTransport`
+- `InMemoryCertificateApprovalStore`
 
 Types:
 
 - `AuthMiddlewareOptions`
 - `AuthRequest`
 - `AuthTransportLimits`
+- `CertificateApprovalStore`
 - `LogLevel`
 
 ## Related packages

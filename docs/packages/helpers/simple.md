@@ -3,7 +3,7 @@ id: pkg-simple
 title: '@bsv/simple'
 kind: package
 domain: helpers
-version: '0.5.3'
+version: '0.6.0'
 source_repo: 'bsv-blockchain/ts-stack'
 last_updated: '2026-09-08'
 last_verified: '2026-09-08'
@@ -126,7 +126,9 @@ await serverWallet.receiveDirectPayment({
 - **MessageBox** — P2P payment and message transport via a Message Box server
 - **Overlay** — SHIP/SLAP broadcast and lookup with explicit `teratestnet`
   routing alongside mainnet, testnet, and local presets
-- **Verifiable Credentials** — W3C format for attestations with revocation support
+- **Verifiable Credentials** — W3C credential envelopes backed by authenticated
+  BSV certificates. Presentation envelopes produced by the current synchronous
+  helper are unsigned and are not authentication evidence.
 
 ## When to use this
 

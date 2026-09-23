@@ -4,9 +4,9 @@ title: '@bsv/overlay-topics'
 kind: package
 domain: overlays
 npm: '@bsv/overlay-topics'
-version: '1.7.2'
-last_updated: '2026-08-27'
-last_verified: '2026-08-27'
+version: '1.8.4'
+last_updated: '2026-09-18'
+last_verified: '2026-09-18'
 review_cadence_days: 30
 repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/overlays/topics'
 status: stable
@@ -155,7 +155,9 @@ const admittance = await manager.identifyAdmissibleOutputs(beef, [])
 
 ## Spec conformance
 
-- **DID** — W3C-compliant decentralized identifiers (serialNumber as DID identifier)
+- **DID** — Legacy serial-number token indexing. The v1 wire token omits issuer
+  and subject, so lookup does not establish either identity relationship;
+  consumers need a separate authenticated binding.
 - **BTMS** — Basic Token Management System protocol (issuance, transfer, burn)
 - **KVStore** — Key-value protocol-agnostic storage
 - **ProtoMap** — Registry of wallet protocols with deserialization support
@@ -222,3 +224,33 @@ older readers may have admitted inputs that the format does not permit.
 Repository fixtures establish format compatibility; they do not establish an
 inventory of every deployed or historical anchor. Other topics, lookup query
 shapes and persisted schemas are unchanged.
+
+### Mandala admission and the 1.8.0 upgrade
+
+Use the same `MandalaStorageManager` for Mandala admission and lookup. The
+reference store now implements `isAdminOutpoint(assetId, txid, outputIndex)`
+against admitted admin history. Custom adapters must implement that predicate;
+a missing verifier rejects non-genesis admin actions. Its optional TypeScript
+member preserves source compatibility, not permission to bypass verification.
+Never implement it as a constant `true`.
+
+Registration must omit `assetId` or use an empty string: the registration's own
+outpoint defines its asset. Subsequent admin actions must spend a previously
+admitted admin output for that same asset. Token spends require a stored owner
+row matching the source outpoint, asset and amount. Optional input linkage
+corroborates that owner and the source locking key; it cannot replace missing
+state. Sender blinding and transfers without input linkage remain supported
+when authoritative owner state is present. Linkage arrays require unique,
+non-negative integer indices.
+
+Before upgrading an existing Mandala deployment, back up and audit its admin
+history and token-owner records. Restore missing rows from verified admission
+evidence before historical replay; do not infer authority from a submitted
+payload. The engine identifies admissible outputs before sending spend
+notifications, so normal admission can read the owner before lookup removes
+the spent row. Custom replay adapters must preserve that ordering. These checks
+do not retroactively validate old records.
+
+Coordinate the admission and lookup upgrade. Existing valid wire fields and
+encodings are unchanged, and no database collection migration is required.
+Keep the new admission checks enabled while repairing historical data.

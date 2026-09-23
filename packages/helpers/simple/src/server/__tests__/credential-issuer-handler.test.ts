@@ -1,6 +1,10 @@
 import { CredentialIssuer } from '../../modules/credentials'
 import { createCredentialIssuerHandler } from '../credential-issuer-handler'
 
+const SUBJECT_KEY = '030dbed53c3613c887ad36e8bde365c2e58f6196735a589cd09d6bc316fa550df4'
+const SERIAL_NUMBER = 'BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU='
+const CERTIFICATE_TYPE = 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE='
+
 interface TestCase {
   name: string
   url: string
@@ -43,11 +47,17 @@ const cases: TestCase[] = [
     name: 'preserves unknown-action reporting',
     url: 'https://issuer.example/api/credential-issuer?action=unknown',
     body: {},
-    expectedBody: { success: false, error: 'Unknown action: unknown' }
+    expectedBody: { success: false, error: 'Unknown credential issuer action' }
   }
 ]
 
 const testIssuer = {
+  getInfo: jest.fn(() => ({
+    publicKey: SUBJECT_KEY,
+    did: `did:bsv:${SUBJECT_KEY}`,
+    schemas: [{ id: 'test-schema', name: 'Test Schema', certificateTypeBase64: CERTIFICATE_TYPE }]
+  })),
+  isRevoked: jest.fn(async () => false),
   issue: jest.fn(async (subject: string, schemaId: string, fields: Record<string, string>) => ({
     _bsv: {
       certificate: {
@@ -66,7 +76,8 @@ describe('createCredentialIssuerHandler POST routing', () => {
   const privateKey = '1'.repeat(64)
   const handler = createCredentialIssuerHandler({
     envVar,
-    schemas: [{ id: 'test-schema', name: 'Test Schema', fields: [] }]
+    schemas: [{ id: 'test-schema', name: 'Test Schema', fields: [] }],
+    authorize: async () => true
   })
 
   beforeAll(() => {
@@ -96,9 +107,9 @@ describe('createCredentialIssuerHandler POST routing', () => {
     {
       name: 'legacy certify',
       url: 'https://issuer.example/api/certify?action=unknown',
-      body: { identityKey: 'legacy-subject', fields: { name: 'Legacy' } },
+      body: { identityKey: SUBJECT_KEY, fields: { name: 'Legacy' } },
       expectedBody: {
-        subject: 'legacy-subject',
+        subject: SUBJECT_KEY,
         schemaId: 'test-schema',
         fields: { name: 'Legacy' }
       }
@@ -106,9 +117,9 @@ describe('createCredentialIssuerHandler POST routing', () => {
     {
       name: 'query-parameter certify',
       url: 'https://issuer.example/api/credential-issuer?action=certify',
-      body: { identityKey: 'query-subject', schemaId: 'custom-schema', fields: { name: 'Query' } },
+      body: { identityKey: SUBJECT_KEY, schemaId: 'custom-schema', fields: { name: 'Query' } },
       expectedBody: {
-        subject: 'query-subject',
+        subject: SUBJECT_KEY,
         schemaId: 'custom-schema',
         fields: { name: 'Query' }
       }
@@ -116,13 +127,13 @@ describe('createCredentialIssuerHandler POST routing', () => {
     {
       name: 'issue',
       url: 'https://issuer.example/api/credential-issuer?action=issue',
-      body: { subjectKey: 'issue-subject', fields: { name: 'Issue' } },
+      body: { subjectKey: SUBJECT_KEY, fields: { name: 'Issue' } },
       expectedBody: {
         success: true,
         credential: {
           _bsv: {
             certificate: {
-              subject: 'issue-subject',
+              subject: SUBJECT_KEY,
               schemaId: 'test-schema',
               fields: { name: 'Issue' }
             }
@@ -142,8 +153,8 @@ describe('createCredentialIssuerHandler POST routing', () => {
     {
       name: 'revoke',
       url: 'https://issuer.example/api/credential-issuer?action=revoke',
-      body: { serialNumber: 'serial-1' },
-      expectedBody: { success: true, txid: 'revoke-serial-1' }
+      body: { serialNumber: SERIAL_NUMBER },
+      expectedBody: { success: true, txid: `revoke-${SERIAL_NUMBER}` }
     }
   ])('dispatches successful $name requests', async ({ url, body, expectedBody }) => {
     const response = await handler.POST?.({
@@ -168,7 +179,72 @@ describe('createCredentialIssuerHandler POST routing', () => {
     expect(response.status).toBe(500)
     await expect(response.json()).resolves.toEqual({
       success: false,
-      error: 'Failed: invalid JSON'
+      error: 'Credential issuer operation failed'
+    })
+  })
+
+  it('publishes the canonical configured certificate type', async () => {
+    const response = await handler.GET?.({
+      url: 'https://issuer.example/api/credential-issuer?action=info'
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      certifierPublicKey: SUBJECT_KEY,
+      certificateType: CERTIFICATE_TYPE,
+      schemas: [{ certificateTypeBase64: CERTIFICATE_TYPE }]
+    })
+  })
+
+  it('does not disclose issuer implementation errors', async () => {
+    testIssuer.issue.mockRejectedValueOnce(
+      new Error('sqlite /private/issuer.db failed: select secret from credentials')
+    )
+    const response = await handler.POST?.({
+      url: 'https://issuer.example/api/credential-issuer?action=issue',
+      json: async () => ({ subjectKey: SUBJECT_KEY, fields: {} })
+    })
+
+    expect(response.status).toBe(500)
+    const body = await response.text()
+    expect(body).toContain('Credential issuer operation failed')
+    expect(body).not.toContain('/private/issuer.db')
+    expect(body).not.toContain('select secret')
+  })
+
+  it('denies state changes when no authorization policy is configured', async () => {
+    const denied = createCredentialIssuerHandler({
+      envVar,
+      schemas: [{ id: 'test-schema', name: 'Test Schema', fields: [] }]
+    })
+    const response = await denied.POST?.({
+      url: 'https://issuer.example/api/credential-issuer?action=issue',
+      json: async () => ({ subjectKey: SUBJECT_KEY, fields: {} })
+    })
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({
+      success: false,
+      error: 'Credential issuance is not authorized'
+    })
+  })
+
+  it('requires an exact boolean authorization verdict', async () => {
+    const denied = createCredentialIssuerHandler({
+      envVar,
+      schemas: [{ id: 'test-schema', name: 'Test Schema', fields: [] }],
+      authorize: async () => 'true' as unknown as boolean
+    })
+    const response = await denied.POST?.({
+      url: 'https://issuer.example/api/credential-issuer?action=revoke',
+      json: async () => ({ serialNumber: SERIAL_NUMBER })
+    })
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({
+      success: false,
+      error: 'Credential revocation is not authorized'
     })
   })
 })

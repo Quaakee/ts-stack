@@ -4,9 +4,9 @@ title: '@bsv/overlay-discovery-services'
 kind: package
 domain: overlays
 npm: '@bsv/overlay-discovery-services'
-version: '2.2.1'
-last_updated: '2026-08-27'
-last_verified: '2026-08-27'
+version: '2.2.5'
+last_updated: '2026-09-18'
+last_verified: '2026-09-18'
 review_cadence_days: 30
 repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/overlays/overlay-discovery-services'
 status: stable
@@ -114,7 +114,7 @@ import { WalletAdvertiser } from '@bsv/overlay-discovery-services'
 
 const advertiser = new WalletAdvertiser(
   'main',
-  process.env.SERVER_PRIVATE_KEY!,
+  process.env.SERVER_PRIVATE_KEY!, // dedicated root secret; never expose the instance
   'https://store-us-1.bsvb.tech',
   'https://mynode.example.com'
 )
@@ -160,6 +160,25 @@ const serviceDiscovery = await engine.lookup({
 - **Service naming** — Format `ls_*` (e.g., `ls_hello`, `ls_slap`, `ls_btms`)
 - **URI validation** — Must be HTTPS with valid domain (localhost/IPs not advertised in production)
 
+## Security boundaries
+
+- `WalletAdvertiser.findAllAdvertisements()` returns only canonical,
+  cryptographically authenticated advertisements owned by its wallet identity.
+  Use `ls_ship` or `ls_slap` lookups to discover advertisements from other
+  identities.
+- `WalletAdvertiser.privateKey` remains public only for compatibility and is a
+  root wallet secret. Never serialize, log, return, or share an advertiser
+  instance with plugins or untrusted code; use a dedicated key.
+- `parseAdvertisement()` is a synchronous structural parser, not a signature
+  verdict. Topic admission and the advertiser's create/find/revoke flows perform
+  the cryptographic check.
+- Lookup queries accept only documented plain-data fields. `limit` is an integer
+  from 0 through 1,000, defaults to 1,000, and zero returns no rows. `skip` is
+  bounded to 1,000,000. Paginate explicitly.
+- Discovered endpoints are untrusted network input even when the advertisement
+  signature is valid. Retain public-HTTPS/DNS pinning, redirect and timeout
+  controls, and response validation when connecting.
+
 ## When to use this
 
 - Running an overlay node that wants to be discoverable by peers
@@ -186,7 +205,7 @@ const serviceDiscovery = await engine.lookup({
 1. **Auto-registration** — SHIP/SLAP are auto-registered by Engine; don't manually add `tm_ship` and `tm_slap`
 2. **Topic/service naming** — Must follow `tm_*` or `ls_*` pattern; invalid names rejected by validators
 3. **URI format** — Must be valid HTTPS; localhost/IPs not advertised in production
-4. **Token signature linkage** — Advertiser verifies signature is linked to the transaction; mismatched signatures fail
+4. **Token signature linkage** — Advertiser verifies signature, identity, metadata, one-satoshi output, transaction, and exact outpoint before signing; mismatches fail
 5. **Storage isolation** — SHIP and SLAP have separate storage; wrong service query returns no results
 6. **Bootstrap requirement** — Engine needs at least one SHIP/SLAP tracker URL to bootstrap peer discovery
 

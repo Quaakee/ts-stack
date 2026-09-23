@@ -71,6 +71,21 @@ function compareText(left, right) {
   return left.localeCompare(right)
 }
 
+function stableModuleName(module) {
+  const normalized = module.replaceAll('\\', '/')
+  const installed = normalized.lastIndexOf('/node_modules/')
+  if (installed >= 0) return `node_modules/${normalized.slice(installed + '/node_modules/'.length)}`
+  if (/\/browser-package-consumer-[^/]+\/entry\.mjs$/.test(normalized)) return 'entry.mjs'
+  return normalized
+}
+
+function largestModules(moduleBytes, limit = 50) {
+  return [...moduleBytes.entries()]
+    .map(([module, bytes]) => ({ module: stableModuleName(module), bytes }))
+    .sort((left, right) => right.bytes - left.bytes || compareText(left.module, right.module))
+    .slice(0, limit)
+}
+
 function packageNameFromModuleId(moduleId) {
   const normalized = moduleId.replaceAll('\\', '/')
   const installed = normalized.split('/node_modules/').at(-1)
@@ -122,10 +137,10 @@ function positiveBudget(value, label) {
   }
 }
 
-export function validateBundleBudget(actual, maximum, label) {
+export function validateBundleBudget(actual, maximum, label, enforce = true) {
   for (const dimension of ['raw', 'gzip', 'brotli']) {
     positiveBudget(maximum?.[dimension], `${label} budget ${dimension}`)
-    if (actual[dimension] > maximum[dimension]) {
+    if (enforce && actual[dimension] > maximum[dimension]) {
       throw new Error(
         `${label} ${dimension} size ${actual[dimension]} exceeds budget ${maximum[dimension]}`
       )
@@ -315,9 +330,10 @@ async function collectBundle(directory) {
   return { code, files }
 }
 
-async function checkVite(consumerDirectory, entryPath, budget) {
+async function checkVite(consumerDirectory, entryPath, budget, enforceBudget) {
   const outputDirectory = path.join(consumerDirectory, 'vite-dist')
   const moduleIds = new Set()
+  const moduleBytes = new Map()
   const { build } = await importTool('vite')
   await build({
     root: consumerDirectory,
@@ -329,7 +345,13 @@ async function checkVite(consumerDirectory, entryPath, budget) {
         generateBundle(_options, bundle) {
           for (const artifact of Object.values(bundle)) {
             if (artifact.type !== 'chunk') continue
-            for (const moduleId of Object.keys(artifact.modules)) moduleIds.add(moduleId)
+            for (const [moduleId, details] of Object.entries(artifact.modules)) {
+              moduleIds.add(moduleId)
+              moduleBytes.set(
+                moduleId,
+                (moduleBytes.get(moduleId) ?? 0) + (details.renderedLength ?? 0)
+              )
+            }
           }
         }
       }
@@ -351,14 +373,17 @@ async function checkVite(consumerDirectory, entryPath, budget) {
   const bundle = await collectBundle(outputDirectory)
   assertBrowserComposition([...moduleIds], bundle.code.toString('utf8'), 'Vite browser bundle')
   const measurements = bundleSizes(bundle.code)
-  validateBundleBudget(measurements, budget, 'Vite browser bundle')
+  validateBundleBudget(measurements, budget, 'Vite browser bundle', enforceBudget)
   return {
     bytes: measurements,
-    composition: bundleComposition([...moduleIds], bundle.files)
+    composition: {
+      ...bundleComposition([...moduleIds], bundle.files),
+      largestModules: largestModules(moduleBytes)
+    }
   }
 }
 
-async function checkEsbuild(consumerDirectory, entryPath, budget) {
+async function checkEsbuild(consumerDirectory, entryPath, budget, enforceBudget) {
   const outputDirectory = path.join(consumerDirectory, 'esbuild-dist')
   await fs.mkdir(outputDirectory)
   const outputPath = path.join(outputDirectory, 'consumer.mjs')
@@ -386,10 +411,19 @@ async function checkEsbuild(consumerDirectory, entryPath, budget) {
     'esbuild browser bundle'
   )
   const measurements = bundleSizes(bundle.code)
-  validateBundleBudget(measurements, budget, 'esbuild browser bundle')
+  validateBundleBudget(measurements, budget, 'esbuild browser bundle', enforceBudget)
+  const moduleBytes = new Map()
+  for (const output of Object.values(result.metafile.outputs)) {
+    for (const [moduleId, details] of Object.entries(output.inputs ?? {})) {
+      moduleBytes.set(moduleId, (moduleBytes.get(moduleId) ?? 0) + details.bytesInOutput)
+    }
+  }
   return {
     bytes: measurements,
-    composition: bundleComposition(Object.keys(result.metafile.inputs), bundle.files)
+    composition: {
+      ...bundleComposition(Object.keys(result.metafile.inputs), bundle.files),
+      largestModules: largestModules(moduleBytes)
+    }
   }
 }
 
@@ -406,7 +440,7 @@ async function removeTemporaryDirectory(directory) {
   })
 }
 
-async function checkUmd(consumerDirectory, manifest, budget) {
+async function checkUmd(consumerDirectory, manifest, budget, enforceBudget) {
   if (!budget.umd) return undefined
   const packageDirectory = installedPackageDirectory(consumerDirectory, manifest.name)
   const payloadPaths = [budget.umd.path, ...(budget.umd.additionalPaths ?? [])]
@@ -446,7 +480,7 @@ async function checkUmd(consumerDirectory, manifest, budget) {
     throw new Error(`UMD bundle does not expose configured global ${budget.umd.global}`)
   }
   const measurements = aggregateBundleSizes(payloads)
-  validateBundleBudget(measurements, budget.umd.maximumBytes, 'UMD browser payload')
+  validateBundleBudget(measurements, budget.umd.maximumBytes, 'UMD browser payload', enforceBudget)
   return {
     bytes: measurements,
     composition: {
@@ -457,7 +491,7 @@ async function checkUmd(consumerDirectory, manifest, budget) {
   }
 }
 
-export async function checkBrowserPackage(packageDirectory) {
+export async function checkBrowserPackage(packageDirectory, { enforceBudget = true } = {}) {
   const [manifestText, budgetText] = await Promise.all([
     fs.readFile(path.join(packageDirectory, 'package.json'), 'utf8'),
     fs.readFile(path.join(packageDirectory, 'browser-budget.json'), 'utf8')
@@ -488,9 +522,9 @@ export async function checkBrowserPackage(packageDirectory) {
       consumerEntry(packageSpecifier(manifest.name, budget.entry), budget)
     )
     const [vite, esbuild, umd] = await Promise.all([
-      checkVite(consumerDirectory, entryPath, budget.maximumBytes.vite),
-      checkEsbuild(consumerDirectory, entryPath, budget.maximumBytes.esbuild),
-      checkUmd(consumerDirectory, manifest, budget)
+      checkVite(consumerDirectory, entryPath, budget.maximumBytes.vite, enforceBudget),
+      checkEsbuild(consumerDirectory, entryPath, budget.maximumBytes.esbuild, enforceBudget),
+      checkUmd(consumerDirectory, manifest, budget, enforceBudget)
     ])
     return { vite, esbuild, ...(umd ? { umd } : {}) }
   } finally {
@@ -502,14 +536,18 @@ export async function checkBrowserPackage(packageDirectory) {
 }
 
 async function main(arguments_) {
-  if (arguments_.length !== 1) {
-    throw new Error('Usage: check-browser-package.mjs <package-directory>')
+  const measureOnly = arguments_.at(-1) === '--measure'
+  const positionalArguments = measureOnly ? arguments_.slice(0, -1) : arguments_
+  if (positionalArguments.length !== 1) {
+    throw new Error('Usage: check-browser-package.mjs <package-directory> [--measure]')
   }
-  const packageDirectory = path.resolve(process.cwd(), arguments_[0])
+  const packageDirectory = path.resolve(process.cwd(), positionalArguments[0])
   const manifest = JSON.parse(
     await fs.readFile(path.join(packageDirectory, 'package.json'), 'utf8')
   )
-  const measurements = await checkBrowserPackage(packageDirectory)
+  const measurements = await checkBrowserPackage(packageDirectory, {
+    enforceBudget: !measureOnly
+  })
   const outputDirectory = process.env.BROWSER_COMPOSITION_DIRECTORY
   if (outputDirectory) {
     await fs.mkdir(outputDirectory, { recursive: true })
@@ -533,7 +571,8 @@ async function main(arguments_) {
     )
   }
   console.log(
-    `Verified ${manifest.name}@${manifest.version} exact-tarball browser contract: ` +
+    `${measureOnly ? 'Measured' : 'Verified'} ${manifest.name}@${manifest.version} ` +
+      `exact-tarball browser contract: ` +
       JSON.stringify(measurements)
   )
 }

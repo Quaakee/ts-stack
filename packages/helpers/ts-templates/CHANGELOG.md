@@ -10,6 +10,19 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### 1.10.3 candidate — CommonJS SDK interop
+
+### Fixed
+
+- The CommonJS build no longer wraps `@bsv/sdk` default imports as whole
+  modules, so `require('@bsv/templates')` consumers can construct scripts again
+  instead of failing with `LockingScript.default is not a constructor`
+  ([#571](https://github.com/bsv-blockchain/ts-stack/issues/571)). SDK classes
+  are now imported by name from the SDK barrels; the ESM build and browser
+  bundle size are unchanged.
+
+### 1.10.2 candidate — signing-context and template hardening
+
 ### Added
 
 - `R1K1Wallet`, a static Runar contract template with a salted P-256 hardware
@@ -38,7 +51,15 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Security
 
-- (Notify of any improvements related to security vulnerabilities or potential risks.)
+- Validate and snapshot the complete signing context before requesting a
+  wallet signature, including source outpoint, satoshis, locking script,
+  sequence, scope, and any supplied source transaction.
+- Require `MultiPushDrop` to match its complete canonical script and cap it at
+  120 distinct compressed locking keys; bind `P2MSKH` signatures to the exact
+  ordered key commitment and threshold.
+- Reject non-positive or non-safe-integer Mandala amounts and harden Mandala,
+  R1K1Wallet, OpReturn, DSTAS, STAS, and BSV-21 script and signature inputs
+  against malformed, ambiguous, or mutation-backed values.
 
 ---
 

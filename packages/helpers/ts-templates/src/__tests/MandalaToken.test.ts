@@ -1,5 +1,10 @@
 import { MandalaToken } from '../MandalaToken.js'
-import { Hash, PrivateKey, WalletInterface } from '@bsv/sdk'
+import { Hash, LockingScript, OP, PrivateKey, WalletInterface } from '@bsv/sdk'
+import {
+  createMinimallyEncodedScriptChunk,
+  encodeAssetId,
+  encodeScriptNum
+} from '../mandala-encoding.js'
 
 describe('MandalaToken lock/decode', () => {
   const assetId = `${'a'.repeat(64)}.0`
@@ -70,8 +75,27 @@ describe('MandalaToken lock/decode', () => {
 
   it.each([0, 1.5])('rejects invalid token amount %s', amount => {
     expect(() => new MandalaToken().lock(assetId, amount, pubKeyHash)).toThrow(
-      'amount must be a positive integer'
+      'amount must be a positive safe integer'
     )
+  })
+
+  it('rejects amounts outside JavaScript exact-integer range on lock and decode', () => {
+    const unsafeAmount = Number.MAX_SAFE_INTEGER + 1
+    expect(() => new MandalaToken().lock(assetId, unsafeAmount, pubKeyHash)).toThrow(
+      'positive safe integer'
+    )
+
+    const script = new LockingScript([
+      createMinimallyEncodedScriptChunk(encodeAssetId(assetId)),
+      createMinimallyEncodedScriptChunk(encodeScriptNum(unsafeAmount)),
+      { op: OP.OP_2DROP },
+      { op: OP.OP_DUP },
+      { op: OP.OP_HASH160 },
+      { op: pubKeyHash.length, data: pubKeyHash },
+      { op: OP.OP_EQUALVERIFY },
+      { op: OP.OP_CHECKSIG }
+    ])
+    expect(() => MandalaToken.decode(script)).toThrow('bad amount')
   })
 
   it('rejects a malformed P2PKH tail during decode', () => {

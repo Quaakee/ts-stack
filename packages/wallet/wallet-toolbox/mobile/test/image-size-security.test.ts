@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -7,11 +8,16 @@ const requireFromMobile = createRequire(path.join(process.cwd(), 'mobile/package
 const metroManifest = requireFromMobile.resolve('metro/package.json')
 const requireFromMetro = createRequire(metroManifest)
 const imageSizeEntry = requireFromMetro.resolve('image-size')
-const imageSizeManifest = requireFromMetro.resolve('image-size/package.json')
-const imageSizeUtils = path.join(path.dirname(imageSizeManifest), 'dist/types/utils.js')
+const imageSizeManifest = path.resolve(path.dirname(imageSizeEntry), '../../package.json')
+const imageSizeUtils = requireFromMetro.resolve('image-size/types/utils')
 
-describe('patched image-size parser', () => {
-  it('rejects zero-sized boxes and non-progressing ICNS entries', () => {
+describe('Metro image-size security boundary', () => {
+  it('uses the maintained release beyond both parser advisories', () => {
+    const manifest = JSON.parse(readFileSync(imageSizeManifest, 'utf8')) as { version: string }
+    expect(manifest.version).toBe('2.0.4')
+  })
+
+  it('terminates on zero-sized boxes and non-progressing ICNS entries', () => {
     const source = `
       const { imageSize } = require(${JSON.stringify(imageSizeEntry)})
       const { findBox } = require(${JSON.stringify(imageSizeUtils)})
@@ -25,10 +31,12 @@ describe('patched image-size parser', () => {
       input.writeUInt32BE(0, 12)
       try {
         imageSize(input)
-        process.exit(2)
       } catch (error) {
-        if (!String(error).includes('Invalid ICNS image entry length')) process.exit(3)
+        // A malformed record may be rejected by the detector or the ICNS
+        // parser; termination without accepting dimensions is the contract.
+        process.exit(0)
       }
+      process.exit(2)
     `
     const result = spawnSync(process.execPath, ['-e', source], {
       encoding: 'utf8',

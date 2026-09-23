@@ -1,6 +1,6 @@
 {
   "name": "@bsv/sdk",
-  "version": "2.6.1",
+  "version": "2.8.2",
   "sideEffects": false,
   "engines": {
     "node": ">=22"
@@ -581,6 +581,36 @@
       "require": {
         "types": "./dist/cjs/src/auth/certificates/*.d.ts",
         "default": "./dist/cjs/src/auth/certificates/*.js"
+      }
+    },
+    "./identity": {
+      "import": {
+        "types": "./dist/types/src/identity/index.d.ts",
+        "default": "./dist/esm/src/identity/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/src/identity/index.d.ts",
+        "default": "./dist/cjs/src/identity/index.js"
+      }
+    },
+    "./identity/*.ts": {
+      "import": {
+        "types": "./dist/types/src/identity/*.d.ts",
+        "default": "./dist/esm/src/identity/*.js"
+      },
+      "require": {
+        "types": "./dist/cjs/src/identity/*.d.ts",
+        "default": "./dist/cjs/src/identity/*.js"
+      }
+    },
+    "./identity/*": {
+      "import": {
+        "types": "./dist/types/src/identity/*.d.ts",
+        "default": "./dist/esm/src/identity/*.js"
+      },
+      "require": {
+        "types": "./dist/cjs/src/identity/*.d.ts",
+        "default": "./dist/cjs/src/identity/*.js"
       }
     },
     "./overlay-tools": {

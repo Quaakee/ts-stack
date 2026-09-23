@@ -1,27 +1,23 @@
 import { AdmittanceInstructions, TopicManager } from '@bsv/overlay'
-import { PushDrop, Transaction, Utils } from '@bsv/sdk'
+import { decodeCanonicalDIDToken, Transaction } from '@bsv/sdk'
 
 export default class DIDTopicManager implements TopicManager {
-  async identifyAdmissibleOutputs (beef: number[], previousCoins: number[]): Promise<AdmittanceInstructions> {
+  async identifyAdmissibleOutputs(
+    beef: number[],
+    previousCoins: number[]
+  ): Promise<AdmittanceInstructions> {
     const outputsToAdmit: number[] = []
     try {
       const parsedTransaction = Transaction.fromBEEF(beef)
 
-      if (!Array.isArray(parsedTransaction.inputs) || parsedTransaction.inputs.length < 1) throw new Error('Missing parameter: inputs')
-      if (!Array.isArray(parsedTransaction.outputs) || parsedTransaction.outputs.length < 1) throw new Error('Missing parameter: outputs')
+      if (!Array.isArray(parsedTransaction.inputs) || parsedTransaction.inputs.length < 1)
+        throw new Error('Missing parameter: inputs')
+      if (!Array.isArray(parsedTransaction.outputs) || parsedTransaction.outputs.length < 1)
+        throw new Error('Missing parameter: outputs')
 
       for (const [i, output] of parsedTransaction.outputs.entries()) {
         try {
-          const result = PushDrop.decode(output.lockingScript)
-
-          if (result.fields.length !== 2) {
-            throw new Error('DID token must have exactly one field + signature')
-          }
-
-          const serialNumber = Utils.toUTF8(result.fields[0])
-          if (serialNumber === undefined || serialNumber === null) {
-            throw new Error('DID token must contain a valid serialNumber')
-          }
+          decodeCanonicalDIDToken(output.lockingScript)
 
           outputsToAdmit.push(i)
         } catch (error) {
@@ -34,7 +30,10 @@ export default class DIDTopicManager implements TopicManager {
 
       return { outputsToAdmit, coinsToRetain: [] }
     } catch (error) {
-      if (outputsToAdmit.length === 0 && (previousCoins === undefined || previousCoins.length === 0)) {
+      if (
+        outputsToAdmit.length === 0 &&
+        (previousCoins === undefined || previousCoins.length === 0)
+      ) {
         console.error('Error identifying admissible outputs:', error)
       }
     }
@@ -42,11 +41,11 @@ export default class DIDTopicManager implements TopicManager {
     return { outputsToAdmit, coinsToRetain: [] }
   }
 
-  async getDocumentation (): Promise<string> {
-    return 'DID Topic Manager: register decentralized identifiers for on-chain resolution.'
+  async getDocumentation(): Promise<string> {
+    return 'DID Topic Manager: indexes canonical legacy DID tokens. The v1 wire format omits issuer and subject, so issuer/subject authority must be established separately.'
   }
 
-  async getMetaData (): Promise<{
+  async getMetaData(): Promise<{
     name: string
     shortDescription: string
     iconURL?: string

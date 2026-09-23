@@ -140,6 +140,12 @@ function makeWallet(input: Record<string, unknown>): ProtoWallet {
   return new ProtoWallet(PrivateKey.fromHex(rootHex))
 }
 
+function withVectorData(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...args }
+  if (Object.prototype.hasOwnProperty.call(args, 'data')) normalized.data = toDataArray(args.data)
+  return normalized
+}
+
 // ─── REAL WALLET HARNESS ──────────────────────────────────────────────────────
 //
 // Constructs a fresh Wallet backed by a pure-TypeScript in-memory storage stub.
@@ -367,7 +373,7 @@ async function dispatchCreateHmac(
 ): Promise<void> {
   const wallet = makeWallet(input)
   const args = (input.args as Record<string, unknown>) ?? {}
-  const argsWithData = { ...args, data: toDataArray(args.data) }
+  const argsWithData = withVectorData(args)
 
   if ('error' in expected) {
     await expect(wallet.createHmac(argsWithData as any)).rejects.toThrow()
@@ -387,7 +393,7 @@ async function dispatchVerifyHmac(
 ): Promise<void> {
   const wallet = makeWallet(input)
   const args = (input.args as Record<string, unknown>) ?? {}
-  const argsWithData = { ...args, data: toDataArray(args.data) }
+  const argsWithData = withVectorData(args)
 
   if ('error' in expected) {
     await expect(wallet.verifyHmac(argsWithData as any)).rejects.toThrow()
@@ -410,7 +416,7 @@ async function dispatchCreateSignature(
 ): Promise<void> {
   const wallet = makeWallet(input)
   const args = (input.args as Record<string, unknown>) ?? {}
-  const argsWithData = { ...args, data: toDataArray(args.data) }
+  const argsWithData = withVectorData(args)
 
   if ('error' in expected) {
     await expect(wallet.createSignature(argsWithData as any)).rejects.toThrow()
@@ -430,7 +436,7 @@ async function dispatchVerifySignature(
 ): Promise<void> {
   const wallet = makeWallet(input)
   const args = (input.args as Record<string, unknown>) ?? {}
-  const argsWithData = { ...args, data: toDataArray(args.data) }
+  const argsWithData = withVectorData(args)
 
   if ('error' in expected) {
     await expect(wallet.verifySignature(argsWithData as any)).rejects.toThrow()
@@ -531,6 +537,7 @@ async function dispatchRevealSpecificKeyLinkage(
   expect(result).toHaveProperty('encryptedLinkageProof')
 
   if ('prover' in expected) expect(result.prover).toBe(expected.prover)
+  if ('verifier' in expected) expect(result.verifier).toBe(expected.verifier)
   if ('counterparty' in expected) expect(result.counterparty).toBe(expected.counterparty)
   if (Array.isArray(expected.protocolID)) expect(result.protocolID).toEqual(expected.protocolID)
   if ('keyID' in expected) expect(result.keyID).toBe(expected.keyID)

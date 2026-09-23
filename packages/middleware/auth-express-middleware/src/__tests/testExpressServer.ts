@@ -129,6 +129,12 @@ export const startServer = (_port = 3000): Server => {
   // Add the mutual authentication middleware
   app.use(authMiddleware)
 
+  for (const status of [204, 401, 403, 404]) {
+    app.get(`/empty-${status}`, (_req: Request, res: Response) => {
+      res.status(status).end()
+    })
+  }
+
   app.get('/', (req: Request, res: Response) => {
     res.send('Hello, world!')
   })

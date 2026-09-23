@@ -4,7 +4,7 @@ title: '@bsv/teranode-listener'
 kind: package
 domain: network
 npm: '@bsv/teranode-listener'
-version: '1.1.5'
+version: '1.1.6'
 last_updated: '2026-08-26'
 last_verified: '2026-08-26'
 review_cadence_days: 30
@@ -15,7 +15,7 @@ tags: ['network', 'broadcast', 'teranode', 'p2p', 'libp2p']
 
 # @bsv/teranode-listener
 
-> TypeScript library for subscribing to Teranode P2P topics (blocks, subtrees, mining updates) via libp2p private DHT network.
+> TypeScript library for subscribing to Teranode P2P topics (blocks, subtrees, mining updates) via libp2p DHT and gossipsub.
 
 ## Install
 
@@ -49,7 +49,7 @@ console.log('Listener started, waiting for messages...')
 
 - **TeranodeListener** — Class-based API for subscribing to P2P topics with callbacks
 - **startSubscriber** — Legacy function-based API for backward compatibility
-- **Private DHT network** — Uses pre-shared key (PSK) for secure peer-to-peer communication
+- **PNET-compatible DHT** — Uses the public mainnet PNET value or a custom deployment's 32-byte PSK
 - **Gossipsub** — Efficient pub/sub messaging for blockchain events
 - **Bootstrap peer discovery** — Connects to known peers and discovers more dynamically
 - **Static peer support** — Explicitly configured peers maintained across restarts
@@ -123,7 +123,7 @@ await listener.stop()
 
 ## Key concepts
 
-- **Private DHT network** — Uses pre-shared key (PSK) for closed, authenticated P2P network
+- **PNET-compatible DHT** — The published mainnet value provides compatibility, not closed membership or publisher authentication
 - **libp2p gossipsub** — Pub/sub messaging layer for efficient blockchain event distribution
 - **Topic-based subscriptions** — Subscribe to specific Teranode topics (e.g., `bitcoin/mainnet-block`)
 - **Bootstrap peers** — Known peers to connect to initially; discover more peers from there
@@ -163,18 +163,19 @@ await listener.stop()
 - **Gossipsub** — Standard pubsub protocol for message distribution
 - **DHT (Kademlia)** — Distributed peer discovery
 - **Noise protocol** — Modern encryption for libp2p connections
-- **PSK (Pre-Shared Key)** — Private network isolation via PNET
+- **PSK (Pre-Shared Key)** — Optional private-deployment isolation via PNET; the package's public mainnet default is not a credential
 
 ## Common pitfalls
 
 1. **Node.js 22+ required** — This is the supported runtime floor declared by the package
 2. **ES modules only** — Package is ESM; use `.mjs` files or set `"type": "module"` in package.json
 3. **Teranode mainnet defaults** — Without config, connects to official Teranode mainnet
-4. **PSK hex format** — `sharedKey` must be hex-encoded; library auto-formats to PSK
+4. **PSK hex format** — `sharedKey` must be exactly 64 hexadecimal characters; the library auto-formats it for PNET
 5. **Static peer connection** — If unreachable, may spam logs; consider retry logic
 6. **Message data format** — Teranode messages are raw `Uint8Array`; caller must deserialize (typically BSV transaction/block)
 7. **Blocking callbacks** — Slow callbacks queue messages; consider async processing
 8. **Network requirements** — Requires TCP connectivity on configured listen ports
+9. **Untrusted events** — The sender-name field is unverified and callback `from` identifies a propagation peer, possibly a relay. Typed decoding is bounded structural decoding, not publisher authentication or topic-schema proof. Independently verify every chain or financial claim before use.
 
 ## Related packages
 

@@ -71,15 +71,15 @@ The issued `vc.sdJwt` contains the issuer-signed JWT, all Disclosures, and a fin
 ```ts
 import { SdJwtVcHolder, SdJwtVcPresenter } from '@bsv/did'
 
-const presentation = await SdJwtVcHolder.generatePresentation(
-  vc,
-  ['given_name', 'is_over_21'],
-  {
-    holderPrivateKey,
-    audience: 'https://verifier.example',
-    nonce: 'verifier-nonce'
+const presentation = await SdJwtVcHolder.generatePresentation(vc, ['given_name', 'is_over_21'], {
+  holderPrivateKey,
+  audience: 'https://verifier.example',
+  nonce: 'verifier-nonce',
+  verificationOptions: {
+    expectedIssuer: issuer,
+    expectedVct: 'https://credentials.example.com/identity_credential'
   }
-)
+})
 
 const wirePayload = SdJwtVcPresenter.present(presentation)
 ```
@@ -92,6 +92,8 @@ When `holderPrivateKey` is supplied, the holder creates a KB-JWT with `sd_hash`,
 import { SdJwtVcVerifier } from '@bsv/did'
 
 const result = await SdJwtVcVerifier.verify(wirePayload, {
+  expectedIssuer: issuer,
+  expectedVct: 'https://credentials.example.com/identity_credential',
   expectedAudience: 'https://verifier.example',
   expectedNonce: 'verifier-nonce',
   requireKeyBinding: true
@@ -102,7 +104,21 @@ if (result.verified) {
 }
 ```
 
-If the issuer is a `did:key`, the verifier can derive the issuer public key from `iss`. Otherwise pass `issuerPublicKey`.
+If the issuer is a `did:key`, the verifier derives the signing key from `iss` and rejects a configured key that does not match it. Otherwise, pass an `issuerPublicKey` obtained from a local trust policy. A JWT's own `jwk`, `jku`, or certificate header is never an issuer trust anchor.
+
+`verified` means that the signed issuer identity, credential type, validity window, disclosures, and requested Key Binding policy all passed. A self-certifying `did:key` proves which key signed; it does not by itself authorize that issuer for an application. Set `expectedIssuer` and `expectedVct`, or apply an equivalent local allowlist, before granting access. If `aud` is present in the credential itself, set `expectedCredentialAudience`.
+
+For replay-safe authorization, Key Binding requires both the verifier's exact audience and a transaction-specific nonce. The high-level verifier enforces both whenever Key Binding is required; the low-level helpers continue to accept legacy KB-JWTs with omitted `aud` or `nonce`, but those unbound tokens must not be used to authorize a transaction. KB-JWTs are rejected when their `iat` is in the future or older than five minutes by default; `clockToleranceSeconds`, `maxKeyBindingAgeSeconds`, and `now` allow bounded policy and deterministic tests. Supplying an expected audience or nonce automatically requires Key Binding.
+
+The verifier validates `iat`, `nbf`, and `exp`, but it does not retrieve or evaluate a credential status list or type-metadata document. A signed `status` claim remains application input: check it under the relevant credential policy before authorization.
+
+The Holder validates the issuer-signed credential and all supplied Disclosures before it selects claims or creates a KB-JWT. For non-`did:key` issuers, provide the trusted issuer key through `verificationOptions`. The Holder also proves that the supplied holder private key matches the signed `cnf.jwk`. Nested disclosure requests use full dotted paths such as `address.locality`; unknown or ambiguous paths fail rather than disclosing claims with the same short name elsewhere.
+
+## Input and ownership limits
+
+Compact JWT, JSON, disclosure count/size/depth, identifier, in-memory store, and QR inputs have fixed defensive limits. JSON must be strict UTF-8 without duplicate keys, accessors, sparse arrays, cycles, non-finite numbers, or unpaired Unicode surrogates. SD-JWT processing rejects duplicate digest placement, cleartext/disclosed-name collisions, reserved claim names, nested `_sd_alg`, malformed array placeholders, and disconnected Disclosures. RFC 9901 recursive object and array Disclosures are processed with their complete ancestor chain.
+
+Returned payloads, Disclosure arrays, stored credentials, keys, and JWK-derived objects are owned copies. `SdJwtVcHolder.store` is only a bounded process-local convenience store; adding a credential does not make its issuer trusted and it is not durable storage. QR colors are restricted to hexadecimal CSS colors so generated SVG cannot contain external paint-server URLs.
 
 ## Public API
 

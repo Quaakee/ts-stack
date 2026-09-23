@@ -15,7 +15,7 @@ async function main() {
   const services = new MockServices(chainDb)
   await services.initialize()
   let active = new StorageKnex({
-    chain: 'test',
+    chain: 'mock',
     knex: walletDb,
     commissionSatoshis: 0,
     commissionPubKeyHex: undefined,
@@ -31,7 +31,7 @@ async function main() {
   await manager.makeAvailable()
   await active.findOrInsertUser(identityKey)
   let monitor = new Monitor({
-    chain: 'test',
+    chain: 'mock',
     storage: manager,
     services,
     chaintracks: services.tracker,
@@ -45,7 +45,7 @@ async function main() {
   })
   monitor.addDefaultTasks()
   let wallet = new Wallet({
-    chain: 'test',
+    chain: 'mock',
     keyDeriver: new CachedKeyDeriver(root),
     storage: manager,
     services,

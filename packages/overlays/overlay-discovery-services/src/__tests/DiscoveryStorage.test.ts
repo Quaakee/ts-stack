@@ -149,6 +149,19 @@ describe('discovery storage initialization and retry behavior', () => {
     expect(collection.createIndex).toHaveBeenCalledTimes(1)
     expect(collection.createIndex).toHaveBeenCalledWith({ domain: 1, topic: 1 })
   })
+
+  it('returns zero rows for limit zero and rejects invalid pagination before database work', async () => {
+    const { db, collection } = createMockDb()
+    const storage = new SHIPStorage(db)
+
+    await expect(storage.findAll(0)).resolves.toEqual([])
+    await expect(storage.findAll(Number.NaN)).rejects.toThrow('query.limit')
+    await expect(storage.findAll(1001)).rejects.toThrow('query.limit')
+    await expect(storage.findRecord({ limit: 1.5 })).rejects.toThrow('query.limit')
+
+    expect(collection.indexes).not.toHaveBeenCalled()
+    expect(collection.createIndex).not.toHaveBeenCalled()
+  })
 })
 
 describe('discovery storage MongoDB invariants', () => {
@@ -273,5 +286,25 @@ describe('discovery storage MongoDB invariants', () => {
       }),
       expect.objectContaining({ key: { domain: 1, service: 1 } })
     ]))
+  })
+
+  it('caps omitted SHIP and SLAP lookup limits at 1000 rows', async () => {
+    await db.collection('shipRecords').insertMany(Array.from({ length: 1005 }, (_, index) => ({
+      ...shipFilter,
+      topic: `tm_topic_${index}`,
+      txid: `ship-${index}`,
+      outputIndex: index,
+      createdAt: new Date(2026, 0, 1, 0, 0, 0, index)
+    })))
+    await db.collection('slapRecords').insertMany(Array.from({ length: 1005 }, (_, index) => ({
+      ...slapFilter,
+      service: `ls_service_${index}`,
+      txid: `slap-${index}`,
+      outputIndex: index,
+      createdAt: new Date(2026, 0, 1, 0, 0, 0, index)
+    })))
+
+    await expect(new SHIPStorage(db).findAll()).resolves.toHaveLength(1000)
+    await expect(new SLAPStorage(db).findAll()).resolves.toHaveLength(1000)
   })
 })

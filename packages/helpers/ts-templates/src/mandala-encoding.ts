@@ -1,4 +1,4 @@
-import { Utils } from '@bsv/sdk'
+import { toArray, toHex } from '@bsv/sdk/primitives/utils'
 
 export const createMinimallyEncodedScriptChunk = (
   data: number[]
@@ -66,7 +66,7 @@ export const encodeAssetId = (assetId: string): number[] => {
   // order — i.e. the display hex reversed (tx.hash() vs tx.id('hex')) — followed by
   // the 4-byte little-endian vout. This lets a contract compare the embedded assetId
   // directly against the genesis transaction's outpoint as it appears in the tx.
-  const txidBytes = Utils.toArray(txid, 'hex').reverse()
+  const txidBytes = toArray(txid, 'hex').reverse()
   const voutBytes = [vout & 0xff, (vout >> 8) & 0xff, (vout >> 16) & 0xff, (vout >> 24) & 0xff]
   return [...txidBytes, ...voutBytes]
 }
@@ -74,7 +74,7 @@ export const encodeAssetId = (assetId: string): number[] => {
 export const decodeAssetId = (bytes: number[]): string => {
   if (bytes.length !== 36) throw new Error('assetId bytes must be exactly 36 bytes')
   // Reverse the internal (hash) byte order back to display txid hex.
-  const txid = Utils.toHex(bytes.slice(0, 32).reverse())
+  const txid = toHex(bytes.slice(0, 32).reverse())
   const v = bytes.slice(32)
   const vout = (v[0] + (v[1] << 8) + (v[2] << 16) + (v[3] << 24)) >>> 0
   return `${txid}.${vout}`

@@ -28,7 +28,7 @@ import { WalletAdvertiser } from '@bsv/overlay-discovery-services'
 
 const advertiser = new WalletAdvertiser(
   'main', // chain
-  privateKeyHex, // signing key
+  privateKeyHex, // dedicated root signing key; keep secret
   'https://my-storage.example.com', // wallet storage URL
   'https://my-overlay.example.com' // advertisable URI clients should connect to
 )
@@ -40,8 +40,8 @@ await advertiser.createAdvertisements([
   { protocol: 'SLAP', topicOrServiceName: 'ls_did' }
 ])
 
-// Discover everyone else hosting tm_did.
-const peers = await advertiser.findAllAdvertisements('SHIP')
+// Recover this identity's current advertisements for reconciliation/revocation.
+const mine = await advertiser.findAllAdvertisements('SHIP')
 ```
 
 For TerraTestNet, pass `ttn` as the chain and a TTN wallet-storage URL. Unless
@@ -85,9 +85,15 @@ Host a topic (e.g. `tm_did`) and publish a SHIP advertisement so other nodes rou
 ### Find peers for a given topic
 
 ```ts
-const hosts = await advertiser.findAllAdvertisements('SHIP')
-const didHosts = hosts.filter(a => a.topicOrService === 'tm_did')
+const hosts = await engine.lookup({
+  service: 'ls_ship',
+  query: { topics: ['tm_did'], limit: 100 }
+})
 ```
+
+`WalletAdvertiser.findAllAdvertisements()` intentionally returns only
+cryptographically authenticated advertisements owned by that advertiser's
+identity. Use the SHIP/SLAP lookup services to discover other identities.
 
 ### Take a service offline
 
@@ -111,7 +117,25 @@ await advertiser.revokeAdvertisements(mine.filter(a => a.topicOrService === 'ls_
 
 The package publishes matching ESM and CommonJS entry points with
 condition-specific TypeScript declarations. Advertisement names, signatures,
-and URIs are validated before admission.
+URIs, canonical PushDrop envelopes, and identity-to-locking-key linkage are
+validated before admission. Lookup query objects must contain only documented
+plain-data fields. Results default to at most 1,000 records; `limit` accepts
+integers from 0 through 1,000, `skip` is bounded, and `limit: 0` returns an
+empty page. Paginate deliberately rather than relying on an unbounded
+`findAll` response.
+
+`WalletAdvertiser` retains its constructor `privateKey` as a public instance
+property solely for backward compatibility. That value is the root wallet
+secret. Use a dedicated key, keep the instance inside one trusted process, and
+never log, serialize, return, inspect, or pass it to plugins or untrusted code.
+The create and revoke paths bind requested inputs/outputs and the wallet's final
+signed transaction; revoke additionally authenticates each one-satoshi token,
+its owner, metadata, and exact outpoint before asking the wallet to sign.
+
+`parseAdvertisement()` validates canonical structure only because the public
+interface is synchronous. It does not establish signature authenticity. Prefer
+the topic-manager admission decision or `WalletAdvertiser`'s verified find and
+revoke methods for security decisions.
 
 Discovery advertisements contain public connection endpoints. Treat discovered
 hosts as untrusted network input: retain TLS validation, apply request timeouts,

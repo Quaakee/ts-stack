@@ -3,8 +3,8 @@ id: architecture-identity
 title: Identity & Mutual Authentication
 kind: meta
 version: 'n/a'
-last_updated: '2026-04-29'
-last_verified: '2026-08-26'
+last_updated: '2026-09-18'
+last_verified: '2026-09-18'
 review_cadence_days: 30
 status: stable
 tags: ['architecture', 'identity', 'auth', 'BRC-31', 'BRC-103', 'BRC-104']
@@ -25,7 +25,11 @@ BRC-103 defines the core mutual-auth primitive: a **`Peer`** abstraction.
 
 `@bsv/authsocket` implements BRC-103 over WebSocket.
 `@bsv/auth-express-middleware` wraps BRC-103/104 for Express HTTP servers.
-`@bsv/message-box-client` uses BRC-103 to authenticate against MessageBox servers.
+`@bsv/message-box-client` uses BRC-103 to authenticate against MessageBox
+servers. It requires the response to remain mutually authenticated, retains one
+server identity per URL origin for the client lifetime, and supports an
+independently validated identity pin. AuthFetch's unauthenticated compatibility
+fallback is not accepted as Message Box authority.
 
 ## BRC-104 — Message-Layer Transport
 
@@ -66,6 +70,14 @@ An identity key is a long-lived BRC-42-derived public key representing a user, s
 
 All BRC-103/104 and BRC-31 handshakes use identity keys for signing. Applications retrieve their identity key via `wallet.getPublicKey({ identityKey: true })`.
 
+For the BRC-104 v0.1 HTTP binding, that identity authenticates the encoded
+method, path, query, declared signed-header subset, and body—not the transport
+authority or every HTTP header. `Host`, cookies, forwarding metadata, and most
+standard headers remain outside the signature. A trusted edge must pin the
+authority, and application authorization must use exact signed fields rather
+than omitted metadata. Virtual authorities representing different security
+principals should use distinct server identity keys.
+
 ## AuthSocket — Persistent Authenticated Channels
 
 `@bsv/authsocket` and `@bsv/authsocket-client` implement BRC-103/104 over WebSocket:
@@ -104,6 +116,12 @@ BRC-100's certificate methods (`acquireCertificate`, `proveCertificate`, `listCe
 - **Revocation** — Supported via revocation overlay services
 
 `@bsv/simple` exposes `Certifier`, `CredentialSchema`, and `CredentialIssuer` for W3C Verifiable Credential workflows built on top of BRC certificate primitives.
+Its credential verifier authenticates the embedded BSV certificate and binds
+the surrounding issuer, subject, type, fields, proof, and revocation reference.
+The W3C wrapper's timestamps are not signed claims. The current Simple
+presentation helper creates an unsigned envelope and must not be treated as
+holder authentication; replay-safe presentations require a holder signature
+bound to a verifier challenge and audience.
 
 ## Related
 

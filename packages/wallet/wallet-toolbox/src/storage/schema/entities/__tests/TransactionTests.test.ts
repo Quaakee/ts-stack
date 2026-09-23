@@ -152,7 +152,7 @@ describe('Transaction class method tests', () => {
 
   // Test: `getBsvTx` returns parsed transaction
   test('3_getBsvTx_returns_parsed_transaction', () => {
-    const rawTx = Uint8Array.from([1, 2, 3])
+    const rawTx = new bsv.Transaction().toBinary()
     const tx = new EntityTransaction({
       rawTx: Array.from(rawTx)
     } as TableTransaction)
@@ -170,7 +170,7 @@ describe('Transaction class method tests', () => {
 
   // Test: `getBsvTxIns` returns parsed inputs
   test('5_getBsvTxIns_returns_inputs', () => {
-    const rawTx = Uint8Array.from([1, 2, 3])
+    const rawTx = new bsv.Transaction().toBinary()
     const tx = new EntityTransaction({
       rawTx: Array.from(rawTx)
     } as TableTransaction)
@@ -187,7 +187,7 @@ describe('Transaction class method tests', () => {
       const tx = new EntityTransaction(txData.tx)
 
       // Assign rawTx to simulate transaction inputs
-      const rawTx = Uint8Array.from([1, 2, 3])
+      const rawTx = new bsv.Transaction().toBinary()
       tx.rawTx = Array.from(rawTx)
 
       // Insert test outputs with spentBy linked to the transaction

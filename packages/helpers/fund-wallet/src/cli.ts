@@ -185,6 +185,9 @@ export async function fundWallet(
     description: 'Incoming wallet funding payment from local wallet'
   }
   const result = await wallet.internalizeAction(directTransaction)
+  if (result.accepted !== true) {
+    throw new Error('The destination wallet did not accept the funding transaction')
+  }
   io.log(chalk.green(`🎉 Wallet funded! ${JSON.stringify(result)}`))
   io.log(chalk.blue(`🔗 View on WhatsOnChain: https://whatsonchain.com/tx/${transaction.txid}`))
 }

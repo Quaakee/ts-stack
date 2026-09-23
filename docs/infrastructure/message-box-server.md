@@ -2,9 +2,9 @@
 id: infra-message-box-server
 title: 'Message-box Server'
 kind: infra
-version: '1.1.39'
-last_updated: '2026-08-24'
-last_verified: '2026-08-25'
+version: '1.1.43'
+last_updated: '2026-09-21'
+last_verified: '2026-09-21'
 review_cadence_days: 30
 status: stable
 tags: [messaging, overlay, store-and-forward, authentication]
@@ -156,7 +156,28 @@ Migrations tracked in `src/migrations/`:
 - `2025-01-31-002-device-registrations.ts` – Device registration tracking
 - `2026-07-26-001-message-permission-scope.ts` – Enforce one box-wide or sender-specific permission per scope
 - `2026-07-26-002-list-query-indexes.ts` – Add indexes for bounded inbox and sender-list queries
-- `2026-08-04-001-resource-safety.ts` – Add retained-state accounting and resource-safety fields
+- `2026-08-04-001-resource-safety.ts` – Add retained-state accounting, resource-safety fields, and durable payment replay claims
+- `2026-09-21-001-message-payment-intents.ts` – Bind paid sends to exact requests and preserve cross-boundary recovery state
+
+Preserve both `payment_replays` and `message_payment_intents` across rollouts.
+For body payments, the replay claim is non-expiring. An intent advances from
+`prepared` to `wallet_accepted` to `completed`; an ambiguous `prepared` intent
+after process termination requires reconciliation against the wallet before
+retrying. Do not delete or reassign an intent to force a retry. The down
+migration refuses to drop a populated intent table, and an older image cannot
+safely interpret this recovery protocol. Prefer roll-forward; if rollback is
+unavoidable, drain all replicas, reconcile every intent, and restore the prior
+image together with a verified pre-migration database backup. See the
+[deployment guide](https://github.com/bsv-blockchain/ts-stack/blob/main/infra/message-box-server/DEPLOYING.md#database-migrations)
+for the full recovery and rollback procedure.
+
+Periodic snapshots provide the general message/permission RPO, but paid sends
+require zero silent loss of replay and intent evidence. Retain continuous
+point-in-time/binlog history and independent wallet transaction/audit evidence
+from each snapshot through the present. After a restore, keep paid sends
+disabled until every post-snapshot wallet action, replay claim, and intent has
+been reconstructed and reconciled; an unresolved interval must not be retried
+or converted into a second payment request.
 
 ## Health checks
 
@@ -178,7 +199,7 @@ Migrations tracked in `src/migrations/`:
 - Clients connect via `@bsv/message-box-client`
 - Uses Wallet Storage for key derivation from SERVER_PRIVATE_KEY
 - Advertises MessageBox capabilities to overlay nodes via SHIP protocol using HOSTING_DOMAIN
-- Optionally enforces BRC-100 payment verification on message send via `@bsv/payment-express-middleware`
+- Enforces configured BRC-100/BRC-105 payment policy and atomically binds each accepted body payment to the exact message request through durable replay claims and payment intents
 
 ## Common pitfalls
 
@@ -188,6 +209,8 @@ Migrations tracked in `src/migrations/`:
 - Private key generation: Must be 256-bit hex; asymmetric key used for mutual auth signing
 - Migration failures prevent the process from accepting traffic; deployments
   should still gate traffic on `/ready`.
+- Image-only rollback after the payment-intent migration is unsafe; follow the
+  documented database recovery procedure instead.
 
 ## Source
 

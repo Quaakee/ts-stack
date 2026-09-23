@@ -1,6 +1,6 @@
 {
   "name": "@bsv/402-pay",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "sideEffects": false,
   "engines": {
     "node": ">=22"
@@ -66,7 +66,7 @@
     "build": "tsdown src/index.ts src/server.ts src/client.ts --format cjs,esm --dts --sourcemap --clean --out-dir dist --tsconfig tsconfig.build.json",
     "format:check": "pnpm --workspace-root exec prettier --check \"packages/middleware/402-pay/src/**/*.ts\" \"packages/middleware/402-pay/*.{json,ts}\"",
     "lint": "oxlint src vitest.config.ts --deny-warnings",
-    "pack:check": "node ../../../scripts/check-package-artifact.mjs . --exports HEADERS,HEADER_PREFIX,BRC29_PROTOCOL_ID,DEFAULT_PAYMENT_WINDOW_MS,createPaymentMiddleware,validatePayment,send402,create402Fetch,constructPaymentHeaders --entry-exports \"./server=createPaymentMiddleware|validatePayment|send402;./client=create402Fetch|constructPaymentHeaders\"",
+    "pack:check": "node ../../../scripts/check-package-artifact.mjs . --exports HEADERS,HEADER_PREFIX,BRC29_PROTOCOL_ID,DEFAULT_PAYMENT_WINDOW_MS,InMemoryPaymentReplayStore,createPaymentMiddleware,validatePayment,send402,create402Fetch,constructPaymentHeaders --entry-exports \"./server=InMemoryPaymentReplayStore|createPaymentMiddleware|validatePayment|send402;./client=create402Fetch|constructPaymentHeaders\"",
     "test": "vitest run",
     "test:browser": "pnpm build && node ../../../scripts/check-browser-package.mjs .",
     "test:property": "vitest run src/server.property.test.ts",

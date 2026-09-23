@@ -1,16 +1,6 @@
-import {
-  HexString,
-  PubKeyHex,
-  WalletNetwork,
-  Beef,
-  Hash,
-  PrivateKey,
-  PublicKey,
-  Random,
-  Script,
-  Transaction,
-  Utils
-} from '@bsv/sdk'
+import { HexString, PubKeyHex, WalletNetwork, Beef, PrivateKey, PublicKey, Random, Script, Transaction } from '@bsv/sdk'
+import { SHA256 } from '@bsv/sdk/primitives/Hash'
+import { toBase64, toHex } from '@bsv/sdk/primitives/utils'
 import { Chain } from '../sdk/types'
 import { asArray } from './utilityHelpers.noBuffer'
 import { CertOpsWallet } from '../sdk/CertOpsWallet'
@@ -53,7 +43,7 @@ export function toLookupNetworkPreset(chain: Chain): 'mainnet' | 'testnet' | 'te
 }
 
 export function makeAtomicBeef(tx: Transaction, beef: number[] | Beef): number[] {
-  if (Array.isArray(beef)) beef = Beef.fromBinary(beef)
+  if (Array.isArray(beef)) beef = Beef.fromBinaryStrict(beef)
   beef.mergeTransaction(tx)
   return beef.toBinaryAtomic(tx.id('hex'))
 }
@@ -220,14 +210,14 @@ export function randomBytes(count: number): number[] {
  * @returns count cryptographically secure random bytes as hex encoded string
  */
 export function randomBytesHex(count: number): string {
-  return Utils.toHex(Random(count))
+  return toHex(Random(count))
 }
 
 /**
  * @returns count cryptographically secure random bytes as base64 encoded string
  */
 export function randomBytesBase64(count: number): string {
-  return Utils.toBase64(Random(count))
+  return toBase64(Random(count))
 }
 
 export function validateSecondsSinceEpoch(time: number): Date {
@@ -277,7 +267,7 @@ export function sha256Hash(data: number[] | Uint8Array): number[] {
   if (!Array.isArray(data)) {
     data = asArray(data)
   }
-  const first = new Hash.SHA256().update(data).digest()
+  const first = new SHA256().update(data).digest()
   return first
 }
 
@@ -291,8 +281,8 @@ export function doubleSha256LE(data: number[] | Uint8Array): number[] {
   if (!Array.isArray(data)) {
     data = asArray(data)
   }
-  const first = new Hash.SHA256().update(data).digest()
-  const second = new Hash.SHA256().update(first).digest()
+  const first = new SHA256().update(data).digest()
+  const second = new SHA256().update(first).digest()
   return second
 }
 

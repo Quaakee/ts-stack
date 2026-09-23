@@ -1,18 +1,16 @@
-import {
-  ScriptTemplate,
-  ScriptTemplateUnlock,
-  LockingScript,
-  UnlockingScript,
-  OP,
-  Utils,
-  WalletInterface,
-  WalletProtocol,
+import { hash160, sha256 } from '@bsv/sdk/primitives/Hash'
+import type PrivateKey from '@bsv/sdk/primitives/PrivateKey'
+import { TransactionSignature } from '@bsv/sdk/primitives'
+import { toArray } from '@bsv/sdk/primitives/utils'
+import { LockingScript, OP, UnlockingScript } from '@bsv/sdk/script'
+import type ScriptTemplate from '@bsv/sdk/script/ScriptTemplate'
+import type ScriptTemplateUnlock from '@bsv/sdk/script/ScriptTemplateUnlock'
+import type Transaction from '@bsv/sdk/transaction/Transaction'
+import type {
   WalletCounterparty,
-  Transaction,
-  Hash,
-  TransactionSignature,
-  PrivateKey
-} from '@bsv/sdk'
+  WalletInterface,
+  WalletProtocol
+} from '@bsv/sdk/wallet/Wallet.interfaces'
 import {
   createMinimallyEncodedScriptChunk,
   encodeScriptNum,
@@ -55,14 +53,14 @@ export class MandalaToken implements ScriptTemplate {
       { protocolID, keyID, counterparty },
       this.originator
     )
-    const pubKeyHash = Hash.hash160(Utils.toArray(publicKey, 'hex'))
+    const pubKeyHash = hash160(toArray(publicKey, 'hex'))
     return this.lock(assetId, amount, pubKeyHash)
   }
 
   lock(assetId: string, amount: number, pubKeyHash: number[]): LockingScript {
     if (pubKeyHash.length !== 20) throw new Error('pubKeyHash must be 20 bytes')
-    if (!Number.isInteger(amount) || amount < 1)
-      throw new Error('amount must be a positive integer')
+    if (!Number.isSafeInteger(amount) || amount < 1)
+      throw new Error('amount must be a positive safe integer')
     const assetIdBytes = encodeAssetId(assetId)
     // assetId + amount are pushed then dropped by a single OP_2DROP; the tail is
     // a standard P2PKH. No identifier prefix — outputs are classified off-chain.
@@ -87,7 +85,7 @@ export class MandalaToken implements ScriptTemplate {
       sign: async (tx: Transaction, inputIndex: number): Promise<UnlockingScript> => {
         const { preimage, scope } = buildSighashPreimage(tx, inputIndex, signOutputs, anyoneCanPay)
 
-        const rawSignature = privateKey.sign(Hash.sha256(preimage))
+        const rawSignature = privateKey.sign(sha256(preimage))
         const sig = new TransactionSignature(rawSignature.r, rawSignature.s, scope)
         const sigForScript = sig.toChecksigFormat()
         const pubkeyForScript = privateKey.toPublicKey().encode(true) as number[]
@@ -114,7 +112,7 @@ export class MandalaToken implements ScriptTemplate {
     }
     const assetId = decodeAssetId(vt(c[0].data))
     const amount = decodeScriptNumChunk(c[1])
-    if (!Number.isInteger(amount) || amount < 1)
+    if (!Number.isSafeInteger(amount) || amount < 1)
       throw new Error('not a MandalaToken script: bad amount')
     const pubKeyHash = vt(c[5].data)
     if (pubKeyHash.length !== 20) throw new Error('not a MandalaToken script: bad pubKeyHash')

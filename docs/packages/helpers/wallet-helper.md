@@ -3,7 +3,7 @@ id: pkg-wallet-helper
 title: '@bsv/wallet-helper'
 kind: package
 domain: helpers
-version: '0.1.7'
+version: '0.1.8'
 source_repo: 'bsv-blockchain/ts-stack'
 last_updated: '2026-08-27'
 last_verified: '2026-08-27'

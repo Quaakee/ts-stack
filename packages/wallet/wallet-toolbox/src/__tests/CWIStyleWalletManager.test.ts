@@ -1,4 +1,15 @@
-import { WalletInterface, Random, Hash, Utils, PrivateKey, SymmetricKey, PushDrop, Transaction } from '@bsv/sdk'
+import {
+  WalletInterface,
+  Random,
+  Hash,
+  Utils,
+  PrivateKey,
+  SymmetricKey,
+  PushDrop,
+  Transaction,
+  ProtoWallet,
+  LockingScript
+} from '@bsv/sdk'
 import { PrivilegedKeyManager } from '../sdk'
 import {
   CWIStyleWalletManager,
@@ -996,61 +1007,56 @@ describe('CWIStyleWalletManager Tests', () => {
   })
 
   describe('OverlayUMPTokenInteractor signature-aware parsing', () => {
-    test('strips verified trailing signature before interpreting optional profiles', () => {
+    async function lookupTransaction(fields: number[][]): Promise<Transaction> {
+      const owner = new ProtoWallet(PrivateKey.fromRandom())
+      const lockingScript = await new PushDrop(owner).lock(
+        fields.map(field => [...field]),
+        [2, 'admin user management token'],
+        '1',
+        'self',
+        true,
+        true
+      )
+      return new Transaction(1, [], [{ satoshis: 1, lockingScript }], 0)
+    }
+
+    test('strips verified trailing signature before interpreting optional profiles', async () => {
       const interactor = new OverlayUMPTokenInteractor({} as any, {} as any)
       const payloadFields = Array.from({ length: 11 }, () => Random(32))
-      const signingKey = PrivateKey.fromRandom()
-      const validSignature = signingKey.sign(payloadFields.flat()).toDER()
-
-      const fromBeefSpy = jest.spyOn(Transaction, 'fromBEEF').mockReturnValue({
-        outputs: [{ lockingScript: {} as any }],
-        id: () => 'txid123'
-      } as any)
-      const decodeSpy = jest.spyOn(PushDrop, 'decode').mockReturnValue({
-        fields: [...payloadFields, validSignature],
-        lockingPublicKey: signingKey.toPublicKey()
-      } as any)
+      const transaction = await lookupTransaction(payloadFields)
 
       const parsed = (interactor as any).parseLookupAnswer({
         type: 'output-list',
-        outputs: [{ beef: [1, 2, 3], outputIndex: 0 }]
+        outputs: [{ beef: transaction.toBEEF(), outputIndex: 0 }]
       }) as UMPToken
 
       expect(parsed).toBeDefined()
       expect(parsed.passwordSalt).toEqual(payloadFields[0])
       expect(parsed.profilesEncrypted).toBeUndefined()
-
-      fromBeefSpy.mockRestore()
-      decodeSpy.mockRestore()
+      expect(parsed.currentOutpoint).toBe(`${transaction.id('hex')}.0`)
     })
 
-    test('does not strip DER-like trailing field when signature verification fails', () => {
+    test('rejects a canonical token when its trailing field signature is invalid', async () => {
       const interactor = new OverlayUMPTokenInteractor({} as any, {} as any)
       const payloadFields = Array.from({ length: 11 }, () => Random(32))
-      const derLikeButInvalidForPayload = [0x30, 0x06, 1, 2, 3, 4, 5, 6]
-
-      const fromBeefSpy = jest.spyOn(Transaction, 'fromBEEF').mockReturnValue({
-        outputs: [{ lockingScript: {} as any }],
-        id: () => 'txid124'
-      } as any)
-      const decodeSpy = jest.spyOn(PushDrop, 'decode').mockReturnValue({
-        fields: [...payloadFields, derLikeButInvalidForPayload],
-        lockingPublicKey: PrivateKey.fromRandom().toPublicKey()
-      } as any)
+      const transaction = await lookupTransaction(payloadFields)
+      const chunks = transaction.outputs[0].lockingScript.chunks.map(chunk => ({
+        op: chunk.op,
+        ...(chunk.data == null ? {} : { data: [...chunk.data] })
+      }))
+      const signature = chunks[2 + payloadFields.length].data!
+      signature[signature.length - 1] ^= 1
+      transaction.outputs[0].lockingScript = new LockingScript(chunks)
 
       const parsed = (interactor as any).parseLookupAnswer({
         type: 'output-list',
-        outputs: [{ beef: [4, 5, 6], outputIndex: 0 }]
+        outputs: [{ beef: transaction.toBEEF(), outputIndex: 0 }]
       }) as UMPToken
 
-      expect(parsed).toBeDefined()
-      expect(parsed.profilesEncrypted).toEqual(derLikeButInvalidForPayload)
-
-      fromBeefSpy.mockRestore()
-      decodeSpy.mockRestore()
+      expect(parsed).toBeUndefined()
     })
 
-    test('parses valid v3 KDF metadata from a lookup token', () => {
+    test('parses valid v3 KDF metadata from a field-signed lookup token', async () => {
       const interactor = new OverlayUMPTokenInteractor({} as any, {} as any)
       const payloadFields = Array.from({ length: 11 }, () => Random(32))
       const protocolFields = [
@@ -1067,17 +1073,11 @@ describe('CWIStyleWalletManager Tests', () => {
           'utf8'
         )
       ]
-      const fromBeefSpy = jest.spyOn(Transaction, 'fromBEEF').mockReturnValue({
-        outputs: [{ lockingScript: {} as any }],
-        id: () => 'txid125'
-      } as any)
-      const decodeSpy = jest.spyOn(PushDrop, 'decode').mockReturnValue({
-        fields: protocolFields
-      } as any)
+      const transaction = await lookupTransaction(protocolFields)
 
       const parsed = (interactor as any).parseLookupAnswer({
         type: 'output-list',
-        outputs: [{ beef: [7, 8, 9], outputIndex: 0 }]
+        outputs: [{ beef: transaction.toBEEF(), outputIndex: 0 }]
       }) as UMPToken
 
       expect(parsed).toMatchObject({
@@ -1089,11 +1089,8 @@ describe('CWIStyleWalletManager Tests', () => {
           parallelism: 1,
           hashLength: 32
         },
-        currentOutpoint: 'txid125.0'
+        currentOutpoint: `${transaction.id('hex')}.0`
       })
-
-      fromBeefSpy.mockRestore()
-      decodeSpy.mockRestore()
     })
   })
 })

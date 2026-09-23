@@ -19,9 +19,18 @@ export interface WalletDefaults {
   tokenKeyID: string
   messageBoxHost: string
   registryUrl?: string
+  /** Explicitly trusted registry transport for controlled local/private deployments. */
+  registryFetch?: typeof fetch
   didBasket: string
+  /**
+   * Authoritative HTTPS DID resolver. Its answer is schema- and DID-bound but
+   * is not accompanied by cryptographic chain/freshness evidence.
+   */
   didResolverUrl: string
+  /** Optional authoritative application proxy with the same trust boundary. */
   didProxyUrl?: string
+  /** Explicitly trusted DID transport override for controlled tests/local development. */
+  didFetch?: typeof fetch
   didProtocolID: [SecurityLevel, string]
 }
 
@@ -196,6 +205,11 @@ export interface MessageBoxConfig {
 
 export interface CertifierConfig {
   privateKey?: string
+  /**
+   * Canonical base64 certificate identifier. A bounded historical short value
+   * is retained as an offline-migration alias while new issuance uses its
+   * 32-byte SHA-256 digest.
+   */
   certificateType?: string
   defaultFields?: Record<string, string>
   includeTimestamp?: boolean
@@ -409,7 +423,14 @@ export interface CredentialSchemaConfig {
   id: string
   name: string
   description?: string
+  /**
+   * Canonical base64 certificate identifier. A bounded historical short value
+   * is retained as an offline-migration alias while new issuance uses its
+   * 32-byte SHA-256 digest.
+   */
   certificateTypeBase64?: string
+  /** Exact historical identifiers accepted when verifying offline persisted credentials. */
+  legacyCertificateTypesBase64?: string[]
   fields: CredentialFieldSchema[]
   fieldGroups?: Array<{ key: string; label: string }>
   validate?: (values: Record<string, string>) => string | null
@@ -513,16 +534,30 @@ export interface IdentityRegistryStore {
 }
 
 export interface IdentityRegistryConfig {
+  /**
+   * Persistence for the legacy unauthenticated directory. Possession of an
+   * identity key string does not prove control of its private key.
+   */
   store?: IdentityRegistryStore
+  /** Content validation only; this callback is not an authentication hook. */
   validateTag?: (tag: string, identityKey: string) => string | null
+  /** Maximum tags retained for one identity. Defaults to 32; maximum 256. */
   maxTagsPerIdentity?: number
+  /** Maximum entries loaded or retained by the registry. Defaults to 10,000. */
+  maxEntries?: number
+  /** Maximum matches returned by one lookup. Defaults to 100; maximum 1,000. */
+  maxLookupResults?: number
 }
 
 export interface DIDResolverConfig {
+  /** Authoritative universal resolver; see the DID resolver trust-boundary documentation. */
   resolverUrl?: string
+  /** Authoritative transaction/spend-index provider used for the fallback chain view. */
   wocBaseUrl?: string
   resolverTimeout?: number
   maxHops?: number
+  /** Explicitly trusted transport override for controlled tests/local development. */
+  fetch?: typeof fetch
 }
 
 export interface ServerWalletManagerConfig {
@@ -532,6 +567,17 @@ export interface ServerWalletManagerConfig {
   storageUrl?: string
   defaultRequestSatoshis?: number
   requestMemo?: string
+  /** Maximum decoded JSON request bytes. Defaults to 64 MiB; maximum 256 MiB. */
+  maxRequestBytes?: number
+  /**
+   * Mandatory authorization policy for every generated server-wallet route.
+   * Only a literal `true` authorizes access; omission defaults closed.
+   */
+  authorize?: (request: {
+    action: 'status' | 'reset' | 'create' | 'request' | 'balance' | 'outputs' | 'receive'
+    url: string
+    headers?: Headers
+  }) => boolean | Promise<boolean>
 }
 
 export interface CredentialIssuerHandlerConfig {
@@ -540,4 +586,20 @@ export interface CredentialIssuerHandlerConfig {
   keyFile?: string
   serverWalletManager?: any
   revocationStorePath?: string
+  /** Maximum decoded JSON request bytes. Defaults to 64 MiB; maximum 256 MiB. */
+  maxRequestBytes?: number
+  /**
+   * Mandatory authorization policy for certificate issuance and revocation.
+   * Only a literal `true` authorizes the requested state change. Public info,
+   * schema, status, and signature-verification queries do not invoke it.
+   */
+  authorize?: (request: {
+    action: 'certify' | 'issue' | 'revoke'
+    subjectIdentityKey?: string
+    schemaId?: string
+    fields?: Record<string, string>
+    serialNumber?: string
+    url: string
+    headers?: Headers
+  }) => boolean | Promise<boolean>
 }

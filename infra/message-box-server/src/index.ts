@@ -127,10 +127,9 @@ export async function startStandalone(): Promise<void> {
         'migrations applied'
       )
     } catch (error) {
-      span.recordException(error as Error)
       span.setStatus({
         code: SpanStatusCode.ERROR,
-        message: error instanceof Error ? error.message : 'Migration failed'
+        message: 'Migration failed'
       })
       throw error
     } finally {
@@ -169,10 +168,10 @@ export function shutdownStandalone(signal: NodeJS.Signals): Promise<void> {
       { operation: 'server.shutdown', outcome: 'ok', signal },
       'MessageBox shutdown complete'
     )
-  })().catch(error => {
+  })().catch(() => {
     process.exitCode = 1
     log.error(
-      { operation: 'server.shutdown', outcome: 'error', signal, err: error },
+      { operation: 'server.shutdown', outcome: 'error', signal },
       'MessageBox shutdown failed'
     )
   })
@@ -187,13 +186,13 @@ if (NODE_ENV !== 'test') {
     await startStandalone()
     process.once('SIGTERM', () => void shutdownStandalone('SIGTERM'))
     process.once('SIGINT', () => void shutdownStandalone('SIGINT'))
-  } catch (error) {
-    log.error({ operation: 'server.init', outcome: 'error', err: error }, '[SERVER INIT ERROR]')
+  } catch {
+    log.error({ operation: 'server.init', outcome: 'error' }, '[SERVER INIT ERROR]')
     try {
       await knex.destroy()
-    } catch (shutdownError) {
+    } catch {
       log.error(
-        { operation: 'server.shutdown', outcome: 'error', err: shutdownError },
+        { operation: 'server.shutdown', outcome: 'error' },
         'Failed to close the database pool after initialization failure'
       )
     }
@@ -212,3 +211,4 @@ export {
 } from './compose.js'
 export type { MessageBoxContext, CreateMessageBoxContextOptions } from './context.js'
 export type { MessageBoxRouter } from './compose.js'
+export type { TransactionalPaymentReplayStore } from './security/TransactionalPaymentReplayStore.js'

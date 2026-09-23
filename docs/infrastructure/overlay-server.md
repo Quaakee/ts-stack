@@ -33,7 +33,7 @@ Clients submit transaction outputs via HTTP, the server routes valid outputs thr
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Database          | MongoDB (lookup data), MySQL/Knex (overlay tracking)                                                                                                |
 | External services | Wallet Storage (service advertisement), Arcade and/or Arc (transaction propagation), Chaintracks/go-chaintracks-compatible headers and reorg stream |
-| ts-stack packages | @bsv/sdk, @bsv/overlay-express, @bsv/auth-express-middleware, @bsv/overlay-topics 1.7.0+ for UMP reservations                                      |
+| ts-stack packages | @bsv/sdk, @bsv/overlay-express, @bsv/auth-express-middleware, @bsv/overlay-topics 1.7.0+ for UMP reservations                                       |
 
 ## HTTP endpoints
 
@@ -80,11 +80,11 @@ None (HTTP-only OverlayExpress endpoints).
 | NODE_NAME                        | Yes           | One-word, lowercase overlay service node identifier                                                                                       |
 | SERVER_PRIVATE_KEY               | Yes           | 32-byte hex root private key for server wallet                                                                                            |
 | HOSTING_URL                      | Yes           | Public URL where the node is reachable                                                                                                    |
-| ADMIN_TOKEN                      | Yes           | Token for admin API access                                                                                                                |
+| ADMIN_TOKEN                      | Yes           | Independent random secret of at least 32 characters for admin API access                                                                  |
 | WALLET_STORAGE_URL               | Yes           | BSV wallet storage endpoint (e.g., `https://store-us-1.bsvb.tech`)                                                                        |
 | NETWORK                          | Yes           | `main` or `test` (BSV blockchain network)                                                                                                 |
 | ARC_API_KEY                      | Conditionally | Arc key for fallback transaction broadcasting. Required only when `ARCADE_URL` is unset.                                                  |
-| ARC_CALLBACK_TOKEN               | No            | Shared secret expected on `/arc-ingest` callbacks. Recommended for public deployments.                                                    |
+| ARC_CALLBACK_TOKEN               | No            | Independent random secret of at least 32 characters expected on `/arc-ingest` callbacks                                                   |
 | ARCADE_URL                       | Conditionally | Arcade endpoint used as the first-choice broadcaster and proof lookup provider. Required only when `ARC_API_KEY` is unset.                |
 | ARCADE_API_KEY                   | No            | Arcade API key, when the deployment requires one.                                                                                         |
 | ARCADE_DEPLOYMENT_ID             | No            | Stable Arcade deployment identifier used for callback/proof routing.                                                                      |
@@ -95,6 +95,10 @@ None (HTTP-only OverlayExpress endpoints).
 | MONGO_URL                        | Yes           | MongoDB connection string                                                                                                                 |
 | KNEX_URL                         | Yes           | MySQL connection string for Knex                                                                                                          |
 | GASP_ENABLED                     | No            | `true` or `false` (Graph Aware Sync Protocol for overlay sync)                                                                            |
+| MANDALA_ENABLED                  | No            | Enable the regulated Mandala topic. Defaults to `false`; see the production restriction below.                                            |
+| MANDALA_VERIFIER_PRIVATE_KEY     | When enabled  | Dedicated 32-byte linkage-verifier root, distinct from the node and Mandala admin roots.                                                  |
+| MANDALA_ADMIN_PRIVATE_KEY        | When enabled  | Dedicated 32-byte administrative root, distinct from the node and verifier roots.                                                         |
+| MANDALA_STATIC_DENYLIST_JSON     | When enabled  | Explicit bounded JSON array of compressed identity keys for reference/local screening only.                                               |
 | BASM_ENABLED                     | No            | Enable BRC-136 BASM synchronization. Defaults to `false`.                                                                                 |
 | BASM_REORG_STREAM_ENABLED        | No            | Subscribe to Chaintracks reorg SSE when Chaintracks is configured. Defaults to `true`.                                                    |
 | BASM_REORG_SCAN_DEPTH            | No            | Number of recent blocks to revalidate on reorg reconnect/poll.                                                                            |
@@ -107,6 +111,14 @@ None (HTTP-only OverlayExpress endpoints).
 At least one transaction propagation provider must be configured:
 `ARCADE_URL` or `ARC_API_KEY`. Production deployments should prefer
 Arcade-first plus Arc fallback when both are available.
+
+The bundled server leaves Mandala disabled because its in-memory screening
+adapter is not an authoritative sanctions source. Enabling the reference
+adapter requires independent node, verifier, and admin secrets plus an explicit
+screening snapshot. A production regulated-token service must instead inject a
+continuously maintained authoritative `ScreeningProvider` in application code
+and independently custody and rotate the verifier and administrative roots.
+An empty static list is not a production screening control.
 
 ## Run locally
 
@@ -225,7 +237,8 @@ counts.
 - Invalid outputs must be silently skipped in topic managers (don't throw errors)
 - Lookup services use factory pattern returning instances from MongoDB connection
 - GASP sync may cause conflicts if disabled on some nodes; keep consistent across deployment
-- Admin API requires ADMIN_TOKEN in Authorization header; unauthenticated calls rejected
+- Admin API requires a random `ADMIN_TOKEN` of at least 32 characters in the Authorization header; unauthenticated calls are rejected
+- `/arc-ingest` is enabled only with a separately generated random `ARC_CALLBACK_TOKEN` of at least 32 characters; do not reuse the admin or provider API credential
 - Database indexes critical for performance with large transaction volumes
 - Do not run BASM without a production chain tracker. `CHAINTRACKS_URL` or
   `USE_ARCADE_CHAINTRACKS=true` should be configured so anchors use canonical

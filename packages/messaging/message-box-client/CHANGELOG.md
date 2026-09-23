@@ -13,6 +13,25 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### 2.5.3 candidate — CommonJS SDK interop and send failure codes
+
+- Fix the CommonJS build so `new MessageBoxClient()` no longer fails with
+  `LookupResolver.default is not a constructor`; SDK classes are imported by
+  name from the SDK barrels.
+- `sendMessage()` HTTP failures now include the server's well-formed failure
+  code, for example `Message Box send failed with HTTP 400
+(ERR_DUPLICATE_MESSAGE).`, so callers can recognise an already-delivered
+  message. Free-text server descriptions are still never copied into errors.
+- Raise the `@bsv/sdk` peer floor to `^2.8.0`. The package already required
+  SDK modules that first shipped in 2.8.0, so earlier 2.x SDKs never loaded it.
+
+### 2.5.2 candidate — authenticated transport and payment hardening
+
+- Internalize notification payments with the configured originator before acknowledgment.
+- Require affirmative wallet acceptance in notification and PeerPay paths.
+- For refundable payments, internalize, send the refund, then acknowledge.
+- Keep issue #503 open for envelope/outcome handling and durable refund semantics.
+
 ### Added
 
 - Added an optional `socketOptions` client option, forwarded to
@@ -62,6 +81,20 @@ All notable changes to this project will be documented in this file. The format 
   before wallet or adapter dispatch; malformed bytes are never acknowledged.
 
 ### Security
+
+- Require every Message Box HTTP response to remain BRC-103 mutually
+  authenticated, pin one curve-valid server identity per origin, restrict
+  plaintext HTTP to loopback, and support independently provisioned durable
+  `serverIdentityKeysByHost` pins.
+- Validate and bound overlay advertisements, PushDrop envelopes, BEEF,
+  identities, room, box, message, device, permission, and token values before
+  wallet or application use.
+- Snapshot outgoing send authority, bind quote and send rows to exact
+  recipients and message IDs, enforce safe-integer fees and optional
+  `maximumPayment` ceilings, and verify that returned Atomic BEEF preserves
+  every requested script, amount, and remittance index.
+- Make client diagnostics opt-in and event-only so wallet, message, payment,
+  host, identity, token, transaction, and response data are not logged.
 
 ---
 

@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-08-25T23:43:06.103Z",
-  "totalVectors": 6690,
-  "totalFiles": 76,
+  "timestamp": "2026-09-22T04:21:47.930Z",
+  "totalVectors": 6694,
+  "totalFiles": 77,
   "parseErrors": 0,
   "suites": [
     {
@@ -33829,6 +33829,31 @@
         },
         {
           "name": "wallet.storage.adapterconformance.18",
+          "pass": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "name": "wallet/storage/sync-transfer",
+      "cases": [
+        {
+          "name": "wallet.storage.sync-transfer.frame",
+          "pass": true,
+          "error": null
+        },
+        {
+          "name": "wallet.storage.sync-transfer.truncated",
+          "pass": true,
+          "error": null
+        },
+        {
+          "name": "wallet.storage.sync-transfer.trailing",
+          "pass": true,
+          "error": null
+        },
+        {
+          "name": "wallet.storage.sync-transfer.short-header",
           "pass": true,
           "error": null
         }

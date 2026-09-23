@@ -10,6 +10,7 @@ The BSV Wallet Toolbox builds on the [SDK](https://bsv-blockchain.github.io/ts-s
 ## Table of Contents
 
 - [Objective](#objective)
+- [Security and Operational Safety](#security-and-operational-safety)
 - [Examples](#examples)
 - [Documentation](#documentation)
 - [Contribution Guidelines](#contribution-guidelines)
@@ -19,6 +20,36 @@ The BSV Wallet Toolbox builds on the [SDK](https://bsv-blockchain.github.io/ts-s
 ## Objective
 
 The BSV Wallet Toolbox Examples provides a collection of self-contained sample code to support learning and getting started with the @bsv/wallet-toolbox.
+
+## Security and Operational Safety
+
+This package is educational code, not a production wallet application. Importing
+its modules is inert: examples run only when their source file is executed
+directly or an exported function is explicitly called.
+
+Treat the following boundaries as security decisions:
+
+- Most transaction examples use testnet. `p2pkhToAddress`, `swapActive`, and the
+  mainnet janitor functions intentionally affect mainnet state. `release` covers
+  both chains. Verify the chain, identities, destination, amount, and active
+  storage provider before invoking any of them.
+- Generate `.env` inside `src` with `umask 077` and
+  `npx tsx makeEnv > .env`. Never display, share, or commit it: `DEV_KEYS`
+  contains root private keys. The committed `.env.template` contains placeholders
+  only. Do not reuse credentials found in repository history; rotate any
+  credential previously copied from an older template.
+- Example logs can contain identity keys, balances, transaction IDs, BEEF,
+  derivation data, and wallet/storage names. Treat logs as sensitive financial
+  and operational data.
+- Pass only a wallet and storage endpoints you independently trust. The selected
+  wallet is the local authority for managed funding and change, while the custom
+  signing examples additionally bind the requested outpoint, requested output,
+  and final signed transaction and abort mismatched actions.
+- SQLite backups contain sensitive wallet history. Put them in a trusted,
+  owner-only directory; the example rejects linked targets and sets the
+  database file to mode `0600`, but SQLite may create journal files beside it.
+- `janitor release*` relinquishes outputs, and `swapActive*` changes the active
+  storage authority. Inspect first, then invoke the narrowest function needed.
 
 ## Documentation
 

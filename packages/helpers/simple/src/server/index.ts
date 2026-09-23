@@ -3,7 +3,7 @@
  */
 
 // Handler types & utilities
-export type { HandlerRequest, HandlerResponse, RouteHandler } from './handler-types'
+export type { HandlerLimits, HandlerRequest, HandlerResponse, RouteHandler } from './handler-types'
 export { getSearchParams, jsonResponse, toNextHandlers } from './handler-types'
 
 // File persistence

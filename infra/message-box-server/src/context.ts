@@ -1,7 +1,7 @@
 import type { Knex } from 'knex'
-import type { AsyncSessionManager, SessionManager, WalletInterface } from '@bsv/sdk'
+import type { AsyncSessionManager, AtomicBEEF, SessionManager, WalletInterface } from '@bsv/sdk'
 import type { Request } from 'express'
-import type { PaymentReplayStore } from '@bsv/payment-express-middleware'
+import type { TransactionalPaymentReplayStore } from './security/TransactionalPaymentReplayStore.js'
 
 export interface MessageBoxContext {
   wallet: WalletInterface
@@ -11,7 +11,8 @@ export interface MessageBoxContext {
   enableSwagger: boolean
   calculateRequestPrice: (req: Request) => Promise<number> | number
   sessionManager?: SessionManager | AsyncSessionManager
-  paymentReplayStore?: PaymentReplayStore
+  paymentReplayStore?: TransactionalPaymentReplayStore
+  paymentTransactionVerifier?: (tx: AtomicBEEF) => Promise<boolean>
   logger: Console
 }
 
@@ -23,7 +24,8 @@ export interface CreateMessageBoxContextOptions {
   enableSwagger?: boolean
   calculateRequestPrice?: (req: Request) => Promise<number> | number
   sessionManager?: SessionManager | AsyncSessionManager
-  paymentReplayStore?: PaymentReplayStore
+  paymentReplayStore?: TransactionalPaymentReplayStore
+  paymentTransactionVerifier?: (tx: AtomicBEEF) => Promise<boolean>
   logger?: Console
 }
 
@@ -51,6 +53,7 @@ export function createMessageBoxContext(deps: CreateMessageBoxContextOptions): M
       }),
     sessionManager: deps.sessionManager,
     paymentReplayStore: deps.paymentReplayStore,
+    paymentTransactionVerifier: deps.paymentTransactionVerifier,
     logger: deps.logger ?? console
   }
 }

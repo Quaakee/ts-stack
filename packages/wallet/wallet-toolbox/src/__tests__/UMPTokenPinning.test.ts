@@ -1,4 +1,4 @@
-import { Hash, PushDrop } from '@bsv/sdk'
+import { Hash, LockingScript, PrivateKey, ProtoWallet, PushDrop, Transaction } from '@bsv/sdk'
 import { OverlayUMPTokenInteractor, UMPToken, UMPTokenLookupError } from '../CWIStyleWalletManager'
 
 function token(outpoint: `${string}.${number}`, presentationHash: number[]): UMPToken {
@@ -84,28 +84,93 @@ describe('WAB-administered UMP pin fallback', () => {
 
   it('builds and broadcasts a finalized UMP token through the shared action path', async () => {
     const { subject, first } = interactor()
-    const finalizedOutpoint = `${'d'.repeat(64)}.0` as const
+    const completed = new Transaction(
+      1,
+      [],
+      [
+        { satoshis: 2, lockingScript: LockingScript.fromHex('00') },
+        { satoshis: 1, lockingScript: LockingScript.fromHex('51') }
+      ],
+      0
+    )
+    const finalizedOutpoint = `${completed.id('hex')}.1`
+    const broadcast = jest.fn(async () => ({
+      status: 'success' as const,
+      txid: completed.id('hex'),
+      message: 'published'
+    }))
+    Object.assign(subject as any, { broadcaster: { broadcast } })
     const lock = jest.spyOn(PushDrop.prototype, 'lock').mockResolvedValue({ toHex: () => '51' } as any)
     const fields = jest.spyOn(subject as any, 'tokenFields').mockReturnValue([])
     const oldInput = jest.spyOn(subject as any, 'resolveOldInput').mockResolvedValue({
       resolvedOldToken: undefined,
       inputToken: undefined
     })
-    const createAction = jest.spyOn(subject as any, 'createAction').mockResolvedValue({ txid: 'd'.repeat(64) })
-    const broadcastFinal = jest.spyOn(subject as any, 'broadcastFinal').mockResolvedValue(finalizedOutpoint)
+    const complete = jest.spyOn(subject as any, 'completeUMPAction').mockResolvedValue(completed)
 
     await expect(subject.buildAndSend({} as any, 'admin.example', first)).resolves.toBe(finalizedOutpoint)
     expect(fields).toHaveBeenCalledWith(first)
     expect(oldInput).toHaveBeenCalledWith(undefined)
-    expect(createAction).toHaveBeenCalledWith(
+    expect(complete).toHaveBeenCalledWith(
       expect.anything(),
-      'admin.example',
-      [],
-      [{ lockingScript: '51', satoshis: 1, outputDescription: 'New UMP token output' }],
-      undefined,
-      undefined
+      expect.objectContaining({
+        inputs: [],
+        outputs: [{ lockingScript: '51', satoshis: 1, outputDescription: 'New UMP token output' }]
+      }),
+      expect.anything(),
+      'admin.example'
     )
-    expect(broadcastFinal).toHaveBeenCalledWith({ txid: 'd'.repeat(64) })
+    expect(broadcast).toHaveBeenCalledWith(completed)
     lock.mockRestore()
+  })
+
+  it('refuses ambiguous token outputs and mismatched broadcast identities', async () => {
+    const { subject } = interactor()
+    const duplicate = new Transaction(
+      1,
+      [],
+      [
+        { satoshis: 1, lockingScript: LockingScript.fromHex('51') },
+        { satoshis: 1, lockingScript: LockingScript.fromHex('51') }
+      ],
+      0
+    )
+    const broadcast = jest.fn()
+    Object.assign(subject as any, { broadcaster: { broadcast } })
+    await expect((subject as any).broadcastUMPTransaction(duplicate, '51', 'create')).rejects.toThrow(
+      'exactly one requested token output'
+    )
+    expect(broadcast).not.toHaveBeenCalled()
+
+    const unique = new Transaction(1, [], [{ satoshis: 1, lockingScript: LockingScript.fromHex('51') }], 0)
+    broadcast.mockResolvedValue({ status: 'success', txid: 'f'.repeat(64), message: 'substituted' })
+    await expect((subject as any).broadcastUMPTransaction(unique, '51', 'create')).rejects.toThrow(
+      'transaction ID mismatch'
+    )
+  })
+
+  it('will not sign renewal of a canonical token owned by another wallet', async () => {
+    const { subject } = interactor()
+    const attackerWallet = new ProtoWallet(PrivateKey.fromRandom())
+    const localWallet = new ProtoWallet(PrivateKey.fromRandom())
+    const forgedToken = token(`${'0'.repeat(64)}.0`, presentationHash)
+    const fields = (subject as any).tokenFields(forgedToken)
+    const lockingScript = await new PushDrop(attackerWallet).lock(
+      fields,
+      [2, 'admin user management token'],
+      '1',
+      'self',
+      true,
+      true
+    )
+    const source = new Transaction(1, [], [{ satoshis: 1, lockingScript }], 0)
+    forgedToken.currentOutpoint = `${source.id('hex')}.0`
+
+    await expect(
+      (subject as any).assertOwnedUMPInput(localWallet, 'admin.example', forgedToken, {
+        beef: source.toBEEF(),
+        outputIndex: 0
+      })
+    ).rejects.toThrow('not controlled by this wallet')
   })
 })

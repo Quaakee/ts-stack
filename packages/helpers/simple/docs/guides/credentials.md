@@ -4,14 +4,14 @@
 
 ## Overview
 
-| Component | Role |
-|-----------|------|
-| `CredentialSchema` | Defines the fields, validation, and computed values for a credential type |
-| `CredentialIssuer` | Issues, verifies, and revokes credentials |
-| `MemoryRevocationStore` | Stores revocation secrets in memory (browser/tests) |
-| `FileRevocationStore` | Stores revocation secrets on disk (server only) |
-| `toVerifiableCredential()` | Wraps a BSV certificate into W3C VC format |
-| `toVerifiablePresentation()` | Wraps VCs into a W3C VP |
+| Component                    | Role                                                                      |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `CredentialSchema`           | Defines the fields, validation, and computed values for a credential type |
+| `CredentialIssuer`           | Issues, verifies, and revokes credentials                                 |
+| `MemoryRevocationStore`      | Stores revocation secrets in memory (browser/tests)                       |
+| `FileRevocationStore`        | Stores revocation secrets on disk (server only)                           |
+| `toVerifiableCredential()`   | Wraps a BSV certificate into W3C VC format                                |
+| `toVerifiablePresentation()` | Builds an unsigned W3C presentation-shaped envelope                       |
 
 ## Defining a Schema
 
@@ -25,18 +25,23 @@ const schema = new CredentialSchema({
   fields: [
     { key: 'name', label: 'Full Name', type: 'text', required: true },
     { key: 'email', label: 'Email', type: 'email', required: true },
-    { key: 'department', label: 'Department', type: 'select', options: [
-      { value: 'engineering', label: 'Engineering' },
-      { value: 'design', label: 'Design' },
-      { value: 'sales', label: 'Sales' }
-    ]},
+    {
+      key: 'department',
+      label: 'Department',
+      type: 'select',
+      options: [
+        { value: 'engineering', label: 'Engineering' },
+        { value: 'design', label: 'Design' },
+        { value: 'sales', label: 'Sales' }
+      ]
+    },
     { key: 'startDate', label: 'Start Date', type: 'date' }
   ],
-  validate: (values) => {
+  validate: values => {
     if (!values.email?.includes('@')) return 'Invalid email'
     return null
   },
-  computedFields: (values) => ({
+  computedFields: values => ({
     ...values,
     issuedAt: new Date().toISOString(),
     verified: 'true'
@@ -58,19 +63,30 @@ const all = schema.computeFields({ name: 'Alice', email: 'alice@co.com' })
 // Get info
 const info = schema.getInfo()
 // { id: 'employee-badge', name: 'EmployeeBadge', certificateTypeBase64: '...', fieldCount: 4 }
+
+const migration = schema.getCertificateTypeMigration()
+// { canonical: '<32-byte base64>', legacy: ['ZW1wbG95ZWUtYmFkZ2U='] }
 ```
+
+Releases before 0.6 used base64 of the UTF-8 schema ID as the default
+certificate type. New issuance uses its 32-byte SHA-256 digest. The migration
+mapping is for offline storage migration and local verification only: current
+SDK wallet methods reject short types, so do not put `legacy` values in wallet
+lookup, acquire, prove, or relinquish requests. Export historical records with
+the storage version that created them, verify them with the matching locally
+configured issuer, and reissue/import canonical replacements.
 
 ### Field Types
 
-| Type | Description |
-|------|-------------|
-| `text` | Free-form text |
-| `email` | Email address |
-| `date` | Date string |
-| `number` | Numeric value |
-| `textarea` | Multi-line text |
-| `checkbox` | Boolean flag |
-| `select` | Dropdown with predefined options |
+| Type       | Description                      |
+| ---------- | -------------------------------- |
+| `text`     | Free-form text                   |
+| `email`    | Email address                    |
+| `date`     | Date string                      |
+| `number`   | Numeric value                    |
+| `textarea` | Multi-line text                  |
+| `checkbox` | Boolean flag                     |
+| `select`   | Dropdown with predefined options |
 
 ## Creating an Issuer
 
@@ -82,7 +98,7 @@ const issuer = await CredentialIssuer.create({
   schemas: [schema.getConfig()],
   revocation: {
     enabled: true,
-    wallet: walletInstance.getClient(),    // for creating revocation UTXOs
+    wallet: walletInstance.getClient(), // for creating revocation UTXOs
     store: new MemoryRevocationStore()
   }
 })
@@ -93,22 +109,22 @@ console.log('Schemas:', issuer.getInfo().schemas)
 
 ### Issuer Configuration
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `privateKey` | `string` | Yes | Hex-encoded private key |
-| `schemas` | `CredentialSchemaConfig[]` | No | Schema definitions |
-| `revocation.enabled` | `boolean` | No | Enable on-chain revocation |
-| `revocation.wallet` | `WalletInterface` | If enabled | Wallet for creating revocation UTXOs |
-| `revocation.store` | `RevocationStore` | No | Custom store (default: MemoryRevocationStore) |
+| Parameter            | Type                       | Required   | Description                                   |
+| -------------------- | -------------------------- | ---------- | --------------------------------------------- |
+| `privateKey`         | `string`                   | Yes        | Hex-encoded private key                       |
+| `schemas`            | `CredentialSchemaConfig[]` | No         | Schema definitions                            |
+| `revocation.enabled` | `boolean`                  | No         | Enable on-chain revocation                    |
+| `revocation.wallet`  | `WalletInterface`          | If enabled | Wallet for creating revocation UTXOs          |
+| `revocation.store`   | `RevocationStore`          | No         | Custom store (default: MemoryRevocationStore) |
 
 ## Issuing a Credential
 
 ```typescript
-const vc = await issuer.issue(
-  subjectIdentityKey,
-  'employee-badge',
-  { name: 'Alice Smith', email: 'alice@company.com', department: 'engineering' }
-)
+const vc = await issuer.issue(subjectIdentityKey, 'employee-badge', {
+  name: 'Alice Smith',
+  email: 'alice@company.com',
+  department: 'engineering'
+})
 
 console.log('VC type:', vc.type)
 // ['VerifiableCredential', 'EmployeeBadge']
@@ -178,11 +194,15 @@ console.log('Subject:', result.subject)
 ```
 
 Verification checks:
-1. W3C `@context` is present
-2. `VerifiableCredential` type is present
-3. Proof and signature are present
-4. BSV certificate data is present
-5. Revocation status (if applicable)
+
+1. The embedded BSV certificate is structurally canonical, or has an exact schema-configured historical type, and its certifier signature is valid
+2. The certificate was issued by this `CredentialIssuer`
+3. The wrapper's issuer, subject, schema-derived type, encrypted fields, proof, and revocation reference exactly match the signed certificate
+4. The issuer's revocation store still contains the applicable unspent record
+
+The wrapper's `issuanceDate`/`proof.created` values are formatting metadata and
+are not signed certificate claims. Do not make age or expiry decisions from
+them. Use a signed certificate field when time is part of authorization policy.
 
 ## Revoking a Credential
 
@@ -225,9 +245,9 @@ for (const vc of vcs) {
 }
 ```
 
-### Create a Presentation
+### Create an Unsigned Presentation Envelope
 
-Bundle credentials for sharing:
+Bundle credentials for transport or display:
 
 ```typescript
 const presentation = wallet.createPresentation(vcs)
@@ -235,6 +255,18 @@ const presentation = wallet.createPresentation(vcs)
 console.log('Holder:', presentation.holder)
 console.log('Credentials:', presentation.verifiableCredential.length)
 ```
+
+This synchronous helper has no holder wallet, challenge, or audience. Its
+`proof` object is metadata only: it does not prove holder control and provides
+no replay protection. Do not use it for authentication. A replay-safe
+presentation requires a holder signature bound to a verifier-provided
+challenge and audience.
+
+Remote acquisition uses public HTTPS, refuses redirects, bounds response size
+and time, validates the issuer metadata and certificate signature, and imports
+the new certificate before relinquishing older ones. The optional `fetch`
+setting is an explicitly trusted transport override for controlled tests or
+local development.
 
 ## Server-Side Revocation Store
 
@@ -259,7 +291,12 @@ const issuer = await CredentialIssuer.create({
 ## Complete Example
 
 ```typescript
-import { createWallet, CredentialSchema, CredentialIssuer, MemoryRevocationStore } from '@bsv/simple/browser'
+import {
+  createWallet,
+  CredentialSchema,
+  CredentialIssuer,
+  MemoryRevocationStore
+} from '@bsv/simple/browser'
 
 const wallet = await createWallet()
 
@@ -281,11 +318,10 @@ const issuer = await CredentialIssuer.create({
 })
 
 // Issue credential
-const vc = await issuer.issue(
-  wallet.getIdentityKey(),
-  'age-check',
-  { name: 'Alice', over18: 'true' }
-)
+const vc = await issuer.issue(wallet.getIdentityKey(), 'age-check', {
+  name: 'Alice',
+  over18: 'true'
+})
 
 // List from wallet
 const vcs = await wallet.listCredentials({

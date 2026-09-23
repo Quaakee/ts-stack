@@ -48,11 +48,21 @@ const advertiseHandler = async (req: AdvertiseRequest, res: Response<AdvertiseRe
 
   try {
     const expiryTime = Number(req.body.expiryTime) // in seconds
-    
+    const hostingOrigin = new URL(
+      typeof HOSTING_DOMAIN === 'string' && /^[a-z][a-z0-9+.-]*:\/\//i.test(HOSTING_DOMAIN)
+        ? HOSTING_DOMAIN
+        : `https://${HOSTING_DOMAIN ?? ''}`
+    )
+    if (
+      hostingOrigin.protocol !== 'https:' || hostingOrigin.username !== '' ||
+      hostingOrigin.password !== '' || hostingOrigin.pathname !== '/' ||
+      hostingOrigin.search !== '' || hostingOrigin.hash !== ''
+    ) throw new Error('HOSTING_DOMAIN must be a credential-free HTTPS origin')
+
     await createUHRPAdvertisement({
       hash: StorageUtils.getHashFromURL(req.body.uhrpUrl),
       objectIdentifier: req.body.objectIdentifier,
-      url: `${HOSTING_DOMAIN}/cdn/${req.body.objectIdentifier}`,
+      url: `${hostingOrigin.origin}/cdn/${req.body.objectIdentifier}`,
       uploaderIdentityKey: req.body.uploaderIdentityKey,
       expiryTime,
       contentLength: req.body.fileSize

@@ -1,8 +1,8 @@
 // /utils/getMetadata.ts
 import { Storage } from '@google-cloud/storage'
-import { getWallet } from './walletSingleton'
-import { Utils } from '@bsv/sdk'
+import { PublicKey, StorageUtils } from '@bsv/sdk'
 import { normalizeUhrpPagination } from '../resourceLimits'
+import { listVerifiedAdvertisements } from './storedAdvertisements'
 
 const storage = new Storage()
 const { GCP_BUCKET_NAME } = process.env
@@ -24,57 +24,41 @@ interface FileMetadata {
  * @throws If no matching advertisement is found or GCS metadata fails.
  */
 export async function getMetadata(uhrpUrl: string, uploaderIdentityKey: string, limit?: number, offset?: number): Promise<FileMetadata> {
-  const wallet = await getWallet()
+  if (typeof uhrpUrl !== 'string' || uhrpUrl.length < 1 || uhrpUrl.length > 256) throw new Error('Invalid UHRP URL')
+  const canonicalUrl = StorageUtils.getURLForHash(StorageUtils.getHashFromURL(uhrpUrl))
+  if (typeof uploaderIdentityKey !== 'string' || !/^(?:02|03)[0-9a-f]{64}$/i.test(uploaderIdentityKey)) {
+    throw new Error('Invalid uploader identity key')
+  }
+  const identityKey = PublicKey.fromString(uploaderIdentityKey).toString().toLowerCase()
   const pagination = normalizeUhrpPagination(limit, offset)
-  const { outputs } = await wallet.listOutputs({
-    basket: 'uhrp advertisements',
-    tags: [`uhrp_url_${Utils.toHex(Utils.toArray(uhrpUrl, 'utf8'))}`, `uploader_identity_key_${uploaderIdentityKey}`],
-    tagQueryMode: 'all',
-    includeTags: true,
+  const { advertisements } = await listVerifiedAdvertisements({
+    uhrpUrl: canonicalUrl,
+    uploaderIdentityKey: identityKey,
     ...pagination
   })
-
-  let objectIdentifier
-  // Farthest expiration time given in seconds
-  let maxpiry = 0
-  // Finding the identifier for the file with the maxpiry date
-  for (const out of outputs) {
-    if (!out.tags) continue
-    const objectIdTag = out.tags.find(t => t.startsWith('object_identifier_'))
-    const expiryTag = out.tags.find(t => t.startsWith('expiry_time_'))
-    if (!objectIdTag || !expiryTag) continue
-
-    const expiryNum = Number.parseInt(expiryTag.substring('expiry_time_'.length), 10) || 0
-
-    if (expiryNum > maxpiry) {
-      maxpiry = expiryNum
-      objectIdentifier = Utils.toUTF8(Utils.toArray(objectIdTag.substring('object_identifier_'.length), 'hex'))
-    }
+  const selected = advertisements.reduce<typeof advertisements[number] | undefined>(
+    (farthest, candidate) => farthest == null || candidate.metadata.expiryTime > farthest.metadata.expiryTime ? candidate : farthest,
+    undefined
+  )
+  if (selected == null) {
+    throw new Error(`No authenticated advertisement found for uhrpUrl: ${canonicalUrl}`)
+  }
+  if (Date.now() > selected.metadata.expiryTime * 1000) {
+    throw new Error(`Advertisement for uhrpUrl: ${canonicalUrl} has expired`)
   }
 
-  if (!objectIdentifier) {
-    throw new Error(`No advertisement found for uhrpUrl: ${uhrpUrl} uploaderIdentityKey: ${uploaderIdentityKey}`)
-  }
-
-  if (Date.now() > maxpiry * 1000) {
-    throw new Error(`Advertisement for uhrpUrl: ${uhrpUrl} has expired`)
-  }
-
-  // Fetch GCS metadata
-  const file = storage.bucket(GCP_BUCKET_NAME!).file(`cdn/${objectIdentifier}`)
+  const file = storage.bucket(GCP_BUCKET_NAME!).file(`cdn/${selected.metadata.objectIdentifier}`)
   const [gcsMetadata] = await file.getMetadata()
-
-  const {
-    name = '',
-    size,
-    contentType = '',
-  } = gcsMetadata
+  const gcsSize = typeof gcsMetadata.size === 'string' ? Number(gcsMetadata.size) : gcsMetadata.size
+  if (!Number.isSafeInteger(gcsSize) || gcsSize !== selected.metadata.fileSize) {
+    throw new Error('GCS object size does not match the authenticated advertisement')
+  }
 
   return {
-    objectIdentifier,
-    name,
-    size: String(size ?? ''),
-    contentType,
-    expiryTime: maxpiry
+    objectIdentifier: selected.metadata.objectIdentifier,
+    name: gcsMetadata.name ?? `cdn/${selected.metadata.objectIdentifier}`,
+    size: String(selected.metadata.fileSize),
+    contentType: selected.metadata.contentType,
+    expiryTime: selected.metadata.expiryTime
   }
 }

@@ -122,25 +122,22 @@ describe('StorageClientBase createAction inputBEEF pruning', () => {
     expect(Beef.fromBinary(sentArgs.inputBEEF!).version).toBe(BEEF_V1)
   })
 
-  test('forwards malformed inputBEEF so the server preserves its validation error contract', async () => {
+  test('rejects malformed inputBEEF before an RPC can be attempted', () => {
     const txid = '22'.repeat(32)
-    const args = Validation.validateCreateActionArgs({
-      description: 'forward malformed proof data',
-      inputs: [
-        {
-          outpoint: `${txid}.0`,
-          unlockingScript: '00',
-          inputDescription: 'declared malformed input'
-        }
-      ],
-      inputBEEF: [1, 2, 3],
-      outputs: [{ satoshis: 1, lockingScript: '51', outputDescription: 'replacement output' }]
-    })
-    const client = new CapturingStorageClient({} as WalletInterface, 'https://storage.example.test')
-
-    await client.createAction(auth, args)
-
-    expect(client.calls[0].params[1]).toBe(args)
+    expect(() =>
+      Validation.validateCreateActionArgs({
+        description: 'reject malformed proof data',
+        inputs: [
+          {
+            outpoint: `${txid}.0`,
+            unlockingScript: '00',
+            inputDescription: 'declared malformed input'
+          }
+        ],
+        inputBEEF: [1, 2, 3],
+        outputs: [{ satoshis: 1, lockingScript: '51', outputDescription: 'replacement output' }]
+      })
+    ).toThrow('complete, exactly framed BEEF envelope')
   })
 })
 

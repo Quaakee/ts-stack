@@ -1,4 +1,10 @@
-import { normalizeBRC100WalletByteFields, stringifyBRC100, type WalletInterface } from '@bsv/sdk'
+import {
+  normalizeBRC100WalletByteFields,
+  stringifyBRC100
+} from '@bsv/sdk/wallet/BRC100ByteEncoding'
+import { validateWalletArgs } from '@bsv/sdk/wallet/WalletArgumentValidation'
+import { validateWalletResult } from '@bsv/sdk/wallet/WalletResultValidation'
+import type { WalletInterface } from '@bsv/sdk/wallet/Wallet.interfaces'
 import type {
   SessionInfo,
   WalletRequest,
@@ -7,6 +13,17 @@ import type {
   WalletMethodName
 } from '../types.js'
 import { WALLET_METHOD_NAMES } from '../types.js'
+import {
+  fetchBoundedJson,
+  parseRpcMessage,
+  requireBoundedString,
+  requireDesktopToken,
+  requirePairingUri,
+  requirePlainRecord,
+  requireQrDataUrl,
+  requireSessionId,
+  validateSessionInfo
+} from '../shared/validation.js'
 
 export interface WalletRelayClientOptions {
   /**
@@ -42,6 +59,8 @@ export interface WalletRelayClientOptions {
   onSessionChange?: (session: SessionInfo) => void
   /** Called when the request log changes. */
   onLogChange?: (log: RequestLogEntry[]) => void
+  /** Maximum in-memory request-log entries. Set 0 to disable retention. Default: 100. */
+  maxLogEntries?: number
   /** Called when an error occurs during session creation. */
   onError?: (error: string) => void
 }
@@ -51,6 +70,7 @@ export type WalletRelayErrorCode =
   | 'REQUEST_TIMEOUT' // mobile did not respond within 30 s
   | 'SESSION_DISCONNECTED' // mobile dropped while the request was in-flight
   | 'INVALID_TOKEN' // desktopToken mismatch — likely a client config issue
+  | 'REQUEST_CANCELLED' // lifecycle changed while session creation was in flight
   | 'NETWORK_ERROR' // fetch failed or unexpected HTTP error
 
 export class WalletRelayError extends Error {
@@ -122,6 +142,14 @@ function normalizeRelayApiUrl(apiUrl: string): string {
   return normalized.endsWith('/api') ? normalized : `${normalized}/api`
 }
 
+function boundedInterval(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback
+  if (!Number.isSafeInteger(resolved) || resolved < 10 || resolved > 24 * 60 * 60 * 1_000) {
+    throw new RangeError(`${name} must be an integer from 10 to 86400000 ms`)
+  }
+  return resolved
+}
+
 /**
  * Frontend counterpart to WalletRelayService.
  *
@@ -149,32 +177,52 @@ export class WalletRelayClient {
   private readonly _onSessionChange?: (session: SessionInfo) => void
   private readonly _onLogChange?: (log: RequestLogEntry[]) => void
   private readonly _onError?: (error: string) => void
+  private readonly _maxLogEntries: number
 
   private _session: SessionInfo | null = null
   private _desktopToken: string | null = null
   private _log: RequestLogEntry[] = []
   private _error: string | null = null
   private _pollTimer: ReturnType<typeof setInterval> | null = null
+  private _pollInFlight = false
+  private _pollEpoch = 0
+  private _lifecycleEpoch = 0
   private _expiredCount = 0
   private _walletProxy: Pick<WalletInterface, WalletMethodName> | null = null
 
   constructor(options?: WalletRelayClientOptions) {
     this._apiUrl = normalizeRelayApiUrl(options?.apiUrl ?? '/api')
-    this._pollInterval = options?.pollInterval ?? 3000
-    this._connectedPollInterval = options?.connectedPollInterval ?? 10000
+    this._pollInterval = boundedInterval(options?.pollInterval, 3000, 'pollInterval')
+    this._connectedPollInterval = boundedInterval(
+      options?.connectedPollInterval,
+      10000,
+      'connectedPollInterval'
+    )
     this._persistSession = options?.persistSession ?? true
     this._storageKey = options?.sessionStorageKey ?? `wallet-relay-session:${this._apiUrl}`
-    this._sessionStorageTtl = options?.sessionStorageTtl ?? 24 * 60 * 60 * 1000
+    this._sessionStorageTtl = boundedInterval(
+      options?.sessionStorageTtl,
+      24 * 60 * 60 * 1000,
+      'sessionStorageTtl'
+    )
     this._onSessionChange = options?.onSessionChange
     this._onLogChange = options?.onLogChange
     this._onError = options?.onError
+    this._maxLogEntries = options?.maxLogEntries ?? 100
+    if (
+      !Number.isSafeInteger(this._maxLogEntries) ||
+      this._maxLogEntries < 0 ||
+      this._maxLogEntries > 10_000
+    ) {
+      throw new RangeError('maxLogEntries must be an integer from 0 to 10000')
+    }
   }
 
   get session(): SessionInfo | null {
     return this._session
   }
   get log(): RequestLogEntry[] {
-    return this._log
+    return [...this._log]
   }
   get error(): string | null {
     return this._error
@@ -226,18 +274,24 @@ export class WalletRelayClient {
   async resumeSession(): Promise<SessionInfo | null> {
     const stored = this._loadFromStorage()
     if (!stored) return null
+    const epoch = ++this._lifecycleEpoch
 
     try {
-      const res = await fetch(`${this._apiUrl}/session/${stored.sessionId}`)
-      if (!res.ok) {
+      const { response, value } = await fetchBoundedJson(
+        `${this._apiUrl}/session/${stored.sessionId}`,
+        { cache: 'no-store' },
+        'wallet relay session response'
+      )
+      if (!response.ok) {
         this._clearStorage()
         return null
       }
-      const data = (await res.json()) as SessionInfo
+      const data = validateSessionInfo(value, { expectedId: stored.sessionId })
       if (data.status === 'expired') {
         this._clearStorage()
         return null
       }
+      if (epoch !== this._lifecycleEpoch) return null
 
       this._desktopToken = stored.desktopToken
       // Merge stored QR data (not returned by status polls) back into session
@@ -262,20 +316,30 @@ export class WalletRelayClient {
    */
   async createSession(): Promise<SessionInfo> {
     this._stopPolling()
+    const epoch = ++this._lifecycleEpoch
     this._expiredCount = 0
     this._error = null
     this._desktopToken = null
     this._clearStorage()
 
     try {
-      const res = await fetch(`${this._apiUrl}/session`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = (await res.json()) as SessionInfo
+      const { response, value } = await fetchBoundedJson(
+        `${this._apiUrl}/session`,
+        { cache: 'no-store' },
+        'wallet relay session response'
+      )
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const data = validateSessionInfo(value, { requireCreationSecrets: true })
+      if (epoch !== this._lifecycleEpoch) {
+        void this._retireCreatedSession(data)
+        throw new WalletRelayError('Session creation was cancelled', 'REQUEST_CANCELLED')
+      }
       this._desktopToken = data.desktopToken ?? null
       this._setSession(data)
       this._startPolling(data.sessionId)
       return data
     } catch (err) {
+      if (err instanceof WalletRelayError && err.code === 'REQUEST_CANCELLED') throw err
       const msg = err instanceof Error ? err.message : 'Failed to create session'
       this._error = msg
       this._onError?.(msg)
@@ -290,6 +354,10 @@ export class WalletRelayClient {
    */
   async sendRequest(method: WalletMethodName, params: unknown = {}): Promise<WalletResponse> {
     if (!this._session) throw new WalletRelayError('No active session', 'SESSION_NOT_CONNECTED')
+    if (!(WALLET_METHOD_NAMES as readonly string[]).includes(method)) {
+      throw new TypeError('Unsupported wallet relay method')
+    }
+    validateWalletArgs(method, params)
 
     const requestId = crypto.randomUUID()
     const request: WalletRequest = { requestId, method, params, timestamp: Date.now() }
@@ -298,15 +366,25 @@ export class WalletRelayClient {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (this._desktopToken) headers['X-Desktop-Token'] = this._desktopToken
-      const res = await fetch(`${this._apiUrl}/request/${this._session.sessionId}`, {
-        method: 'POST',
-        headers,
-        body: stringifyBRC100({ method, params })
-      })
+      const { response: res, value } = await fetchBoundedJson(
+        `${this._apiUrl}/request/${this._session.sessionId}`,
+        {
+          method: 'POST',
+          headers,
+          body: stringifyBRC100({ method, params })
+        },
+        'wallet relay RPC response'
+      )
 
       if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string }
-        const msg = body.error ?? `HTTP ${res.status}`
+        const body =
+          value == null || typeof value !== 'object' || Array.isArray(value)
+            ? {}
+            : (value as { error?: unknown })
+        const msg =
+          typeof body.error === 'string' && body.error.length <= 1_000
+            ? body.error
+            : `HTTP ${res.status}`
         let code: WalletRelayErrorCode
         switch (res.status) {
           case 401:
@@ -326,11 +404,15 @@ export class WalletRelayClient {
         throw new WalletRelayError(msg, code)
       }
 
-      const rpc = (await res.json()) as {
-        result?: unknown
-        error?: { code: number; message: string }
+      const rpc = parseRpcMessage(value)
+      if ('method' in rpc)
+        throw new TypeError('Wallet relay returned a request instead of a response')
+      if (rpc.error !== undefined) {
+        requireBoundedString(rpc.error.message, 'wallet relay error message', 1, 1_000)
+      } else {
+        normalizeBRC100WalletByteFields(rpc.result)
+        rpc.result = validateWalletResult(method, rpc.result, params)
       }
-      normalizeBRC100WalletByteFields(rpc.result)
       const response: WalletResponse = {
         requestId,
         result: rpc.result,
@@ -366,22 +448,30 @@ export class WalletRelayClient {
    * Prefer this over `destroy()` when you want the mobile app to be notified.
    */
   async disconnect(): Promise<void> {
+    this._lifecycleEpoch += 1
     this._stopPolling()
     if (this._session?.sessionId && this._desktopToken) {
       try {
-        await fetch(`${this._apiUrl}/session/${this._session.sessionId}`, {
-          method: 'DELETE',
-          headers: { 'X-Desktop-Token': this._desktopToken }
-        })
+        await fetchBoundedJson(
+          `${this._apiUrl}/session/${this._session.sessionId}`,
+          {
+            method: 'DELETE',
+            headers: { 'X-Desktop-Token': this._desktopToken }
+          },
+          'wallet relay disconnect response'
+        )
       } catch {
         /* ignore — local teardown proceeds regardless */
       }
     }
     this._desktopToken = null
+    this._session = null
+    this._clearStorage()
   }
 
   /** Stop polling and clean up resources. Call this on component unmount. */
   destroy(): void {
+    this._lifecycleEpoch += 1
     this._stopPolling()
     this._desktopToken = null
   }
@@ -391,12 +481,20 @@ export class WalletRelayClient {
   private _startPolling(sessionId: string, interval = this._pollInterval): void {
     // Two consecutive 'expired' polls required — the backend grace window means
     // a session at the 120 s boundary can still flip to 'connected' first.
+    const epoch = ++this._pollEpoch
     this._pollTimer = setInterval(async () => {
+      if (this._pollInFlight) return
+      this._pollInFlight = true
       try {
-        const res = await fetch(`${this._apiUrl}/session/${sessionId}`)
-        if (!res.ok) return
+        const { response, value } = await fetchBoundedJson(
+          `${this._apiUrl}/session/${sessionId}`,
+          { cache: 'no-store' },
+          'wallet relay session response'
+        )
+        if (epoch !== this._pollEpoch) return
+        if (!response.ok) return
         const prevStatus = this._session?.status
-        const updated = (await res.json()) as SessionInfo
+        const updated = validateSessionInfo(value, { expectedId: sessionId })
         this._setSession({ ...this._session!, ...updated })
         if (updated.status === 'expired') {
           if (++this._expiredCount >= 2) {
@@ -416,11 +514,30 @@ export class WalletRelayClient {
         }
       } catch {
         // Ignore transient network errors — next poll will retry
+      } finally {
+        this._pollInFlight = false
       }
     }, interval)
   }
 
+  private async _retireCreatedSession(session: SessionInfo): Promise<void> {
+    if (session.desktopToken === undefined) return
+    try {
+      await fetchBoundedJson(
+        `${this._apiUrl}/session/${session.sessionId}`,
+        {
+          method: 'DELETE',
+          headers: { 'X-Desktop-Token': session.desktopToken }
+        },
+        'wallet relay cancelled-session response'
+      )
+    } catch {
+      // Best effort: the server's short pending-session TTL remains the fallback.
+    }
+  }
+
   private _stopPolling(): void {
+    this._pollEpoch += 1
     if (this._pollTimer !== null) {
       clearInterval(this._pollTimer)
       this._pollTimer = null
@@ -460,26 +577,43 @@ export class WalletRelayClient {
     try {
       const raw = sessionStorage.getItem(this._storageKey)
       if (!raw) return null
-      const entry = JSON.parse(raw) as PersistedSession
+      const value = requirePlainRecord(JSON.parse(raw), 'persisted wallet relay session')
+      const entry: PersistedSession = {
+        sessionId: requireSessionId(value.sessionId),
+        desktopToken: requireDesktopToken(value.desktopToken),
+        status: requireBoundedString(value.status, 'persisted session status', 1, 20),
+        savedAt: value.savedAt as number,
+        ...(value.qrDataUrl === undefined
+          ? {}
+          : { qrDataUrl: requireQrDataUrl(value.qrDataUrl, 'persisted QR data URL') }),
+        ...(value.pairingUri === undefined
+          ? {}
+          : { pairingUri: requirePairingUri(value.pairingUri, 'persisted pairing URI') })
+      }
+      if (!Number.isSafeInteger(entry.savedAt) || entry.savedAt < 0 || entry.savedAt > Date.now()) {
+        this._clearStorage()
+        return null
+      }
       if (Date.now() - entry.savedAt > this._sessionStorageTtl) {
         this._clearStorage()
         return null
       }
       return entry
     } catch {
+      this._clearStorage()
       return null
     }
   }
 
   private _addLogEntry(entry: RequestLogEntry): void {
-    this._log = [entry, ...this._log]
-    this._onLogChange?.(this._log)
+    this._log = this._maxLogEntries === 0 ? [] : [entry, ...this._log].slice(0, this._maxLogEntries)
+    this._onLogChange?.([...this._log])
   }
 
   private _resolveLogEntry(requestId: string, response: WalletResponse): void {
     this._log = this._log.map(e =>
       e.request.requestId === requestId ? { ...e, response, pending: false } : e
     )
-    this._onLogChange?.(this._log)
+    this._onLogChange?.([...this._log])
   }
 }

@@ -4,7 +4,7 @@ title: '@bsv/chirp'
 kind: package
 domain: network
 npm: '@bsv/chirp'
-version: '0.1.1'
+version: '0.1.2'
 last_updated: '2026-08-28'
 last_verified: '2026-08-28'
 review_cadence_days: 30

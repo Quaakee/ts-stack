@@ -1,4 +1,5 @@
-import { LockingScript, Utils } from '@bsv/sdk'
+import { toArray, toUTF8 } from '@bsv/sdk/primitives/utils'
+import type LockingScript from '@bsv/sdk/script/LockingScript'
 
 /**
  * Bsv21Token — decoder for BSV-21 (1Sat ordinals-style fungible token)
@@ -92,7 +93,7 @@ class HexReader {
 function hexToUtf8(hex: string): string {
   if (hex === '') return ''
   try {
-    return Utils.toUTF8(Utils.toArray(hex, 'hex'))
+    return toUTF8(toArray(hex, 'hex'))
   } catch {
     return ''
   }

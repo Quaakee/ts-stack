@@ -872,7 +872,7 @@ export default class Point extends BasePoint {
   mulAdd(k1: BigNumber, p2: Point, k2: BigNumber): Point {
     const points = [this, p2]
     const coeffs = [k1, k2]
-    return this._endoWnafMulAdd(points, coeffs) as Point
+    return this.#_endoWnafMulAdd(points, coeffs) as Point
   }
 
   /**
@@ -893,7 +893,7 @@ export default class Point extends BasePoint {
   jmulAdd(k1: BigNumber, p2: Point, k2: BigNumber): JPoint {
     const points = [this, p2]
     const coeffs = [k1, k2]
-    return this._endoWnafMulAdd(points, coeffs, true) as JPoint
+    return this.#_endoWnafMulAdd(points, coeffs, true) as JPoint
   }
 
   /**
@@ -999,7 +999,7 @@ export default class Point extends BasePoint {
     return res
   }
 
-  private _getBeta(): undefined | Point {
+  #_getBeta(): undefined | Point {
     if (typeof this.curve.endo !== 'object') {
       return
     }
@@ -1049,43 +1049,7 @@ export default class Point extends BasePoint {
     return beta
   }
 
-  private _fixedNafMul(k: BigNumber): Point {
-    if (typeof this.precomputed !== 'object' || this.precomputed === null) {
-      throw new Error('_fixedNafMul requires precomputed values for the point')
-    }
-    const doubles = this._getDoubles()
-
-    const naf = this.curve.getNAF(k, 1, this.curve._bitLength)
-    let I = (1 << (doubles.step + 1)) - (doubles.step % 2 === 0 ? 2 : 1)
-    I /= 3
-
-    // Translate into more windowed form
-    const repr: number[] = []
-    for (let j = 0; j < naf.length; j += doubles.step) {
-      let nafW = 0
-      for (let k = j + doubles.step - 1; k >= j; k--) {
-        nafW = (nafW << 1) + naf[k]
-      }
-      repr.push(nafW)
-    }
-
-    let a = new JPoint(null, null, null)
-    let b = new JPoint(null, null, null)
-    for (let i = I; i > 0; i--) {
-      for (let j = 0; j < repr.length; j++) {
-        const nafW = repr[j]
-        if (nafW === i) {
-          b = b.mixedAdd(doubles.points[j])
-        } else if (nafW === -i) {
-          b = b.mixedAdd(doubles.points[j].neg())
-        }
-      }
-      a = a.add(b)
-    }
-    return a.toP()
-  }
-
-  private _prepareWnafWindows(
+  #_prepareWnafWindows(
     defW: number,
     points: Point[],
     len: number,
@@ -1093,7 +1057,7 @@ export default class Point extends BasePoint {
     wnd: Point[][]
   ): void {
     for (let index = 0; index < len; index++) {
-      const nafPoints = points[index]._getNAFPoints(defW)
+      const nafPoints = points[index].#_getNAFPoints(defW)
       wndWidth[index] = nafPoints.wnd
       wnd[index] = nafPoints.points
     }
@@ -1134,7 +1098,7 @@ export default class Point extends BasePoint {
     return max
   }
 
-  private _prepareWnafRepresentations(
+  #_prepareWnafRepresentations(
     points: Point[],
     coeffs: BigNumber[],
     len: number,
@@ -1178,7 +1142,7 @@ export default class Point extends BasePoint {
     return { index, doubles }
   }
 
-  private _addWnafStep(accumulator: JPoint, len: number, tmp: BigNumber[], wnd: Point[][]): JPoint {
+  #_addWnafStep(accumulator: JPoint, len: number, tmp: BigNumber[], wnd: Point[][]): JPoint {
     const one = new BigNumber(1)
     const two = new BigNumber(2)
     let result = accumulator
@@ -1193,7 +1157,7 @@ export default class Point extends BasePoint {
     return result
   }
 
-  private _wnafMulAdd(
+  #_wnafMulAdd(
     defW: number,
     points: Point[],
     coeffs: BigNumber[],
@@ -1205,8 +1169,8 @@ export default class Point extends BasePoint {
     const wnd: Point[][] = Array.from({ length: scratchLength }, () => [])
     const naf: number[][] = Array.from({ length: scratchLength }, () => [])
 
-    this._prepareWnafWindows(defW, points, len, wndWidth, wnd)
-    const max = this._prepareWnafRepresentations(points, coeffs, len, wndWidth, wnd, naf)
+    this.#_prepareWnafWindows(defW, points, len, wndWidth, wnd)
+    const max = this.#_prepareWnafRepresentations(points, coeffs, len, wndWidth, wnd, naf)
 
     let acc = new JPoint(null, null, null)
     const tmp = this.curve._wnafT4
@@ -1216,7 +1180,7 @@ export default class Point extends BasePoint {
       index = step.index
       acc = acc.dblp(step.doubles)
       if (index < 0) break
-      acc = this._addWnafStep(acc, len, tmp, wnd)
+      acc = this.#_addWnafStep(acc, len, tmp, wnd)
       index--
     }
     // Zeroify references
@@ -1231,7 +1195,7 @@ export default class Point extends BasePoint {
     }
   }
 
-  private _endoWnafMulAdd(
+  #_endoWnafMulAdd(
     points: Point[],
     coeffs: BigNumber[], // Explicitly type coeffs
     jacobianResult?: boolean
@@ -1242,7 +1206,7 @@ export default class Point extends BasePoint {
     for (i = 0; i < points.length; i++) {
       const split = this.curve._endoSplit(coeffs[i])
       let p = points[i]
-      let beta: Point = p._getBeta() ?? new Point(null, null)
+      let beta: Point = p.#_getBeta() ?? new Point(null, null)
 
       if (split.k1.negative !== 0) {
         split.k1.ineg()
@@ -1259,7 +1223,7 @@ export default class Point extends BasePoint {
       ncoeffs[i * 2 + 1] = split.k2
     }
 
-    const res = this._wnafMulAdd(1, npoints, ncoeffs, i * 2, jacobianResult)
+    const res = this.#_wnafMulAdd(1, npoints, ncoeffs, i * 2, jacobianResult)
 
     // Clean-up references to points and coefficients
     for (let j = 0; j < i * 2; j++) {
@@ -1267,19 +1231,6 @@ export default class Point extends BasePoint {
       ncoeffs[j] = null as unknown as BigNumber
     }
     return res
-  }
-
-  private _hasDoubles(k: BigNumber): boolean {
-    if (this.precomputed == null) {
-      return false
-    }
-
-    const doubles = this.precomputed.doubles
-    if (typeof doubles !== 'object') {
-      return false
-    }
-
-    return doubles.points.length >= Math.ceil((k.bitLength() + 1) / doubles.step)
   }
 
   private _getDoubles(step?: number, power?: number): { step: number; points: any[] } {
@@ -1306,7 +1257,7 @@ export default class Point extends BasePoint {
     }
   }
 
-  private _getNAFPoints(wnd: number): { wnd: number; points: any[] } {
+  #_getNAFPoints(wnd: number): { wnd: number; points: any[] } {
     if (
       typeof this.precomputed === 'object' &&
       this.precomputed !== null &&

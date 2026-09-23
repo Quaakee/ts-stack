@@ -84,16 +84,53 @@ describe('OverlayExpress', () => {
     })
 
     it('should use provided admin token', () => {
-      const customToken = 'my-custom-token-123'
+      const customToken = 'test-admin-token-0123456789abcdef'
       const instance = new OverlayExpress('MyService', 'private-key', 'example.com', customToken)
 
       expect(instance.getAdminToken()).toBe(customToken)
+    })
+
+    it('normalizes full HTTPS hosting URLs without constructing a double scheme', () => {
+      const instance = new OverlayExpress('MyService', 'private-key', 'https://example.com:8443/')
+
+      expect(instance.advertisableFQDN).toBe('example.com:8443')
+      expect(
+        () => new OverlayExpress('MyService', 'private-key', 'https://example.com/path')
+      ).toThrow('without credentials or a path')
+      expect(() => new OverlayExpress('MyService', 'private-key', 'http://example.com')).toThrow(
+        'HTTPS host'
+      )
+    })
+
+    it('rejects weak or header-unsafe administrative tokens', () => {
+      expect(() => new OverlayExpress('MyService', 'private-key', 'example.com', 'short')).toThrow(
+        'between 32 and 16384'
+      )
+      expect(
+        () =>
+          new OverlayExpress(
+            'MyService',
+            'private-key',
+            'example.com',
+            ' test-admin-token-0123456789abcdef '
+          )
+      ).toThrow('whitespace')
+      expect(
+        () =>
+          new OverlayExpress(
+            'MyService',
+            'private-key',
+            'example.com',
+            'test-admin-token-0123456789abc\ndef'
+          )
+      ).toThrow('control characters')
     })
 
     it('should initialize with default values', () => {
       expect(overlayExpress.port).toBe(3000)
       expect(overlayExpress.network).toBe('main')
       expect(overlayExpress.enableGASPSync).toBe(true)
+      expect(overlayExpress.enableBASMSync).toBe(false)
       expect(overlayExpress.verboseRequestLogging).toBe(false)
       expect(overlayExpress.managers).toEqual({})
       expect(overlayExpress.services).toEqual({})
@@ -233,6 +270,16 @@ describe('OverlayExpress', () => {
       expect(overlayExpress.janitorConfig.requestTimeoutMs).toBe(20000)
       expect(overlayExpress.janitorConfig.hostDownRevokeScore).toBe(10)
     })
+
+    it('rejects type-confused SSRF and resource policy options', () => {
+      expect(() =>
+        overlayExpress.configureJanitor({ allowPrivateHosts: 'false' as unknown as boolean })
+      ).toThrow('allowPrivateHosts')
+      expect(() => overlayExpress.configureJanitor({ requestTimeoutMs: 0 })).toThrow(
+        'requestTimeoutMs'
+      )
+      expect(() => overlayExpress.configureJanitor({ batchSize: 100_001 })).toThrow('batchSize')
+    })
   })
 
   describe('configureEdgePolicy', () => {
@@ -272,6 +319,118 @@ describe('OverlayExpress', () => {
       expect(overlayExpress.edgePolicyConfig.securityHeaders.contentSecurityPolicy).toContain(
         "default-src 'none'"
       )
+    })
+
+    it('normalizes and defensively copies explicit origins', () => {
+      const origins = ['https://wallet.example:443']
+
+      overlayExpress.configureEdgePolicy({ allowedOrigins: origins })
+      origins[0] = 'https://attacker.example'
+
+      expect(overlayExpress.edgePolicyConfig.allowedOrigins).toEqual(['https://wallet.example'])
+    })
+
+    it('rejects type-confused or unsafe resource and header policy', () => {
+      expect(() => overlayExpress.configureEdgePolicy({ maxConcurrentRequests: 0 })).toThrow(
+        'Maximum concurrent requests'
+      )
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          http: { requestTimeoutMs: 1000, headersTimeoutMs: 1001 }
+        })
+      ).toThrow('headersTimeoutMs')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({ allowedOrigins: ['https://wallet.example/path'] })
+      ).toThrow('origins')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          securityHeaders: { environmentPrefix: 'UNTRUSTED' }
+        })
+      ).toThrow('top-level environmentPrefix')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          securityHeaders: { strictTransportSecurity: 'false' as unknown as boolean }
+        })
+      ).toThrow('boolean')
+    })
+
+    it('validates every bounded HTTP and browser-header option', () => {
+      expect(() => overlayExpress.configureEdgePolicy(null as any)).toThrow(
+        'HTTP edge policy must be an object'
+      )
+      expect(() => overlayExpress.configureEdgePolicy({ environmentPrefix: 'lowercase' })).toThrow(
+        'environmentPrefix'
+      )
+      expect(() =>
+        overlayExpress.configureEdgePolicy({ allowedOrigins: 'https://wallet.example' as any })
+      ).toThrow('allowedOrigins')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          allowedOrigins: Array.from(
+            { length: 129 },
+            (_, index) => `https://wallet-${index}.example`
+          )
+        })
+      ).toThrow('at most 128')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          http: { requestTimeoutMs: 1_000, headersTimeoutMs: 1_000, keepAliveTimeoutMs: 1_001 }
+        })
+      ).toThrow('keepAliveTimeoutMs')
+      expect(() => overlayExpress.configureEdgePolicy({ http: [] as any })).toThrow(
+        'HTTP server policy must be an object'
+      )
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          securityHeaders: { contentSecurityPolicy: 'bad\npolicy' }
+        })
+      ).toThrow('control characters')
+      expect(() =>
+        overlayExpress.configureEdgePolicy({
+          securityHeaders: { crossOriginResourcePolicy: 'invalid' as any }
+        })
+      ).toThrow('is invalid')
+
+      overlayExpress.configureEdgePolicy({
+        environmentPrefix: 'PUBLIC_EDGE_1',
+        allowedOrigins: ['https://wallet.example', 'https://wallet.example:443'],
+        jsonBodyLimitBytes: -1,
+        binaryBodyLimitBytes: 65_536,
+        maxConcurrentRequests: -1,
+        http: {
+          requestTimeoutMs: 60_000,
+          headersTimeoutMs: 30_000,
+          keepAliveTimeoutMs: 5_000,
+          socketTimeoutMs: 45_000,
+          maxRequestsPerSocket: 1_000,
+          maxConnections: -1
+        },
+        securityHeaders: {
+          contentSecurityPolicy: false,
+          permissionsPolicy: 'camera=()',
+          crossOriginResourcePolicy: 'cross-origin',
+          crossOriginOpenerPolicy: false,
+          frameOptions: 'SAMEORIGIN',
+          strictTransportSecurity: true
+        }
+      })
+
+      expect(overlayExpress.edgePolicyConfig).toMatchObject({
+        environmentPrefix: 'PUBLIC_EDGE_1',
+        allowedOrigins: ['https://wallet.example'],
+        jsonBodyLimitBytes: -1,
+        binaryBodyLimitBytes: 65_536,
+        maxConcurrentRequests: -1,
+        http: { maxConnections: -1 },
+        securityHeaders: {
+          contentSecurityPolicy: false,
+          permissionsPolicy: 'camera=()',
+          crossOriginResourcePolicy: 'cross-origin',
+          crossOriginOpenerPolicy: false,
+          frameOptions: 'SAMEORIGIN',
+          strictTransportSecurity: true
+        }
+      })
     })
   })
 
@@ -356,6 +515,97 @@ describe('OverlayExpress', () => {
       expect(report.checks[0].name).toBe('process')
       expect(report.checks[0].details).toBeUndefined()
     })
+
+    it('keeps health details private by default and bounds optional context', async () => {
+      const contextProvider = jest.fn(async () => ({ deployment: 'private-cell' }))
+      overlayExpress.configureHealth({ contextProvider })
+
+      const defaultReport = await (overlayExpress as any).collectHealthReport('full')
+      expect(defaultReport.context).toBeUndefined()
+      expect(contextProvider).not.toHaveBeenCalled()
+
+      overlayExpress.configureHealth({ includeDetails: true, timeoutMs: 1 })
+      const detailedReport = await (overlayExpress as any).collectHealthReport('full')
+      expect(detailedReport.context).toEqual({ deployment: 'private-cell' })
+
+      overlayExpress.configureHealth({
+        contextProvider: async () => await new Promise<Record<string, any>>(() => {})
+      })
+      await expect((overlayExpress as any).collectHealthReport('full')).rejects.toThrow(
+        'Timed out after 1ms'
+      )
+    })
+
+    it('rejects invalid health configuration and check definitions', () => {
+      expect(() => overlayExpress.configureHealth({ timeoutMs: 0 })).toThrow(
+        'timeoutMs must be an integer'
+      )
+      expect(() => overlayExpress.configureHealth({ timeoutMs: 60_001 })).toThrow(
+        'timeoutMs must be an integer'
+      )
+      expect(() =>
+        overlayExpress.configureHealth({ includeDetails: 'yes' as unknown as boolean })
+      ).toThrow('includeDetails must be a boolean')
+      expect(() =>
+        overlayExpress.registerHealthCheck({
+          name: 'mongo',
+          handler: async () => ({ status: 'ok' })
+        })
+      ).toThrow('name is reserved')
+      expect(() =>
+        overlayExpress.registerHealthCheck({
+          name: 'bad\nname',
+          handler: async () => ({ status: 'ok' })
+        })
+      ).toThrow('name is invalid')
+    })
+
+    it('rejects malformed health checks and replaces a valid named check atomically', () => {
+      const handler = async (): Promise<{ status: 'ok' }> => ({ status: 'ok' })
+      for (const definition of [
+        null,
+        [],
+        { name: '', handler },
+        { name: 'x'.repeat(257), handler },
+        { name: 'custom', scope: 'full', handler },
+        { name: 'custom', critical: 'yes', handler },
+        { name: 'custom', handler: 'not-a-function' }
+      ]) {
+        expect(() => overlayExpress.registerHealthCheck(definition as any)).toThrow()
+      }
+
+      overlayExpress.registerHealthCheck({ name: 'custom', scope: 'live', critical: true, handler })
+      const replacement = async (): Promise<{ status: 'ok' }> => ({ status: 'ok' })
+      overlayExpress.registerHealthCheck({ name: 'custom', handler: replacement })
+
+      const registered = (overlayExpress as any).healthChecks.filter(
+        (check: { name: string }) => check.name === 'custom'
+      )
+      expect(registered).toEqual([
+        expect.objectContaining({
+          name: 'custom',
+          scope: 'ready',
+          critical: false,
+          handler: replacement
+        })
+      ])
+    })
+
+    it('caps the number of distinct application health checks', () => {
+      ;(overlayExpress as any).healthChecks = Array.from({ length: 128 }, (_, index) => ({
+        name: `existing-${index}`,
+        scope: 'ready',
+        critical: false,
+        handler: async () => ({ status: 'ok' })
+      }))
+
+      expect(() =>
+        overlayExpress.registerHealthCheck({
+          name: 'one-too-many',
+          handler: async () => ({ status: 'ok' })
+        })
+      ).toThrow('Cannot register more than 128')
+    })
   })
 
   describe('configureLogger', () => {
@@ -400,11 +650,20 @@ describe('OverlayExpress', () => {
       overlayExpress.configureNetwork('test')
       expect(overlayExpress.chainTracker).toBeDefined()
     })
+
+    it('rejects unknown network values', () => {
+      expect(() => overlayExpress.configureNetwork('stn' as OverlayExpress['network'])).toThrow(
+        'Network'
+      )
+    })
   })
 
   describe('configureChainTracker', () => {
     it('should set custom chain tracker', () => {
-      const mockChainTracker: ChainTracker = Object.create(null)
+      const mockChainTracker: ChainTracker = {
+        isValidRootForHeight: jest.fn<any>().mockResolvedValue(true),
+        currentHeight: jest.fn<any>().mockResolvedValue(800_000)
+      }
       overlayExpress.configureChainTracker(mockChainTracker)
       expect(overlayExpress.chainTracker).toBe(mockChainTracker)
     })
@@ -431,12 +690,46 @@ describe('OverlayExpress', () => {
         'TTN requires an explicit ChainTracker'
       )
     })
+
+    it('rejects type-confused provider security options', () => {
+      expect(() =>
+        overlayExpress.configureArcade('http://127.0.0.1', {
+          allowPrivateHosts: 'false' as unknown as boolean
+        })
+      ).toThrow('allowPrivateHosts')
+      expect(() =>
+        overlayExpress.configureChaintracks('https://chaintracks.example', {
+          reorgStream: 'false' as unknown as boolean
+        })
+      ).toThrow('reorgStream')
+      expect(() =>
+        overlayExpress.configureReorgStream(
+          'http://127.0.0.1/reorg',
+          3,
+          'false' as unknown as boolean
+        )
+      ).toThrow('allowPrivateHosts')
+    })
   })
 
   describe('configureArcApiKey', () => {
     it('should set ARC API key', () => {
       overlayExpress.configureArcApiKey('test-api-key')
       expect(overlayExpress.arcApiKey).toBe('test-api-key')
+    })
+  })
+
+  describe('configureArcCallbackToken', () => {
+    it('rejects weak or header-unsafe callback credentials', () => {
+      expect(() => overlayExpress.configureArcCallbackToken('short')).toThrow(
+        'between 32 and 16384'
+      )
+      expect(() =>
+        overlayExpress.configureArcCallbackToken(' test-callback-token-0123456789abcdef ')
+      ).toThrow('whitespace')
+      expect(() =>
+        overlayExpress.configureArcCallbackToken('test-callback-token-0123456789ab\ncdef')
+      ).toThrow('control characters')
     })
   })
 
@@ -449,6 +742,79 @@ describe('OverlayExpress', () => {
     it('should disable GASP sync', () => {
       overlayExpress.configureEnableGASPSync(false)
       expect(overlayExpress.enableGASPSync).toBe(false)
+    })
+  })
+
+  describe('BASM maintenance configuration bounds', () => {
+    it('accepts bounded intervals and eviction thresholds', () => {
+      overlayExpress.configureUnprovenEviction({ thresholdBlocks: 144 })
+      overlayExpress.configureUnprovenMaintenance({ intervalMs: 60_000, thresholdBlocks: 288 })
+      overlayExpress.configureBASMBlockPollInterval(30_000)
+
+      expect(overlayExpress.unprovenEvictionBlocks).toBe(288)
+      expect(overlayExpress.unprovenMaintenanceIntervalMs).toBe(60_000)
+      expect(overlayExpress.basmBlockPollIntervalMs).toBe(30_000)
+    })
+
+    it('rejects unsafe timer and eviction values', () => {
+      expect(() => overlayExpress.configureUnprovenEviction({ thresholdBlocks: 0 })).toThrow(
+        'thresholdBlocks'
+      )
+      expect(() => overlayExpress.configureUnprovenMaintenance({ intervalMs: -1 })).toThrow(
+        'intervalMs'
+      )
+      expect(() => overlayExpress.configureBASMBlockPollInterval(Number.NaN)).toThrow('intervalMs')
+    })
+  })
+
+  describe('default BASM block header resolver', () => {
+    it('accepts only bounded, well-formed WhatsOnChain headers', async () => {
+      const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            hash: '11'.repeat(32),
+            merkleroot: '22'.repeat(32)
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      const resolver = (overlayExpress as any).buildTopicAnchorHeaderResolver()
+
+      await expect(resolver(800_000)).resolves.toEqual({
+        blockHeight: 800_000,
+        blockHash: '11'.repeat(32),
+        merkleRoot: '22'.repeat(32)
+      })
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://api.whatsonchain.com/v1/bsv/main/block/800000/header',
+        expect.objectContaining({ redirect: 'error', signal: expect.any(AbortSignal) })
+      )
+    })
+
+    it('rejects oversized or malformed WhatsOnChain headers', async () => {
+      const fetchSpy = jest
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response('{}', {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': String(64 * 1024 + 1)
+            }
+          })
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ hash: 'not-a-hash', merkleroot: '22'.repeat(32) }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        )
+      const resolver = (overlayExpress as any).buildTopicAnchorHeaderResolver()
+
+      await expect(resolver(800_000)).rejects.toThrow('exceeds')
+      await expect(resolver(800_000)).rejects.toThrow('block hash')
+      await expect(resolver(-1)).rejects.toThrow('block height')
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
     })
   })
 
@@ -537,6 +903,12 @@ describe('OverlayExpress', () => {
       expect(overlayExpress.managers.manager1).toBe(manager1)
       expect(overlayExpress.managers.manager2).toBe(manager2)
     })
+
+    it('rejects reserved registry names', () => {
+      expect(() => overlayExpress.configureTopicManager('__proto__', Object.create(null))).toThrow(
+        'Topic manager name is invalid'
+      )
+    })
   })
 
   describe('configureLookupService', () => {
@@ -556,6 +928,12 @@ describe('OverlayExpress', () => {
 
       expect(overlayExpress.services.service1).toBe(service1)
       expect(overlayExpress.services.service2).toBe(service2)
+    })
+
+    it('rejects reserved registry names', () => {
+      expect(() =>
+        overlayExpress.configureLookupService('constructor', Object.create(null))
+      ).toThrow('Lookup service name is invalid')
     })
   })
 
@@ -686,6 +1064,95 @@ describe('OverlayExpress', () => {
       overlayExpress.configureEngineParams(params)
 
       expect(overlayExpress.engineConfig).toMatchObject(params)
+    })
+
+    it('defensively copies tracker configuration', () => {
+      const shipTrackers = ['https://ship.example']
+      overlayExpress.configureEngineParams({ shipTrackers })
+
+      shipTrackers[0] = 'https://attacker.example'
+
+      expect(overlayExpress.engineConfig.shipTrackers).toEqual(['https://ship.example'])
+    })
+
+    it('rejects type-confused security and background-work settings', () => {
+      expect(() =>
+        overlayExpress.configureEngineParams({
+          reorgStreamAllowPrivateHosts: 'false' as unknown as boolean
+        })
+      ).toThrow('reorgStreamAllowPrivateHosts')
+      expect(() =>
+        overlayExpress.configureEngineParams({ reorgStreamUrl: 'http://127.0.0.1/reorg' })
+      ).toThrow('Provider endpoints')
+      expect(() =>
+        overlayExpress.configureEngineParams({ unprovenMaintenanceIntervalMs: -1 })
+      ).toThrow('unprovenMaintenanceIntervalMs')
+      expect(() => overlayExpress.configureEngineParams({ logPrefix: 'unsafe\nprefix' })).toThrow(
+        'control characters'
+      )
+    })
+
+    it('validates and defensively copies the remaining engine boundary options', () => {
+      expect(() => overlayExpress.configureEngineParams(null as any)).toThrow(
+        'Engine configuration must be an object'
+      )
+      expect(() =>
+        overlayExpress.configureEngineParams({ topicAnchorHeaderResolver: 'bad' as any })
+      ).toThrow('topicAnchorHeaderResolver')
+      for (const chainTracker of [null, {}, { isValidRootForHeight: async () => true }]) {
+        expect(() => overlayExpress.configureEngineParams({ chainTracker } as any)).toThrow(
+          'chainTracker'
+        )
+      }
+      expect(() => overlayExpress.configureEngineParams({ reorgScanDepth: 0 })).toThrow(
+        'reorgScanDepth'
+      )
+      expect(() => overlayExpress.configureEngineParams({ unprovenEvictionBlocks: 0 })).toThrow(
+        'unprovenEvictionBlocks'
+      )
+      expect(() => overlayExpress.configureEngineParams({ maxLookupResults: 0 })).toThrow(
+        'maxLookupResults'
+      )
+      expect(() => overlayExpress.configureEngineParams({ shipTrackers: 'bad' as any })).toThrow(
+        'shipTrackers'
+      )
+      expect(() => overlayExpress.configureEngineParams({ slapTrackers: {} as any })).toThrow(
+        'slapTrackers'
+      )
+
+      const slapTrackers = ['https://slap.example']
+      const resolver = async (blockHeight: number): Promise<any> => ({
+        blockHeight,
+        blockHash: '11'.repeat(32)
+      })
+      const chainTracker = {
+        isValidRootForHeight: async () => true,
+        currentHeight: async () => 1
+      }
+      overlayExpress.configureEngineParams({
+        topicAnchorHeaderResolver: resolver,
+        chainTracker: chainTracker as any,
+        reorgScanDepth: 100,
+        unprovenMaintenanceIntervalMs: 0,
+        unprovenEvictionBlocks: 1,
+        maxLookupResults: -1,
+        reorgStreamUrl: 'http://127.0.0.1/reorg',
+        reorgStreamAllowPrivateHosts: true,
+        slapTrackers
+      })
+      slapTrackers[0] = 'https://attacker.example'
+
+      expect(overlayExpress.engineConfig).toMatchObject({
+        topicAnchorHeaderResolver: resolver,
+        chainTracker,
+        reorgScanDepth: 100,
+        unprovenMaintenanceIntervalMs: 0,
+        unprovenEvictionBlocks: 1,
+        maxLookupResults: -1,
+        reorgStreamUrl: 'http://127.0.0.1/reorg',
+        reorgStreamAllowPrivateHosts: true,
+        slapTrackers: ['https://slap.example']
+      })
     })
   })
 
@@ -859,7 +1326,7 @@ describe('OverlayExpress', () => {
     })
 
     it('should handle configuration with custom admin token', () => {
-      const customToken = 'secure-token-123'
+      const customToken = 'secure-test-token-0123456789abcdef'
       const instance = new OverlayExpress(
         'SecureService',
         'private-key',
@@ -1309,7 +1776,8 @@ describe('OverlayExpress', () => {
       const readyRoute = getSpy.mock.calls.find(call => call[0] === '/health/ready')
       const res = {
         status: jest.fn().mockReturnThis(),
-        json: jest.fn()
+        json: jest.fn(),
+        set: jest.fn().mockReturnThis()
       }
 
       readyRoute?.[1]({} as any, res as any)
@@ -1336,7 +1804,10 @@ describe('OverlayExpress', () => {
       const loggerError = jest.spyOn(instance.logger, 'error').mockImplementation(() => {})
       const { getSpy } = await startAndCaptureRoutes()
 
-      expect((await invokeCapturedRoute(getSpy, '/health/live')).status).toHaveBeenCalledWith(200)
+      const live = await invokeCapturedRoute(getSpy, '/health/live')
+      expect(live.status).toHaveBeenCalledWith(200)
+      expect(live.set).toHaveBeenCalledWith('Cache-Control', 'no-store, max-age=0')
+      expect(live.set).toHaveBeenCalledWith('Pragma', 'no-cache')
       expect((await invokeCapturedRoute(getSpy, '/healthz')).status).toHaveBeenCalledWith(200)
       expect((await invokeCapturedRoute(getSpy, '/health')).status).toHaveBeenCalledWith(200)
 
@@ -1410,6 +1881,7 @@ describe('OverlayExpress', () => {
 
     it('should register ARC ingest route when API key is configured', async () => {
       instance.configureArcApiKey('test-arc-key')
+      instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
       const postSpy = jest.spyOn(instance.app, 'post')
       jest.spyOn(instance.app, 'listen').mockImplementation((port: any, callback: any) => {
         callback()
@@ -1464,7 +1936,7 @@ describe('OverlayExpress', () => {
 
       it('rejects a callback with no token when a token is configured', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
@@ -1476,7 +1948,7 @@ describe('OverlayExpress', () => {
 
       it('rejects a callback with an invalid token', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
@@ -1488,11 +1960,17 @@ describe('OverlayExpress', () => {
 
       it('accepts a callback with a valid Bearer token', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
-        handler({ headers: { authorization: 'Bearer secret-token' }, body: proofCallbackBody }, res)
+        handler(
+          {
+            headers: { authorization: 'Bearer test-callback-token-0123456789abcdef' },
+            body: proofCallbackBody
+          },
+          res
+        )
         await flush()
 
         expect(res.status).not.toHaveBeenCalledWith(401)
@@ -1501,11 +1979,17 @@ describe('OverlayExpress', () => {
 
       it('accepts a callback with a valid x-callback-token header', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
-        handler({ headers: { 'x-callback-token': 'secret-token' }, body: proofCallbackBody }, res)
+        handler(
+          {
+            headers: { 'x-callback-token': 'test-callback-token-0123456789abcdef' },
+            body: proofCallbackBody
+          },
+          res
+        )
         await flush()
 
         expect(res.status).not.toHaveBeenCalledWith(401)
@@ -1514,17 +1998,23 @@ describe('OverlayExpress', () => {
 
       it('accepts callback tokens from array-valued headers', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const bearerRes = mockRes()
         const callbackRes = mockRes()
 
         handler(
-          { headers: { authorization: ['Bearer secret-token'] }, body: proofCallbackBody },
+          {
+            headers: { authorization: ['Bearer test-callback-token-0123456789abcdef'] },
+            body: proofCallbackBody
+          },
           bearerRes
         )
         handler(
-          { headers: { 'x-callback-token': ['secret-token'] }, body: proofCallbackBody },
+          {
+            headers: { 'x-callback-token': ['test-callback-token-0123456789abcdef'] },
+            body: proofCallbackBody
+          },
           callbackRes
         )
         await flush()
@@ -1533,37 +2023,48 @@ describe('OverlayExpress', () => {
         expect(callbackRes.status).not.toHaveBeenCalledWith(401)
       })
 
-      it('accepts the configured token as an unprefixed authorization header', async () => {
+      it('rejects an unprefixed authorization token', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
-        handler({ headers: { authorization: 'secret-token' }, body: proofCallbackBody }, res)
+        handler(
+          {
+            headers: { authorization: 'test-callback-token-0123456789abcdef' },
+            body: proofCallbackBody
+          },
+          res
+        )
         await flush()
 
-        expect(res.status).not.toHaveBeenCalledWith(401)
-        expect(mockEngine.handleNewMerkleProof).toHaveBeenCalled()
+        expect(res.status).toHaveBeenCalledWith(401)
+        expect(mockEngine.handleNewMerkleProof).not.toHaveBeenCalled()
       })
 
-      it('does not enforce a token when none is configured', async () => {
+      it('fails startup when an ARC provider has no callback token', async () => {
         instance.configureArcApiKey('test-arc-key')
-        const handler = await captureArcIngestHandler()
-        const res = mockRes()
+        const postSpy = jest.spyOn(instance.app, 'post')
+        jest.spyOn(instance.app, 'listen').mockImplementation((port: any, callback: any) => {
+          callback()
+          return {} as any
+        })
+        await expect(instance.start()).rejects.toThrow('configureArcCallbackToken is required')
 
-        handler({ headers: {}, body: proofCallbackBody }, res)
-        await flush()
-
-        expect(res.status).not.toHaveBeenCalledWith(401)
-        expect(mockEngine.handleNewMerkleProof).toHaveBeenCalled()
+        expect(postSpy.mock.calls.some(call => call[0] === '/arc-ingest')).toBe(false)
+        expect(mockEngine.handleNewMerkleProof).not.toHaveBeenCalled()
       })
 
       it('returns a public validation error when the callback has no txid', async () => {
         instance.configureArcApiKey('test-arc-key')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
-        handler({ headers: {}, body: {} }, res)
+        handler(
+          { headers: { authorization: 'Bearer test-callback-token-0123456789abcdef' }, body: {} },
+          res
+        )
         await flush()
 
         expect(res.status).toHaveBeenCalledWith(400)
@@ -1575,10 +2076,17 @@ describe('OverlayExpress', () => {
 
       it('accepts a non-terminal status update without a Merkle proof', async () => {
         instance.configureArcApiKey('test-arc-key')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
-        handler({ headers: {}, body: { txid: '11'.repeat(32), txStatus: 'SEEN_ON_NETWORK' } }, res)
+        handler(
+          {
+            headers: { authorization: 'Bearer test-callback-token-0123456789abcdef' },
+            body: { txid: '11'.repeat(32), txStatus: 'SEEN_ON_NETWORK' }
+          },
+          res
+        )
         await flush()
 
         expect(res.status).toHaveBeenCalledWith(202)
@@ -1587,13 +2095,13 @@ describe('OverlayExpress', () => {
 
       it('evicts a transaction when a provider reports a terminal double-spend status', async () => {
         instance.configureArcApiKey('test-arc-key')
-        instance.configureArcCallbackToken('secret-token')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
         handler(
           {
-            headers: { authorization: 'Bearer secret-token' },
+            headers: { authorization: 'Bearer test-callback-token-0123456789abcdef' },
             body: {
               txid: '11'.repeat(32),
               txStatus: 'DOUBLE_SPEND_ATTEMPTED',
@@ -1613,12 +2121,13 @@ describe('OverlayExpress', () => {
 
       it('evicts an orphan reported through extraInfo and preserves its topic', async () => {
         instance.configureArcApiKey('test-arc-key')
+        instance.configureArcCallbackToken('test-callback-token-0123456789abcdef')
         const handler = await captureArcIngestHandler()
         const res = mockRes()
 
         handler(
           {
-            headers: {},
+            headers: { authorization: 'Bearer test-callback-token-0123456789abcdef' },
             body: {
               txid: '33'.repeat(32),
               extraInfo: 'orphaned by competing transaction',
@@ -1637,11 +2146,64 @@ describe('OverlayExpress', () => {
       })
     })
 
+    it.each([
+      ['/requestSyncResponse', 'provideForeignSyncResponse'],
+      ['/requestForeignGASPNode', 'provideForeignGASPNode']
+    ])('serializes untrusted %s errors through the configured logger', async (route, method) => {
+      const safeLog = jest.requireActual<typeof import('@bsv/overlay')>('@bsv/overlay')
+      jest.mocked(serializeErrorForLog).mockImplementation(safeLog.serializeErrorForLog)
+      const logger = { ...console, log: jest.fn(), warn: jest.fn(), error: jest.fn() }
+      instance.configureLogger(logger)
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const { postSpy } = await startAndCaptureRoutes()
+        for (const thrown of [
+          new Error('untrusted\r\nforged\u0085record\u2028separator\u2029'),
+          {
+            toJSON: () => {
+              throw new Error('unserializable request error')
+            }
+          }
+        ]) {
+          logger.error.mockClear()
+          mockEngine[method].mockRejectedValueOnce(thrown)
+          const response = await invokeCapturedRoute(postSpy, route, {
+            headers: { 'x-bsv-topic': 'tm_test' },
+            body: { graphID: 'graph', txid: '01', outputIndex: 0 }
+          })
+          expect(response.status).toHaveBeenCalledWith(400)
+          expect(response.json).toHaveBeenCalledWith({
+            status: 'error',
+            message: 'Request could not be processed'
+          })
+          expect(logger.error).toHaveBeenCalledTimes(1)
+          const args = logger.error.mock.calls[0]
+          expect(args).toHaveLength(1)
+          expect(args[0]).toContain(`Error in ${route}: error=`)
+          expect(args[0]).not.toMatch(/[\r\n\u0085\u2028\u2029]/)
+          expect(args[0]).toContain(safeLog.serializeErrorForLog(thrown))
+          expect(consoleError).not.toHaveBeenCalled()
+        }
+      } finally {
+        consoleError.mockRestore()
+      }
+    })
+
     it('executes public discovery, GASP, and bounded BASM routes', async () => {
       const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
       const { getSpy, postSpy } = await startAndCaptureRoutes()
 
-      expect((await invokeCapturedRoute(getSpy, '/')).send).toHaveBeenCalled()
+      const root = await invokeCapturedRoute(getSpy, '/')
+      expect(root.send).toHaveBeenCalled()
+      const html = root.send.mock.calls[0][0] as string
+      const csp = root.set.mock.calls.find(
+        (call: unknown[]) => call[0] === 'Content-Security-Policy'
+      )?.[1] as string
+      const nonce = csp.match(/script-src 'nonce-([^']+)'/)?.[1]
+      expect(nonce).toBeDefined()
+      expect(html.split(`nonce="${nonce}"`)).toHaveLength(4)
+      expect(csp).not.toMatch(/script-src[^;]*'unsafe-inline'/)
+      expect(html).not.toMatch(/\son(?:click|keydown)=/i)
       expect((await invokeCapturedRoute(getSpy, '/listTopicManagers')).status).toHaveBeenCalledWith(
         200
       )
@@ -1679,10 +2241,11 @@ describe('OverlayExpress', () => {
         body: { since: 1 }
       })
       await invokeCapturedRoute(postSpy, '/requestForeignGASPNode', {
+        headers: { 'x-bsv-topic': 'tm_test' },
         body: { graphID: 'graph', txid: '01', outputIndex: 0 }
       })
       expect(mockEngine.provideForeignSyncResponse).toHaveBeenCalledWith({ since: 1 }, 'tm_test')
-      expect(mockEngine.provideForeignGASPNode).toHaveBeenCalledWith('graph', '01', 0)
+      expect(mockEngine.provideForeignGASPNode).toHaveBeenCalledWith('graph', '01', 0, 'tm_test')
 
       const topicRequest = { headers: { 'x-bsv-topic': 'tm_test' } }
       await invokeCapturedRoute(postSpy, '/requestTopicAnchorTip', topicRequest)
@@ -1692,28 +2255,63 @@ describe('OverlayExpress', () => {
       })
       await invokeCapturedRoute(postSpy, '/requestAdmittedList', {
         ...topicRequest,
-        body: { blockHeight: 2, blockHash: 'hash' }
+        body: { blockHeight: '2', blockHash: 'aa'.repeat(32) }
       })
       await invokeCapturedRoute(postSpy, '/requestCompoundMerklePath', {
         ...topicRequest,
-        body: { blockHeight: 2, txids: ['01', '02'] }
+        body: { blockHeight: '2', txids: ['01'.repeat(32), '02'.repeat(32)] }
       })
       await invokeCapturedRoute(postSpy, '/requestRawTransactions', {
-        body: { txids: ['01'] }
+        ...topicRequest,
+        body: { txids: ['01'.repeat(32)] }
       })
       expect(mockEngine.provideTopicAnchorTip).toHaveBeenCalledWith('tm_test')
       expect(mockEngine.provideTopicAnchorRange).toHaveBeenCalledWith('tm_test', 1, 3)
-      expect(mockEngine.provideAdmittedList).toHaveBeenCalledWith('tm_test', 2, 'hash')
-      expect(mockEngine.provideCompoundMerklePath).toHaveBeenCalledWith('tm_test', 2, ['01', '02'])
-      expect(mockEngine.provideRawTransactions).toHaveBeenCalledWith(['01'])
+      expect(mockEngine.provideAdmittedList).toHaveBeenCalledWith('tm_test', 2, 'aa'.repeat(32))
+      expect(mockEngine.provideCompoundMerklePath).toHaveBeenCalledWith('tm_test', 2, [
+        '01'.repeat(32),
+        '02'.repeat(32)
+      ])
+      expect(mockEngine.provideRawTransactions).toHaveBeenCalledWith(['01'.repeat(32)], 'tm_test')
+
+      const tipRoute = postSpy.mock.calls.find(
+        (call: any[]) => call[0] === '/requestTopicAnchorTip'
+      )
+      const rawRoute = postSpy.mock.calls.find(
+        (call: any[]) => call[0] === '/requestRawTransactions'
+      )
+      const adminRoute = postSpy.mock.calls.find(
+        (call: any[]) => call[0] === '/admin/startBASMSync'
+      )
+      expect(tipRoute).toHaveLength(2)
+      expect(rawRoute).toHaveLength(2)
+      expect(adminRoute.length).toBeGreaterThan(2)
+
+      await invokeCapturedRoute(postSpy, '/requestAdmittedList', {
+        ...topicRequest,
+        body: { blockHeight: 3, blockHash: 'BB'.repeat(32) }
+      })
+      await invokeCapturedRoute(postSpy, '/requestAdmittedList', {
+        ...topicRequest,
+        body: { blockHeight: 4 }
+      })
+      await invokeCapturedRoute(postSpy, '/requestCompoundMerklePath', {
+        ...topicRequest,
+        body: { blockHeight: 3, txids: ['AB'.repeat(32)] }
+      })
+      expect(mockEngine.provideAdmittedList).toHaveBeenCalledWith('tm_test', 3, 'bb'.repeat(32))
+      expect(mockEngine.provideAdmittedList).toHaveBeenCalledWith('tm_test', 4, undefined)
+      expect(mockEngine.provideCompoundMerklePath).toHaveBeenCalledWith('tm_test', 3, [
+        'ab'.repeat(32)
+      ])
 
       for (const [path, request] of [
         ['/requestTopicAnchorTip', { headers: {} }],
         ['/requestTopicAnchorRange', { ...topicRequest, body: { fromHeight: 4, toHeight: 3 } }],
         ['/requestTopicAnchorRange', { ...topicRequest, body: { fromHeight: 0, toHeight: 1000 } }],
         ['/requestCompoundMerklePath', { ...topicRequest, body: { txids: [1] } }],
-        ['/requestRawTransactions', { body: { txids: 'not-an-array' } }],
-        ['/requestRawTransactions', { body: { txids: Array(1001).fill('01') } }]
+        ['/requestRawTransactions', { ...topicRequest, body: { txids: 'not-an-array' } }],
+        ['/requestRawTransactions', { ...topicRequest, body: { txids: Array(1001).fill('01') } }]
       ] as const) {
         const response = await invokeCapturedRoute(postSpy, path, request)
         expect(response.status).toHaveBeenCalledWith(400)
@@ -1722,8 +2320,150 @@ describe('OverlayExpress', () => {
       consoleError.mockRestore()
     })
 
+    it('rejects malformed BASM JSON requests before invoking the engine', async () => {
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+      const { postSpy } = await startAndCaptureRoutes()
+      const topicRequest = { headers: { 'x-bsv-topic': 'tm_test' } }
+
+      for (const [path, request, message] of [
+        [
+          '/requestTopicAnchorRange',
+          { ...topicRequest, body: { fromHeight: null, toHeight: 1 } },
+          'fromHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestTopicAnchorRange',
+          { ...topicRequest, body: { fromHeight: false, toHeight: 1 } },
+          'fromHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestAdmittedList',
+          { ...topicRequest, body: { blockHeight: {}, blockHash: 'aa'.repeat(32) } },
+          'blockHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestAdmittedList',
+          { ...topicRequest, body: { blockHeight: -1 } },
+          'blockHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestAdmittedList',
+          { ...topicRequest, body: { blockHeight: 1.5 } },
+          'blockHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestTopicAnchorRange',
+          {
+            ...topicRequest,
+            body: { fromHeight: Number.MAX_SAFE_INTEGER + 1, toHeight: 1 }
+          },
+          'fromHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestAdmittedList',
+          { ...topicRequest, body: { blockHeight: '2', blockHash: 'not-a-hash' } },
+          'blockHash must be a 32-byte hexadecimal string'
+        ],
+        [
+          '/requestCompoundMerklePath',
+          { ...topicRequest, body: { blockHeight: '', txids: ['01'.repeat(32)] } },
+          'blockHeight must be a nonnegative safe integer'
+        ],
+        [
+          '/requestCompoundMerklePath',
+          { ...topicRequest, body: { blockHeight: 2, txids: [] } },
+          'txids must be a non-empty array'
+        ],
+        [
+          '/requestRawTransactions',
+          { ...topicRequest, body: { txids: ['not-a-txid'] } },
+          'txids must contain 32-byte hexadecimal transaction IDs'
+        ],
+        [
+          '/requestRawTransactions',
+          {
+            ...topicRequest,
+            body: { txids: ['01'.repeat(32), '01'.repeat(32).toUpperCase()] }
+          },
+          'txids must not contain duplicates'
+        ]
+      ] as const) {
+        const response = await invokeCapturedRoute(postSpy, path, request)
+        expect(response.status).toHaveBeenCalledWith(400)
+        expect(response.json).toHaveBeenCalledWith({ status: 'error', message })
+      }
+
+      expect(mockEngine.provideTopicAnchorRange).not.toHaveBeenCalled()
+      expect(mockEngine.provideAdmittedList).not.toHaveBeenCalled()
+      expect(mockEngine.provideCompoundMerklePath).not.toHaveBeenCalled()
+      expect(mockEngine.provideRawTransactions).not.toHaveBeenCalled()
+      consoleError.mockRestore()
+    })
+
+    it('preserves empty BASM responses and reports unsupported capabilities', async () => {
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+      const emptyTip = {
+        topic: 'tm_test',
+        blockHeight: -1,
+        tac: '00'.repeat(32)
+      }
+      mockEngine.provideTopicAnchorTip.mockResolvedValue(emptyTip)
+      const { postSpy } = await startAndCaptureRoutes()
+
+      const tip = await invokeCapturedRoute(postSpy, '/requestTopicAnchorTip', {
+        headers: { 'x-bsv-topic': 'tm_test' }
+      })
+      expect(tip.status).toHaveBeenCalledWith(200)
+      expect(tip.json).toHaveBeenCalledWith(emptyTip)
+
+      const raw = await invokeCapturedRoute(postSpy, '/requestRawTransactions', {
+        headers: { 'x-bsv-topic': 'tm_test' },
+        body: { txids: [] }
+      })
+      expect(raw.status).toHaveBeenCalledWith(200)
+      expect(mockEngine.provideRawTransactions).toHaveBeenCalledWith([], 'tm_test')
+
+      delete mockEngine.provideRawTransactions
+      const unsupported = await invokeCapturedRoute(postSpy, '/requestRawTransactions', {
+        headers: { 'x-bsv-topic': 'tm_test' },
+        body: { txids: ['01'.repeat(32)] }
+      })
+      expect(unsupported.status).toHaveBeenCalledWith(400)
+      expect(unsupported.json).toHaveBeenCalledWith({
+        status: 'error',
+        message: 'BASM capability is not supported by this Overlay engine',
+        code: 'BASM_UNSUPPORTED'
+      })
+      consoleError.mockRestore()
+    })
+
+    it('honors the unlimited BASM transaction limit override', async () => {
+      const previousLimit = process.env.OVERLAY_MAX_BASM_TXIDS
+      process.env.OVERLAY_MAX_BASM_TXIDS = '-1'
+      try {
+        const { postSpy } = await startAndCaptureRoutes()
+        const txids = Array.from({ length: 1001 }, (_, index) =>
+          index.toString(16).padStart(64, '0')
+        )
+        const response = await invokeCapturedRoute(postSpy, '/requestRawTransactions', {
+          headers: { 'x-bsv-topic': 'tm_test' },
+          body: { txids }
+        })
+
+        expect(response.status).toHaveBeenCalledWith(200)
+        expect(mockEngine.provideRawTransactions).toHaveBeenCalledWith(txids, 'tm_test')
+      } finally {
+        if (previousLimit === undefined) {
+          delete process.env.OVERLAY_MAX_BASM_TXIDS
+        } else {
+          process.env.OVERLAY_MAX_BASM_TXIDS = previousLimit
+        }
+      }
+    })
+
     it('enforces admin authentication and executes bounded record and ban operations', async () => {
-      instance.configureAdminIdentityKey('admin-identity')
+      const adminIdentityKey = `02${'11'.repeat(32)}`
+      instance.configureAdminIdentityKey(adminIdentityKey)
       const banService = {
         getStats: jest
           .fn<any>()
@@ -1745,13 +2485,23 @@ describe('OverlayExpress', () => {
       expect(statsRoute).toBeDefined()
       const checkAdminAuth = statsRoute[1]
       const next = jest.fn()
-      checkAdminAuth({ headers: {}, auth: { identityKey: 'admin-identity' } }, mockResponse(), next)
+      const walletAuthResponse = mockResponse()
+      checkAdminAuth(
+        { headers: {}, auth: { identityKey: adminIdentityKey } },
+        walletAuthResponse,
+        next
+      )
       checkAdminAuth(
         { headers: { authorization: `Bearer ${instance.getAdminToken()}` } },
         mockResponse(),
         next
       )
       expect(next).toHaveBeenCalledTimes(2)
+      expect(walletAuthResponse.setHeader).toHaveBeenCalledWith(
+        'Cache-Control',
+        'no-store, max-age=0'
+      )
+      expect(walletAuthResponse.setHeader).toHaveBeenCalledWith('Pragma', 'no-cache')
 
       const invalidCredentials = mockResponse()
       checkAdminAuth(
@@ -1760,6 +2510,10 @@ describe('OverlayExpress', () => {
         next
       )
       expect(invalidCredentials.status).toHaveBeenCalledWith(403)
+      expect(invalidCredentials.setHeader).toHaveBeenCalledWith(
+        'Cache-Control',
+        'no-store, max-age=0'
+      )
       const missingCredentials = mockResponse()
       checkAdminAuth({ headers: {} }, missingCredentials, next)
       expect(missingCredentials.status).toHaveBeenCalledWith(401)
@@ -1773,6 +2527,19 @@ describe('OverlayExpress', () => {
           })
         ).status
       ).toHaveBeenCalledWith(200)
+      const shipCollection = (instance.mongoDb as any).collection('shipRecords')
+      expect(
+        (
+          await invokeCapturedRoute(getSpy, '/admin/ship-records', {
+            query: { search: '.*(a+)+$', page: '1', limit: '2' }
+          })
+        ).status
+      ).toHaveBeenCalledWith(200)
+      expect(shipCollection.find).toHaveBeenLastCalledWith({
+        $or: expect.arrayContaining([
+          { domain: { $regex: '\\.\\*\\(a\\+\\)\\+\\$', $options: 'i' } }
+        ])
+      })
       expect(
         (
           await invokeCapturedRoute(getSpy, '/admin/slap-records', {
@@ -1790,7 +2557,10 @@ describe('OverlayExpress', () => {
 
       for (const [path, query] of [
         ['/admin/ship-records', { page: '1', limit: '0' }],
-        ['/admin/slap-records', { page: '1000000', limit: '200' }]
+        ['/admin/slap-records', { page: '1000000', limit: '200' }],
+        ['/admin/ship-records', { page: '1junk', limit: '2' }],
+        ['/admin/slap-records', { page: '1', limit: '2junk' }],
+        ['/admin/ship-records', { search: 'a'.repeat(257) }]
       ] as const) {
         expect((await invokeCapturedRoute(getSpy, path, { query })).status).toHaveBeenCalledWith(
           400
@@ -1808,7 +2578,7 @@ describe('OverlayExpress', () => {
         body: { type: 'domain', value: 'node.example', reason: 'operator request' }
       })
       await invokeCapturedRoute(postSpy, '/admin/ban', {
-        body: { type: 'outpoint', value: 'abcd.2', reason: 'operator request' }
+        body: { type: 'outpoint', value: `${'ab'.repeat(32)}.2`, reason: 'operator request' }
       })
       await invokeCapturedRoute(postSpy, '/admin/unban', {
         body: { type: 'domain', value: 'node.example' }
@@ -1819,7 +2589,7 @@ describe('OverlayExpress', () => {
       expect(bans.status).toHaveBeenCalledWith(200)
       await invokeCapturedRoute(postSpy, '/admin/remove-token', {
         body: {
-          txid: 'abcd',
+          txid: 'ab'.repeat(32),
           outputIndex: 2,
           ban: true,
           banDomain: true
@@ -1908,7 +2678,10 @@ describe('OverlayExpress', () => {
         ['/admin/evictUnproven', { body: { topic: 'tm_test', thresholdBlocks: 12 } }],
         ['/admin/refreshUnprovenProofs', { body: { topic: 'tm_test', thresholdBlocks: 12 } }],
         ['/admin/maintainUnproven', { body: { topic: 'tm_test', thresholdBlocks: 12 } }],
-        ['/admin/evictOutpoint', { body: { service: 'ls_one', txid: 'abcd', outputIndex: 2 } }],
+        [
+          '/admin/evictOutpoint',
+          { body: { service: 'ls_one', txid: 'ab'.repeat(32), outputIndex: 2 } }
+        ],
         ['/admin/janitor', {}]
       ]
       for (const [path, request] of successfulRoutes) {
@@ -1930,6 +2703,17 @@ describe('OverlayExpress', () => {
         expect.objectContaining({ topic: 'tm_test', thresholdBlocks: 12 })
       )
       expect(janitor.run).toHaveBeenCalled()
+
+      for (const body of [
+        { service: 'ls_one', txid: 'abcd', outputIndex: 2 },
+        { service: 'ls_one', txid: 'ab'.repeat(32), outputIndex: -1 },
+        { service: '__proto__', txid: 'ab'.repeat(32), outputIndex: 2 },
+        { service: 'missing', txid: 'ab'.repeat(32), outputIndex: 2 }
+      ]) {
+        expect(
+          (await invokeCapturedRoute(postSpy, '/admin/evictOutpoint', { body })).status
+        ).toHaveBeenCalledWith(400)
+      }
       consoleError.mockRestore()
     })
 

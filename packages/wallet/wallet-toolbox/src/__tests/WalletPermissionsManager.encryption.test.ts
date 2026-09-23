@@ -120,7 +120,7 @@ describe('WalletPermissionsManager - Metadata Encryption & Decryption', () => {
           description: actionDescription,
           inputs: [
             {
-              outpoint: '0231.0',
+              outpoint: `${'11'.repeat(32)}.0`,
               unlockingScriptLength: 73,
               inputDescription: inputDesc
             }
@@ -218,7 +218,7 @@ describe('WalletPermissionsManager - Metadata Encryption & Decryption', () => {
           description: actionDescription,
           inputs: [
             {
-              outpoint: '9876.0',
+              outpoint: `${'22'.repeat(32)}.0`,
               unlockingScriptLength: 73,
               inputDescription: inputDesc
             }
@@ -266,10 +266,11 @@ describe('WalletPermissionsManager - Metadata Encryption & Decryption', () => {
       // This allows us to disable it on a wallet that had it in the past. The result is that when not encrypted,
       // the plaintext is returned if decryption fails. If it was encrypted from metadata encryption being enabled in
       // the past (even when not enabled now), we will still decrypt and see the correct plaintext rather than garbage.
-      // To simulate, we make decryption pass through.
-      underlying.decrypt.mockImplementation(x => x)
+      // Plaintext is not valid metadata ciphertext, so decryption fails and the
+      // compatibility fallback preserves each original value.
+      underlying.decrypt.mockRejectedValue(new Error('plaintext metadata'))
       const listResult = await (manager as any).listActions({}, 'nonadmin.com')
-      expect(underlying.decrypt).toHaveBeenCalledTimes(3)
+      expect(underlying.decrypt).toHaveBeenCalledTimes(4)
 
       // Confirm the returned data is the same as originally provided (plaintext)
       const [first] = listResult.actions

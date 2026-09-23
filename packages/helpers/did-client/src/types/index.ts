@@ -1,4 +1,4 @@
-import { Base64String } from '@bsv/sdk'
+import type { Base64String } from '@bsv/sdk/wallet/Wallet.interfaces'
 
 export interface DIDRecord {
   txid: string

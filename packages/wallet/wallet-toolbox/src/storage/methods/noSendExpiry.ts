@@ -1,4 +1,6 @@
-import { Beef, Transaction, TransactionSignature, Utils, Validation } from '@bsv/sdk'
+import { type ValidCreateActionArgs, validateCreateActionArgs } from '@bsv/sdk/wallet/validationHelpers'
+import { Beef, Transaction, TransactionSignature } from '@bsv/sdk'
+import { toArray, toBase64, toHex } from '@bsv/sdk/primitives/utils'
 import {
   AuthId,
   StorageActivateNoSendExpiryArgs,
@@ -24,7 +26,7 @@ const CONSERVATIVE_RECLAIM_SATS_PER_KB = 1000
 const MAX_RECLAIM_RAW_TX_BYTES = 1000
 
 export function validateNoSendExpiryRequest(
-  args: Validation.ValidCreateActionArgs
+  args: ValidCreateActionArgs
 ): ReturnType<typeof parseBrc177NoSendExpiryLabels> {
   const expiry = parseBrc177NoSendExpiryLabels(args.labels)
   if (expiry == null) return undefined
@@ -53,7 +55,7 @@ export function makeNoSendExpiryFundingArgs(
   const attributionLabels = protectedLabels.filter(
     label => label.startsWith('admin originator ') || label.startsWith('admin month ')
   )
-  const args = Validation.validateCreateActionArgs({
+  const args = validateCreateActionArgs({
     description: 'BRC-177 expiry anchor funding',
     labels: [...new Set(['admin brc177 funding', ...attributionLabels])],
     options: {
@@ -116,7 +118,7 @@ function reclaimValues(
 async function estimateAnchorSatoshis(
   storage: StorageProvider,
   userId: number,
-  target: Validation.ValidCreateActionArgs
+  target: ValidCreateActionArgs
 ): Promise<number> {
   const { xinputs } = await validateRequiredInputs(storage, userId, target)
   const xoutputs = validateRequiredOutputs(storage, userId, target)
@@ -136,7 +138,7 @@ async function estimateAnchorSatoshis(
 export async function prepareNoSendExpiry(
   storage: StorageProvider,
   auth: AuthId,
-  target: Validation.ValidCreateActionArgs
+  target: ValidCreateActionArgs
 ): Promise<StoragePrepareNoSendExpiryResult> {
   const expiry = validateNoSendExpiryRequest(target)
   if (expiry == null) {
@@ -256,11 +258,11 @@ export async function activateNoSendExpiry(
 function validateDerivation(value: string, name: string): void {
   let bytes: number[]
   try {
-    bytes = Utils.toArray(value, 'base64')
+    bytes = toArray(value, 'base64')
   } catch {
     throw new WERR_INVALID_PARAMETER(name, 'a 16-byte base64 derivation')
   }
-  if (bytes.length !== 16 || Utils.toBase64(bytes) !== value) {
+  if (bytes.length !== 16 || toBase64(bytes) !== value) {
     throw new WERR_INVALID_PARAMETER(name, 'a canonical 16-byte base64 derivation')
   }
 }
@@ -275,7 +277,7 @@ function hasCanonicalAllP2pkhUnlock(reclaim: Transaction): boolean {
     return (
       signature.scope === (TransactionSignature.SIGHASH_ALL | TransactionSignature.SIGHASH_FORKID) &&
       signature.hasLowS() &&
-      Utils.toHex(signature.toChecksigFormat()) === Utils.toHex(checksig)
+      toHex(signature.toChecksigFormat()) === toHex(checksig)
     )
   } catch {
     return false
@@ -293,7 +295,7 @@ function parseCanonicalReclaim(args: StorageArmNoSendExpiryArgs): { reclaim: Tra
   } catch {
     throw new WERR_INVALID_PARAMETER('reclaimRawTx', 'a valid serialized reclaim transaction')
   }
-  if (Utils.toHex(reclaim.toUint8Array()) !== Utils.toHex(rawTx)) {
+  if (toHex(reclaim.toUint8Array()) !== toHex(rawTx)) {
     throw new WERR_INVALID_PARAMETER('reclaimRawTx', 'a canonical serialized reclaim transaction')
   }
   if (reclaim.id('hex') !== args.reclaimTxid) {

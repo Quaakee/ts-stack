@@ -1,4 +1,24 @@
 import {
+  type ValidAcquireIssuanceCertificateArgs,
+  type ValidCreateActionArgs,
+  type ValidWalletSignerArgs,
+  validateAbortActionArgs,
+  validateAcquireDirectCertificateArgs,
+  validateAcquireIssuanceCertificateArgs,
+  validateCreateActionArgs,
+  validateDiscoverByAttributesArgs,
+  validateDiscoverByIdentityKeyArgs,
+  validateInternalizeActionArgs,
+  validateListActionsArgs,
+  validateListCertificatesArgs,
+  validateListOutputsArgs as validateSDKListOutputsArgs,
+  validateOriginator,
+  validateProveCertificateArgs,
+  validateRelinquishCertificateArgs,
+  validateRelinquishOutputArgs,
+  validateSignActionArgs
+} from '@bsv/sdk/wallet/validationHelpers'
+import {
   AbortActionArgs,
   AbortActionResult,
   AcquireCertificateArgs,
@@ -47,11 +67,11 @@ import {
   SignActionResult,
   Transaction as BsvTransaction,
   TrustSelf,
-  Utils,
   VerifyHmacArgs,
   VerifyHmacResult,
   VerifySignatureArgs,
   VerifySignatureResult,
+  VerifiableCertificate,
   WalletDecryptArgs,
   WalletDecryptResult,
   WalletEncryptArgs,
@@ -63,23 +83,32 @@ import {
   MasterCertificate,
   Certificate,
   LookupResolver,
+  LookupAnswer,
   AtomicBEEF,
   BEEF,
   KeyDeriverApi,
-  Validation,
   WalletLoggerInterface,
   MakeWalletLogger,
   Telemetry,
-  TelemetryConfig
+  TelemetryConfig,
+  createPublicHTTPSFetch
 } from '@bsv/sdk'
 import type { SpendVerifierInterface } from '@bsv/sdk'
+import { fromBase58, toArray, toHex } from '@bsv/sdk/primitives/utils'
 import { acquireDirectCertificate } from './signer/methods/acquireDirectCertificate'
 import { proveCertificate } from './signer/methods/proveCertificate'
 import { createAction, CreateActionResultX } from './signer/methods/createAction'
 import { signAction, SignActionResultX } from './signer/methods/signAction'
 import { internalizeAction } from './signer/methods/internalizeAction'
 import { WalletSettingsManager } from './WalletSettingsManager'
-import { queryOverlay, transformVerifiableCertificatesWithTrust } from './utility/identityUtils'
+import {
+  filterCertificatesByAttributes,
+  filterCertificatesByIdentityKey,
+  IdentityEvidenceVerifier,
+  parseResults,
+  queryOverlayEvidence,
+  transformVerifiableCertificatesWithTrust
+} from './utility/identityUtils'
 import { maxPossibleSatoshis } from './storage/methods/generateChange'
 import { hasBrc177NoSendExpiryLabel, parseBrc177NoSendExpiryLabels } from './utility/brc177NoSendExpiry'
 import { createNoSendExpiryAction } from './signer/methods/createNoSendExpiryAction'
@@ -110,6 +139,11 @@ import { asArray } from './utility/utilityHelpers.noBuffer'
 import { getResultBeef } from './signer/methods/resultBeef'
 import type { ValidListOutputsArgs } from '@bsv/sdk/wallet/validationHelpers'
 import { ActionBatchController, ActionBatchMode } from './signer/actionBatch/ActionBatchWorkspace'
+import {
+  assertAbortResult,
+  assertInternalizeAccepted,
+  assertStorageMutationSucceeded
+} from './utility/walletResultGuards'
 
 function prepareKnownTxidsForCreateAction(wallet: Wallet, args: CreateActionArgs): void {
   if (!wallet.autoKnownTxids || args.options?.knownTxids != null) return
@@ -137,8 +171,18 @@ function prepareKnownTxidsForCreateAction(wallet: Wallet, args: CreateActionArgs
  */
 /**
  * Minimal interface the wallet uses to short-circuit identity discovery against the user's local
- * contacts before hitting the overlay. The result shape matches what `discoverByIdentityKey` /
- * `discoverByAttributes` return so callers don't have to special-case contact-sourced records.
+ * contacts before hitting the overlay. Installing a source is an explicit local trust-policy
+ * decision: its records are authoritative personal assertions, like a self-signed certificate or
+ * locally installed trust anchor. The authority is scoped to this user's saved identity-key
+ * association and local metadata; it is not an independent third-party certifier attestation or
+ * a transferable trust statement for another wallet.
+ *
+ * The result shape matches what `discoverByIdentityKey` / `discoverByAttributes` return so callers
+ * do not have to special-case contact-sourced records. Contact results are identifiable by their
+ * default `contact` type and empty certificate proof fields. Do not wire network responses or other
+ * unauthenticated third-party data directly into this interface. Authenticating the local store
+ * proves who saved the record, while the prior user/application validation supplies its identity
+ * authority.
  *
  * Implementations typically wrap `@bsv/sdk` `ContactsManager` or another on-device source. Reads
  * are expected to be very fast (single-digit ms against local SQLite is typical).
@@ -151,8 +195,10 @@ export interface ContactSource {
 }
 
 /**
- * What a {@link ContactSource} returns. Carries enough to synthesize a minimal trusted
- * `DiscoverCertificatesResult` without touching the overlay.
+ * What a {@link ContactSource} returns. Carries enough to synthesize a locally authoritative
+ * `DiscoverCertificatesResult` without touching the overlay. The authority comes from the user's
+ * independent decision to save or validate the contact, not from a third-party certificate.
+ * Consumers must preserve that distinction when rendering or exporting the result.
  */
 export interface ContactRecord {
   identityKey: PubKeyHex
@@ -160,7 +206,12 @@ export interface ContactRecord {
   type?: string
   /** Optional decrypted fields. Whatever the app stored when saving the contact. */
   decryptedFields?: Record<string, string>
-  /** Optional certifier metadata; missing trust defaults to `Infinity` (contacts override overlay trust). */
+  /**
+   * Optional local trust metadata. Missing trust defaults to `Infinity`, meaning the user's contact
+   * assertion overrides third-party overlay thresholds by explicit local policy. It does not mean
+   * that an external certifier supplied or cryptographically verified the record. Infinity is
+   * scoped to the local policy decision; it must not be serialized as a universal trust claim.
+   */
   certifierInfo?: {
     name?: string
     iconUrl?: string
@@ -172,8 +223,9 @@ export interface ContactRecord {
 /**
  * Build a {@link DiscoverCertificatesResult} from contact records so {@link Wallet.discoverByIdentityKey}
  * and {@link Wallet.discoverByAttributes} can short-circuit on a local contacts hit. The synthetic
- * certificate has `trust: Infinity` by default so downstream `transformVerifiableCertificatesWithTrust`
- * style filtering treats contacts as authoritative.
+ * result has `trust: Infinity` by default so downstream trust filtering honors the user's local
+ * assertion as authoritative. Its empty serial, signature, and revocation outpoint deliberately
+ * distinguish it from an independently certified third-party attestation.
  */
 function synthesizeContactResult(contacts: ContactRecord[]): DiscoverCertificatesResult {
   const certificates = contacts.map(c => ({
@@ -210,8 +262,12 @@ export interface WalletArgs {
   settingsManager?: WalletSettingsManager
   lookupResolver?: LookupResolver
   /**
-   * Optional contact source consulted before the overlay in `discoverByIdentityKey` /
-   * `discoverByAttributes`. When a contact matches, the overlay call is skipped entirely.
+   * Optional caller-installed, local contact source consulted before the overlay in
+   * `discoverByIdentityKey` / `discoverByAttributes`. A match is a user-authoritative personal
+   * assertion, not an external certifier attestation, and skips the overlay entirely. Only connect
+   * a locally authenticated/contact-management source whose records the user has independently
+   * chosen to trust. A contact-store signature or encryption authenticates local persistence; it
+   * does not replace that independent validation step.
    * Pass `forceRefresh: true` on the discover args to bypass both contacts and the overlay
    * cache.
    */
@@ -363,6 +419,10 @@ export class Wallet implements WalletInterface, ProtoWallet {
   }
 
   async destroy(): Promise<void> {
+    this._identityEvidenceClosed = true
+    this._identityEvidenceVerifier?.dispose()
+    this._overlayEvidenceCache.clear()
+    clearTimeout(this._overlayEvidenceExpiryTimer)
     await this.actionBatch.abort()
     await this.storage.destroy()
     if (this.privilegedKeyManager != null) this.privilegedKeyManager.destroyKey()
@@ -526,7 +586,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
     }
   }
 
-  private validateAuthAndArgs<A, T extends Validation.ValidWalletSignerArgs>(
+  private validateAuthAndArgs<A, T extends ValidWalletSignerArgs>(
     args: A,
     validate: (args: A, logger?: WalletLoggerInterface) => T,
     logger?: WalletLoggerInterface
@@ -567,8 +627,8 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: ListActionsArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<ListActionsResult> {
-    Validation.validateOriginator(originator)
-    const { vargs } = this.validateAuthAndArgs(args, Validation.validateListActionsArgs)
+    validateOriginator(originator)
+    const { vargs } = this.validateAuthAndArgs(args, validateListActionsArgs)
     const storageArgs = this.actionBatch.hasWorkspace ? { ...vargs, limit: 10000, offset: 0 } : vargs
     const r = this.actionBatch.overlayListActions(await this.storage.listActions(storageArgs), vargs)
     // Implement security policy to block customInstructions from output results.
@@ -590,7 +650,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: ListOutputsArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<ListOutputsResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     const { vargs } = this.validateAuthAndArgs(args, validateListOutputsArgs)
     if (this.autoKnownTxids && !vargs.knownTxids) {
       vargs.knownTxids = this.getKnownTxids()
@@ -611,8 +671,8 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: ListCertificatesArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<ListCertificatesResult> {
-    Validation.validateOriginator(originator)
-    const { vargs } = this.validateAuthAndArgs(args, Validation.validateListCertificatesArgs)
+    validateOriginator(originator)
+    const { vargs } = this.validateAuthAndArgs(args, validateListCertificatesArgs)
     const r = await this.storage.listCertificates(vargs)
     return r
   }
@@ -622,7 +682,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
   /// ///////////////
 
   private async acquireDirectCertificateProtocol(args: AcquireCertificateArgs): Promise<AcquireCertificateResult> {
-    const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateAcquireDirectCertificateArgs)
+    const { auth, vargs } = this.validateAuthAndArgs(args, validateAcquireDirectCertificateArgs)
     vargs.subject = (
       await this.getPublicKey({
         identityKey: true,
@@ -676,7 +736,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
 
   private validateIssuedCertificate(
     certificate: Certificate,
-    vargs: Validation.ValidAcquireIssuanceCertificateArgs,
+    vargs: ValidAcquireIssuanceCertificateArgs,
     expectedFields: Record<string, string>
   ): void {
     if (certificate.type !== vargs.type) {
@@ -695,15 +755,16 @@ export class Wallet implements WalletInterface, ProtoWallet {
   }
 
   private async acquireIssuedCertificateProtocol(args: AcquireCertificateArgs): Promise<AcquireCertificateResult> {
-    const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateAcquireIssuanceCertificateArgs)
+    const { auth, vargs } = this.validateAuthAndArgs(args, validateAcquireIssuanceCertificateArgs)
     const clientNonce = await createNonce(this, vargs.certifier)
-    const authClient = new AuthFetch(this)
+    const endpoint = new URL('signCertificate', `${vargs.certifierUrl}/`)
+    const authClient = new AuthFetch(this, undefined, undefined, undefined, {}, createPublicHTTPSFetch(endpoint.origin))
     const { certificateFields, masterKeyring } = await MasterCertificate.createCertificateFields(
       this,
       vargs.certifier,
       vargs.fields
     )
-    const response = await authClient.fetch(`${vargs.certifierUrl}/signCertificate`, {
+    const response = await authClient.fetch(endpoint.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -732,13 +793,13 @@ export class Wallet implements WalletInterface, ProtoWallet {
     )
     await verifyNonce(serverNonce, this, vargs.certifier)
     const { valid } = await this.verifyHmac({
-      hmac: Utils.toArray(signedCertificate.serialNumber, 'base64'),
-      data: Utils.toArray(clientNonce + serverNonce, 'base64'),
+      hmac: toArray(signedCertificate.serialNumber, 'base64'),
+      data: toArray(clientNonce + serverNonce, 'base64'),
       protocolID: [2, 'certificate issuance'],
       keyID: serverNonce + clientNonce,
       counterparty: vargs.certifier
     })
-    if (!valid) throw new Error('Invalid serialNumber')
+    if (valid !== true) throw new Error('Invalid serialNumber')
     this.validateIssuedCertificate(signedCertificate, vargs, certificateFields)
     if (!(await signedCertificate.verify())) throw new Error('Certificate verification failed')
     await MasterCertificate.decryptFields(this, masterKeyring, certificate.fields, vargs.certifier)
@@ -754,7 +815,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: AcquireCertificateArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<AcquireCertificateResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     if (args.acquisitionProtocol === 'direct') {
       return await this.acquireDirectCertificateProtocol(args)
     }
@@ -769,9 +830,10 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: RelinquishCertificateArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<RelinquishCertificateResult> {
-    Validation.validateOriginator(originator)
-    this.validateAuthAndArgs(args, Validation.validateRelinquishCertificateArgs)
-    await this.storage.relinquishCertificate(args)
+    validateOriginator(originator)
+    this.validateAuthAndArgs(args, validateRelinquishCertificateArgs)
+    const updated = await this.storage.relinquishCertificate(args)
+    assertStorageMutationSucceeded(updated, 'certificate relinquishment')
     return { relinquished: true }
   }
 
@@ -779,8 +841,8 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: ProveCertificateArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<ProveCertificateResult> {
-    Validation.validateOriginator(originator)
-    const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateProveCertificateArgs)
+    validateOriginator(originator)
+    const { auth, vargs } = this.validateAuthAndArgs(args, validateProveCertificateArgs)
     const r = await proveCertificate(this, auth, vargs)
     return r
   }
@@ -791,25 +853,119 @@ export class Wallet implements WalletInterface, ProtoWallet {
     trustSettings: Awaited<ReturnType<WalletSettingsManager['get']>>['trustSettings']
   }
 
-  /** 2-minute cache of queryOverlay() results keyed by normalized query */
-  private readonly _overlayCache: Map<string, { expiresAt: number; value: unknown }> = new Map()
+  /** Bounded two-minute untrusted receipts. Every use rechecks canonical evidence. */
+  private readonly _overlayEvidenceCache = new Map<string, { expiresAt: number; value: LookupAnswer; bytes: number }>()
+  private _overlayEvidenceExpiryTimer?: ReturnType<typeof setTimeout>
+  private _identityEvidenceVerifier?: IdentityEvidenceVerifier
+  private _identityEvidenceClosed = false
 
+  private pruneOverlayEvidence(): void {
+    for (const [key, value] of this._overlayEvidenceCache) {
+      if (value.expiresAt <= Date.now()) this._overlayEvidenceCache.delete(key)
+    }
+  }
+
+  private scheduleOverlayEvidenceExpiry(): void {
+    clearTimeout(this._overlayEvidenceExpiryTimer)
+    const expiresAt = Math.min(...[...this._overlayEvidenceCache.values()].map(value => value.expiresAt))
+    if (!Number.isFinite(expiresAt)) return
+    this._overlayEvidenceExpiryTimer = setTimeout(
+      () => {
+        this.pruneOverlayEvidence()
+        this.scheduleOverlayEvidenceExpiry()
+      },
+      Math.max(1, expiresAt - Date.now())
+    )
+    this._overlayEvidenceExpiryTimer.unref?.()
+  }
+
+  private async requireOverlayChainTracker(forceRefresh: boolean) {
+    if (this.services == null) {
+      if (forceRefresh) {
+        throw new WERR_INVALID_PARAMETER('services', 'valid in constructor arguments to be retreived here.')
+      }
+      return undefined
+    }
+    return await this.services.getChainTracker()
+  }
+
+  private async discoverOverlayCertificates(
+    query: unknown,
+    cacheKey: string,
+    forceRefresh: boolean,
+    now: number
+  ): Promise<VerifiableCertificate[]> {
+    const chainTracker = await this.requireOverlayChainTracker(forceRefresh)
+    if (chainTracker == null) return []
+    if (this._identityEvidenceClosed) return []
+    const chainNamespace = `wallet:${this.chain}`
+    if (
+      this._identityEvidenceVerifier?.chainTracker !== chainTracker ||
+      this._identityEvidenceVerifier.chainNamespace !== chainNamespace
+    ) {
+      this._identityEvidenceVerifier?.dispose()
+      this._identityEvidenceVerifier = new IdentityEvidenceVerifier(chainTracker, chainNamespace)
+    }
+    const verifier = this._identityEvidenceVerifier
+    this.pruneOverlayEvidence()
+    let cached = forceRefresh ? undefined : this._overlayEvidenceCache.get(cacheKey)
+    if (cached == null || cached.expiresAt <= now) {
+      const value = await queryOverlayEvidence(query, this.lookupResolver)
+      if (this._identityEvidenceClosed) return []
+      const bytes =
+        value.type === 'output-list'
+          ? value.outputs.reduce((total, output) => total + output.beef.length + (output.context?.length ?? 0), 0)
+          : 0
+      cached = { value, bytes, expiresAt: now + 2 * 60 * 1000 }
+      this._overlayEvidenceCache.delete(cacheKey)
+      let retained = [...this._overlayEvidenceCache.values()].reduce((total, entry) => total + entry.bytes, 0)
+      while (
+        this._overlayEvidenceCache.size > 0 &&
+        (this._overlayEvidenceCache.size >= 32 || retained + bytes > 16 * 1024 * 1024)
+      ) {
+        const oldest = this._overlayEvidenceCache.keys().next().value!
+        retained -= this._overlayEvidenceCache.get(oldest)!.bytes
+        this._overlayEvidenceCache.delete(oldest)
+      }
+      this._overlayEvidenceCache.set(cacheKey, cached)
+      this.scheduleOverlayEvidenceExpiry()
+    }
+    if (cached.value.type !== 'output-list') {
+      this._overlayEvidenceCache.delete(cacheKey)
+      return []
+    }
+    let certificates: VerifiableCertificate[]
+    try {
+      certificates = await parseResults(cached.value, chainTracker, verifier)
+    } catch (error) {
+      this._overlayEvidenceCache.delete(cacheKey)
+      throw error
+    }
+    // Failed evidence must allow another fetch, including after temporary chain unavailability.
+    if (certificates.length !== cached.value.outputs.length) this._overlayEvidenceCache.delete(cacheKey)
+    return certificates
+  }
+
+  /**
+   * Resolves an identity from a caller-installed local contact source first, then the certificate
+   * overlay. A local hit expresses the user's own authoritative trust decision and carries empty
+   * third-party certificate proof fields; use `forceRefresh` to bypass it and query the overlay.
+   */
   async discoverByIdentityKey(
     args: DiscoverByIdentityKeyArgs & { forceRefresh?: boolean },
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<DiscoverCertificatesResult> {
-    Validation.validateOriginator(originator)
-    this.validateAuthAndArgs(args, Validation.validateDiscoverByIdentityKeyArgs)
+    validateOriginator(originator)
+    const { vargs } = this.validateAuthAndArgs(args, validateDiscoverByIdentityKeyArgs)
 
-    const TTL_MS = 2 * 60 * 1000
     const now = Date.now()
     const forceRefresh = args.forceRefresh === true
 
-    // --- Contacts short-circuit (sub-10 ms typical, no network) ---
+    // Local contacts are explicit user trust anchors, not third-party certifier attestations.
     if (!forceRefresh && this.contactSource != null) {
       try {
-        const contact = await this.contactSource.findByIdentityKey(args.identityKey)
-        if (contact != null) {
+        const contact = await this.contactSource.findByIdentityKey(vargs.identityKey)
+        if (contact != null && contact.identityKey === vargs.identityKey && vargs.offset === 0) {
           return synthesizeContactResult([contact])
         }
       } catch {
@@ -817,105 +973,93 @@ export class Wallet implements WalletInterface, ProtoWallet {
       }
     }
 
-    // --- trustSettings cache (2 minutes) ---
-    let trustSettings =
-      this._trustSettingsCache != null && this._trustSettingsCache.expiresAt > now
-        ? this._trustSettingsCache.trustSettings
-        : undefined
-
-    if (trustSettings == null) {
-      const settings = await this.settingsManager.get()
-      trustSettings = settings.trustSettings
-      this._trustSettingsCache = { trustSettings, expiresAt: now + TTL_MS }
-    }
+    // Authorization policy is read fresh on every call. A removed certifier or
+    // raised threshold must take effect immediately rather than after a cache TTL.
+    const trustSettings = (await this.settingsManager.get()).trustSettings
 
     const certifiers = trustSettings.trustedCertifiers.map(c => c.identityKey).sort((a, b) => a.localeCompare(b))
 
-    // --- queryOverlay cache (2 minutes, client-side, bounded staleness) ---
+    // --- Untrusted overlay response cache; verify again before use. ---
     const cacheKey = JSON.stringify({
       fn: 'discoverByIdentityKey',
-      identityKey: args.identityKey,
-      certifiers
+      identityKey: vargs.identityKey,
+      certifiers,
+      limit: vargs.limit,
+      offset: vargs.offset
     })
 
-    let cached = forceRefresh ? undefined : this._overlayCache.get(cacheKey)
-    if (cached == null || cached.expiresAt <= now) {
-      const value = await queryOverlay({ identityKey: args.identityKey, certifiers }, this.lookupResolver)
-      cached = { value, expiresAt: now + TTL_MS }
-      this._overlayCache.set(cacheKey, cached)
-    }
-
-    if (!cached.value) {
-      return { totalCertificates: 0, certificates: [] }
-    }
-
-    return transformVerifiableCertificatesWithTrust(trustSettings, cached.value as any)
+    const certificates = await this.discoverOverlayCertificates(
+      { identityKey: args.identityKey, certifiers },
+      cacheKey,
+      forceRefresh,
+      now
+    )
+    return transformVerifiableCertificatesWithTrust(
+      trustSettings,
+      filterCertificatesByIdentityKey(certificates, vargs.identityKey)
+    )
   }
 
+  /**
+   * Resolves matching identities from a caller-installed local contact source first, then the
+   * certificate overlay. Local hits are authoritative personal assertions with empty third-party
+   * certificate proof fields; use `forceRefresh` to bypass them and query the overlay.
+   */
   async discoverByAttributes(
     args: DiscoverByAttributesArgs & { forceRefresh?: boolean },
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<DiscoverCertificatesResult> {
-    Validation.validateOriginator(originator)
-    this.validateAuthAndArgs(args, Validation.validateDiscoverByAttributesArgs)
+    validateOriginator(originator)
+    const { vargs } = this.validateAuthAndArgs(args, validateDiscoverByAttributesArgs)
 
-    const TTL_MS = 2 * 60 * 1000
     const now = Date.now()
     const forceRefresh = args.forceRefresh === true
 
-    // --- Contacts short-circuit (optional, only when source supports attribute search) ---
-    if (!forceRefresh && this.contactSource?.findByAttributes != null && args.attributes != null) {
+    // Local contacts are explicit user trust anchors, not third-party certifier attestations.
+    if (!forceRefresh && this.contactSource?.findByAttributes != null && vargs.attributes != null) {
       try {
-        const matches = await this.contactSource.findByAttributes(args.attributes as Record<string, string> | string[])
+        const matches = await this.contactSource.findByAttributes(vargs.attributes)
         if (Array.isArray(matches) && matches.length > 0) {
-          return synthesizeContactResult(matches)
+          return synthesizeContactResult(matches.slice(vargs.offset, vargs.offset + vargs.limit))
         }
       } catch {
         // Fall through to network path on contact-source failure.
       }
     }
 
-    // --- trustSettings cache (2 minutes) ---
-    let trustSettings =
-      this._trustSettingsCache != null && this._trustSettingsCache.expiresAt > now
-        ? this._trustSettingsCache.trustSettings
-        : undefined
-
-    if (trustSettings == null) {
-      const settings = await this.settingsManager.get()
-      trustSettings = settings.trustSettings
-      this._trustSettingsCache = { trustSettings, expiresAt: now + TTL_MS }
-    }
+    // Authorization policy is read fresh on every call. A removed certifier or
+    // raised threshold must take effect immediately rather than after a cache TTL.
+    const trustSettings = (await this.settingsManager.get()).trustSettings
 
     const certifiers = trustSettings.trustedCertifiers.map(c => c.identityKey).sort((a, b) => a.localeCompare(b))
 
     // Normalize attributes for a stable cache key.
     // If attributes is an object, sort its top-level keys; if it's an array, sort a shallow copy.
-    let attributesKey: unknown = args.attributes
-    if (args.attributes && typeof args.attributes === 'object') {
-      const keys = Object.keys(args.attributes as Record<string, unknown>).sort((a, b) => a.localeCompare(b))
-      attributesKey = JSON.stringify(args.attributes, keys)
+    let attributesKey: unknown = vargs.attributes
+    if (vargs.attributes != null && typeof vargs.attributes === 'object') {
+      const keys = Object.keys(vargs.attributes).sort((a, b) => a.localeCompare(b))
+      attributesKey = JSON.stringify(vargs.attributes, keys)
     }
 
-    // --- queryOverlay cache (2 minutes, client-side, bounded staleness) ---
+    // --- Untrusted overlay response cache; verify again before use. ---
     const cacheKey = JSON.stringify({
       fn: 'discoverByAttributes',
       attributes: attributesKey,
-      certifiers
+      certifiers,
+      limit: vargs.limit,
+      offset: vargs.offset
     })
 
-    let cached = forceRefresh ? undefined : this._overlayCache.get(cacheKey)
-    if (cached == null || cached.expiresAt <= now) {
-      const value = await queryOverlay({ attributes: args.attributes, certifiers }, this.lookupResolver)
-      cached = { value, expiresAt: now + TTL_MS }
-      this._overlayCache.set(cacheKey, cached)
-    }
-
-    if (!cached.value) {
-      return { totalCertificates: 0, certificates: [] }
-    }
-
-    return transformVerifiableCertificatesWithTrust(trustSettings, cached.value as any)
+    const certificates = await this.discoverOverlayCertificates(
+      { attributes: args.attributes, certifiers },
+      cacheKey,
+      forceRefresh,
+      now
+    )
+    return transformVerifiableCertificatesWithTrust(
+      trustSettings,
+      filterCertificatesByAttributes(certificates, vargs.attributes)
+    )
   }
 
   verifyReturnedTxidOnly(beef: Beef, knownTxids?: string[]): Beef {
@@ -936,7 +1080,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
 
   verifyReturnedTxidOnlyAtomicBEEF(beef: AtomicBEEF, knownTxids?: string[], parsedBeef?: Beef): AtomicBEEF {
     if (this.returnTxidOnly) return beef
-    const b = parsedBeef ?? Beef.fromBinary(beef)
+    const b = parsedBeef ?? Beef.fromBinaryStrict(beef)
     if (!b.atomicTxid) throw new WERR_INTERNAL()
     const hasUnknownTxidOnly = b.txs.some(btx => btx.isTxidOnly && !knownTxids?.includes(btx.txid))
     if (!hasUnknownTxidOnly) return beef
@@ -945,7 +1089,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
 
   verifyReturnedTxidOnlyBEEF(beef: BEEF): BEEF {
     if (this.returnTxidOnly) return beef
-    const b = Beef.fromBinary(beef)
+    const b = Beef.fromBinaryStrict(beef)
     return this.verifyReturnedTxidOnly(b).toBinary()
   }
 
@@ -981,13 +1125,13 @@ export class Wallet implements WalletInterface, ProtoWallet {
   ): Promise<CreateActionResult> {
     const logger = this.logMakeLogger('createAction', args)
     try {
-      Validation.validateOriginator(originator)
+      validateOriginator(originator)
 
       args.options ??= {}
       args.options.trustSelf ||= this.trustSelf
       prepareKnownTxidsForCreateAction(this, args)
 
-      const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateCreateActionArgs, logger)
+      const { auth, vargs } = this.validateAuthAndArgs(args, validateCreateActionArgs, logger)
       logger?.log('validated args')
 
       vargs.includeAllSourceTransactions = this.includeAllSourceTransactions
@@ -1054,9 +1198,9 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: SignActionArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<SignActionResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
 
-    const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateSignActionArgs)
+    const { auth, vargs } = this.validateAuthAndArgs(args, validateSignActionArgs)
     const prior = this.pendingSignActions[args.reference]
     if (!prior) {
       throw new WERR_NOT_IMPLEMENTED('recovery of out-of-session signAction reference data is not yet implemented.')
@@ -1077,15 +1221,12 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: InternalizeActionArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<InternalizeActionResult> {
-    Validation.validateOriginator(originator)
-    const { auth, vargs } = this.validateAuthAndArgs(args, Validation.validateInternalizeActionArgs)
+    validateOriginator(originator)
+    const { auth, vargs } = this.validateAuthAndArgs(args, validateInternalizeActionArgs)
 
     if (vargs.labels.includes(specOpThrowReviewActions)) throwDummyReviewActions()
     if (hasBrc177NoSendExpiryLabel(vargs.labels)) {
-      throw new WERR_INVALID_PARAMETER(
-        'labels',
-        'BRC-177 noSend expiry labels only on outgoing createAction requests'
-      )
+      throw new WERR_INVALID_PARAMETER('labels', 'BRC-177 noSend expiry labels only on outgoing createAction requests')
     }
 
     const r = await internalizeAction(this, auth, args)
@@ -1099,13 +1240,14 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: AbortActionArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<AbortActionResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
 
-    this.validateAuthAndArgs(args, Validation.validateAbortActionArgs)
+    this.validateAuthAndArgs(args, validateAbortActionArgs)
     if (this.actionBatch.ownsReference(args.reference)) {
       return { aborted: await this.actionBatch.abortAction(args.reference) }
     }
     const r = await this.storage.abortAction(args)
+    assertAbortResult(r)
     return r
   }
 
@@ -1113,14 +1255,15 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: RelinquishOutputArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<RelinquishOutputResult> {
-    Validation.validateOriginator(originator)
-    this.validateAuthAndArgs(args, Validation.validateRelinquishOutputArgs)
-    await this.storage.relinquishOutput(args)
+    validateOriginator(originator)
+    this.validateAuthAndArgs(args, validateRelinquishOutputArgs)
+    const updated = await this.storage.relinquishOutput(args)
+    assertStorageMutationSucceeded(updated, 'output relinquishment')
     return { relinquished: true }
   }
 
   async isAuthenticated(args: {}, originator?: OriginatorDomainNameStringUnder250Bytes): Promise<AuthenticatedResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     const r: { authenticated: true } = {
       authenticated: true
     }
@@ -1131,12 +1274,12 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: {},
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<AuthenticatedResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     return { authenticated: true }
   }
 
   async getHeight(args: {}, originator?: OriginatorDomainNameStringUnder250Bytes): Promise<GetHeightResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     const height = await this.getServices().getHeight()
     return { height }
   }
@@ -1145,18 +1288,18 @@ export class Wallet implements WalletInterface, ProtoWallet {
     args: GetHeaderArgs,
     originator?: OriginatorDomainNameStringUnder250Bytes
   ): Promise<GetHeaderResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     const serializedHeader = await this.getServices().getHeaderForHeight(args.height)
-    return { header: Utils.toHex(serializedHeader) }
+    return { header: toHex(serializedHeader) }
   }
 
   async getNetwork(args: {}, originator?: OriginatorDomainNameStringUnder250Bytes): Promise<GetNetworkResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     return { network: toWalletNetwork(this.chain) }
   }
 
   async getVersion(args: {}, originator?: OriginatorDomainNameStringUnder250Bytes): Promise<GetVersionResult> {
-    Validation.validateOriginator(originator)
+    validateOriginator(originator)
     return { version: 'wallet-brc100-1.0.0' }
   }
 
@@ -1317,7 +1460,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
    * @returns {ListActionsResult} start `listActions` result restricted to 'nosend' (or 'failed' if aborted) actions.
    */
   async listNoSendActions(args: ListActionsArgs, abort = false): Promise<ListActionsResult> {
-    const { vargs } = this.validateAuthAndArgs(args, Validation.validateListActionsArgs)
+    const { vargs } = this.validateAuthAndArgs(args, validateListActionsArgs)
     vargs.labels.push(specOpNoSendActions)
     if (abort) {
       await this.actionBatch.abort()
@@ -1333,7 +1476,7 @@ export class Wallet implements WalletInterface, ProtoWallet {
    * @returns {ListActionsResult} start `listActions` result restricted to 'failed' status actions.
    */
   async listFailedActions(args: ListActionsArgs, unfail = false): Promise<ListActionsResult> {
-    const { vargs } = this.validateAuthAndArgs(args, Validation.validateListActionsArgs)
+    const { vargs } = this.validateAuthAndArgs(args, validateListActionsArgs)
     vargs.labels.push(specOpFailedActions)
     if (unfail) vargs.labels.push('unfail')
     const r = await this.storage.listActions(vargs)
@@ -1353,7 +1496,7 @@ export interface PendingStorageInput {
 export interface PendingSignAction {
   reference: string
   dcr: StorageCreateActionResult
-  args: Validation.ValidCreateActionArgs
+  args: ValidCreateActionArgs
   tx: BsvTransaction
   amount: number
   pdi: PendingStorageInput[]
@@ -1378,6 +1521,7 @@ function throwIfAnyUnsuccessfulSignActions(r: SignActionResultX) {
 }
 
 function throwIfUnsuccessfulInternalizeAction(r: StorageInternalizeActionResult) {
+  assertInternalizeAccepted(r)
   const ndrs = r.notDelayedResults
   const swrs = r.sendWithResults
 
@@ -1392,11 +1536,9 @@ function throwIfUnsuccessfulInternalizeAction(r: StorageInternalizeActionResult)
 export function throwDummyReviewActions() {
   const b58Beef =
     'gno9MC7VXii1KoCkc2nsVyYJpqzN3dhBzYATETJcys62emMKfpBof4R7GozwYEaSapUtnNvqQ57aaYYjm3U2dv9eUJ1sV46boHkQgppYmAz9YH8FdZduV8aJayPViaKcyPmbDhEw6UW8TM5iFZLXNs7HBnJHUKCeTdNK4FUEL7vAugxAV9WUUZ43BZjJk2SmSeps9TCXjt1Ci9fKWp3d9QSoYvTpxwzyUFHjRKtbUgwq55ZfkBp5bV2Bpz9qSuKywKewW7Hh4S1nCUScwwzpKDozb3zic1V9p2k8rQxoPsRxjUJ8bjhNDdsN8d7KukFuc3n47fXzdWttvnxwsujLJRGnQbgJuknQqx3KLf5kJXHzwjG6TzigZk2t24qeB6d3hbYiaDr2fFkUJBL3tukTHhfNkQYRXuz3kucVDzvejHyqJaF51mXG8BjMN5aQj91ZJXCaPVqkMWCzmvyaqmXMdRiJdSAynhXbQK91xf6RwdNhz1tg5f9B6oJJMhsi9UYSVymmax8VLKD9AKzBCBDcfyD83m3jyS1VgKGZn3SkQmr6bsoWq88L3GsMnnmYUGogvdAYarTqg3pzkjCMxHzmJBMN6ofnUk8c1sRTXQue7BbyUaN5uZu3KW6CmFsEfpuqVvnqFW93TU1jrPP2S8yz8AexAnARPCKE8Yz7RfVaT6RCavwQKL3u5iookwRWEZXW1QWmM37yJWHD87SjVynyg327a1CLwcBxmE2CB48QeNVGyQki4CTQMqw2o8TMhDPJej1g68oniAjBcxBLSCs7KGvK3k7AfrHbCMULX9CTibYhCjdFjbsbBoocqJpxxcvkMo1fEEiAzZuiBVZQDYktDdTVbhKHvYkW25HcYX75NJrpNAhm7AjFeKLzEVxqAQkMfvTufpESNRZF4kQqg2Rg8h2ajcKTd5cpEPwXCrZLHm4EaZEmZVbg3QNfGhn7BJu1bHMtLqPD4y8eJxm2uGrW6saf6qKYmmu64F8A667NbD4yskPRQ1S863VzwGpxxmgLc1Ta3R46jEqsAoRDoZVUaCgBBZG3Yg1CTgi1EVBMXU7qvY4n3h8o2FLCEMWY4KadnV3iD4FbcdCmg4yxBosNAZgbPjhgGjCimjh4YsLd9zymGLmivmz2ZBg5m3xaiXT9NN81X9C1JUujd'
-  const beef = Beef.fromBinary(Utils.fromBase58(b58Beef))
+  const beef = Beef.fromBinaryStrict(fromBase58(b58Beef))
   const btx = beef.txs.at(-1)!
   const txid = btx.txid
-
-  console.log('Throwing dummy WERR_REVIEW_ACTIONS')
 
   throw new WERR_REVIEW_ACTIONS(
     [
@@ -1425,7 +1567,7 @@ export function throwDummyReviewActions() {
  * @returns
  */
 function validateListOutputsArgs(args: ListOutputsArgs): ValidListOutputsArgs {
-  const vargs = Validation.validateListOutputsArgs(args)
+  const vargs = validateSDKListOutputsArgs(args)
   const balancePrefix = 'balance '
   if (vargs.basket.startsWith(balancePrefix)) {
     vargs.basket = vargs.basket.slice(balancePrefix.length)

@@ -1,4 +1,10 @@
-import { normalizeBRC100WalletByteFields, stringifyBRC100, type WalletProtocol } from '@bsv/sdk'
+import { assertSafeWalletValue, validateWalletResult } from '@bsv/sdk/wallet/WalletResultValidation'
+import {
+  normalizeBRC100WalletByteFields,
+  stringifyBRC100
+} from '@bsv/sdk/wallet/BRC100ByteEncoding'
+import { validateWalletArgs } from '@bsv/sdk/wallet/WalletArgumentValidation'
+import type { WalletProtocol } from '@bsv/sdk/wallet/Wallet.interfaces'
 import type {
   WalletLike,
   PairingParams,
@@ -9,6 +15,17 @@ import type {
 } from '../types.js'
 import { encryptEnvelope, decryptEnvelope, type CryptoParams } from '../shared/crypto.js'
 import { verifyPairingSignature } from '../shared/pairingUri.js'
+import {
+  fetchBoundedJson,
+  normalizeRelayUrl,
+  parseRpcMessage,
+  parseWireEnvelope,
+  requireBoundedString,
+  requireProtocolId,
+  requirePublicKey,
+  validateSessionInfo
+} from '../shared/validation.js'
+import { WALLET_METHOD_NAMES } from '../types.js'
 
 export type PairingSessionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error'
 
@@ -43,6 +60,18 @@ export const DEFAULT_IMPLEMENTED_METHODS: ReadonlySet<WalletMethodName> = new Se
  */
 export const DEFAULT_AUTO_APPROVE_METHODS: ReadonlySet<WalletMethodName> =
   new Set<WalletMethodName>(['getPublicKey'])
+
+const MAX_DECLARED_METHODS = 100
+const MAX_ACTIVE_MOBILE_REQUESTS = 32
+
+function snapshotMethods(value: ReadonlySet<string>, context: string): ReadonlySet<string> {
+  const methods = Array.from(value)
+  if (methods.length > MAX_DECLARED_METHODS) {
+    throw new RangeError(`${context} may contain at most ${MAX_DECLARED_METHODS} methods`)
+  }
+  for (const method of methods) requireBoundedString(method, `${context} method`, 1, 100)
+  return new Set(methods)
+}
 
 /** Return a result or an error string — used for the onRequest handler. */
 export type RequestHandler = (method: string, params: unknown) => Promise<unknown>
@@ -114,7 +143,11 @@ export class WalletPairingSession {
   private requestHandler: RequestHandler | null = null
   private readonly implementedMethods: ReadonlySet<string>
   private readonly autoApproveMethods: ReadonlySet<string>
+  private readonly walletMeta: Record<string, unknown>
   private pairingVerified = false
+  private lifecycleEpoch = 0
+  private inboundTurn: Promise<void> = Promise.resolve()
+  private activeRequestCount = 0
 
   private readonly listeners: {
     connected: Array<() => void>
@@ -127,9 +160,21 @@ export class WalletPairingSession {
     private readonly params: PairingParams,
     private readonly options: WalletPairingSessionOptions = {}
   ) {
-    this.protocolID = JSON.parse(params.protocolID) as WalletProtocol
-    this.implementedMethods = options.implementedMethods ?? DEFAULT_IMPLEMENTED_METHODS
-    this.autoApproveMethods = options.autoApproveMethods ?? DEFAULT_AUTO_APPROVE_METHODS
+    this.protocolID = requireProtocolId(params.protocolID) as WalletProtocol
+    this.implementedMethods = snapshotMethods(
+      options.implementedMethods ?? DEFAULT_IMPLEMENTED_METHODS,
+      'implementedMethods'
+    )
+    this.autoApproveMethods = snapshotMethods(
+      options.autoApproveMethods ?? DEFAULT_AUTO_APPROVE_METHODS,
+      'autoApproveMethods'
+    )
+    for (const method of this.autoApproveMethods) {
+      if (!this.implementedMethods.has(method)) {
+        throw new TypeError('autoApproveMethods must be a subset of implementedMethods')
+      }
+    }
+    this.walletMeta = assertSafeWalletValue(options.walletMeta ?? {}, 'pairing wallet metadata')
   }
 
   get status(): PairingSessionStatus {
@@ -190,12 +235,18 @@ export class WalletPairingSession {
    */
   async resolveRelay(): Promise<string> {
     await this.verifyPairingBoundary()
-    const res = await fetch(`${this.params.origin}/api/session/${this.params.topic}`)
-    if (!res.ok) throw new Error(`Failed to resolve relay from origin: HTTP ${res.status}`)
-    const data = (await res.json()) as { relay?: string; status?: string }
-    if (!data.relay) throw new Error('Origin server did not return a relay URL')
-    this._resolvedRelay = data.relay
-    return data.relay
+    const target = new URL(`/api/session/${this.params.topic}`, this.params.origin).toString()
+    const { response, value } = await fetchBoundedJson(target, {}, 'pairing relay response')
+    if (!response.ok) {
+      throw new Error(`Failed to resolve relay from origin: HTTP ${response.status}`)
+    }
+    const data = validateSessionInfo(value, {
+      expectedId: this.params.topic,
+      canonicalId: false
+    })
+    if (data.relay === undefined) throw new Error('Origin server did not return a relay URL')
+    this._resolvedRelay = normalizeRelayUrl(data.relay)
+    return this._resolvedRelay
   }
 
   /** Enforces the signed HTTPS pairing boundary before making any network request. */
@@ -247,16 +298,33 @@ export class WalletPairingSession {
 
   /** Close the WebSocket connection. */
   disconnect(): void {
-    this.ws?.close()
+    this.lifecycleEpoch += 1
+    const ws = this.ws
     this.ws = null
+    this.connected = false
+    if (this._status !== 'idle') this._status = 'disconnected'
+    ws?.close()
   }
 
   private async openConnection(initialSeq: number): Promise<void> {
+    if (!Number.isSafeInteger(initialSeq) || initialSeq < 0) {
+      throw new TypeError('lastSeq must be a non-negative safe integer')
+    }
+    const epoch = ++this.lifecycleEpoch
+    const previous = this.ws
+    this.ws = null
+    previous?.close()
     this._status = 'connecting'
     this.connected = false
     this._lastSeq = initialSeq
+    this.inboundTurn = Promise.resolve()
 
-    const { publicKey } = await this.wallet.getPublicKey({ identityKey: true })
+    const publicKeyResult = await this.wallet.getPublicKey({ identityKey: true })
+    if (epoch !== this.lifecycleEpoch) throw new Error('Connection attempt was cancelled')
+    const ownedPublicKeyResult = validateWalletResult('getPublicKey', publicKeyResult, {
+      identityKey: true
+    })
+    const publicKey = requirePublicKey(ownedPublicKeyResult.publicKey, 'mobile wallet identity key')
     this.mobileIdentityKey = publicKey
 
     const { topic, backendIdentityKey } = this.params
@@ -266,87 +334,55 @@ export class WalletPairingSession {
       counterparty: backendIdentityKey
     }
 
-    const ws = new WebSocket(`${this._resolvedRelay}/ws?topic=${topic}&role=mobile`)
+    const relayUrl = new URL(normalizeRelayUrl(this._resolvedRelay))
+    relayUrl.pathname = `${relayUrl.pathname.replace(/\/$/u, '')}/ws`
+    relayUrl.searchParams.set('topic', topic)
+    relayUrl.searchParams.set('role', 'mobile')
+    const ws = new WebSocket(relayUrl.toString())
     this.ws = ws
 
     ws.onopen = async () => {
       try {
+        if (epoch !== this.lifecycleEpoch || this.ws !== ws) return
         const payload = stringifyBRC100({
           id: crypto.randomUUID(),
           seq: this._lastSeq + 1,
           method: 'pairing_approved',
           params: {
             mobileIdentityKey: publicKey,
-            walletMeta: this.options.walletMeta ?? {},
+            walletMeta: this.walletMeta,
             permissions: Array.from(this.implementedMethods)
           }
         })
         const ciphertext = await encryptEnvelope(this.wallet, cryptoParams, payload)
+        if (epoch !== this.lifecycleEpoch || this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+          return
+        }
         const envelope: WireEnvelope = { topic, mobileIdentityKey: publicKey, ciphertext }
         ws.send(stringifyBRC100(envelope))
       } catch (err) {
-        this.emitError(err instanceof Error ? err.message : 'Failed to send pairing message')
+        if (epoch === this.lifecycleEpoch && this.ws === ws) {
+          this.emitError(err instanceof Error ? err.message : 'Failed to send pairing message')
+        }
       }
     }
 
-    ws.onmessage = async (event: MessageEvent) => {
-      try {
-        const envelope = JSON.parse(event.data as string) as WireEnvelope
-        if (!envelope.ciphertext) return
-
-        let plaintext: string
-        try {
-          plaintext = await decryptEnvelope(this.wallet, cryptoParams, envelope.ciphertext)
-        } catch (err) {
-          console.warn('[WalletPairingSession] decryptEnvelope failed:', err)
-          return // tampered or wrong key — drop
-        }
-
-        const msg = JSON.parse(plaintext) as RpcRequest | RpcResponse
-
-        // M4: Replay protection — drop anything not strictly greater than last seq
-        if (typeof msg.seq !== 'number' || msg.seq <= this._lastSeq) {
-          console.warn(
-            '[WalletPairingSession] dropping message: seq',
-            msg.seq,
-            '<= lastSeq',
-            this._lastSeq
-          )
-          return
-        }
-        this._lastSeq = msg.seq
-
-        // Any successfully decrypted message confirms the session is live.
-        // This handles both the pairing_ack path and any race where ack is missed
-        // but an RPC request arrives first.
-        if (!this.connected) {
-          this.connected = true
-          this._status = 'connected'
-          this.listeners.connected.forEach(h => h())
-        }
-
-        // pairing_ack — just a confirmation, no further processing
-        if ('method' in msg && msg.method === 'pairing_ack') return
-
-        // Inbound RPC request
-        if ('method' in msg && msg.id) {
-          await this.handleRpc(msg)
-        }
-      } catch {
-        // silently drop malformed messages
-      }
+    ws.onmessage = (event: MessageEvent) => {
+      if (epoch !== this.lifecycleEpoch || this.ws !== ws) return
+      this.inboundTurn = this.inboundTurn.then(async () => {
+        if (epoch !== this.lifecycleEpoch || this.ws !== ws) return
+        await this.handleInboundMessage(event, ws, cryptoParams, topic)
+      })
     }
 
     ws.onerror = () => {
+      if (epoch !== this.lifecycleEpoch || this.ws !== ws) return
       this.emitError('WebSocket connection failed')
     }
 
     ws.onclose = () => {
-      // disconnect() nulls this.ws before calling ws.close() — if null here,
-      // the close was intentional; skip all state changes.
-      if (this.ws === null) return
-      // Reconnect race: a newer connection already replaced this ws.
-      if (this.ws !== ws) return
+      // disconnect() and a newer connection both invalidate this epoch.
+      if (epoch !== this.lifecycleEpoch || this.ws !== ws) return
 
       this.ws = null // clear stale ref
       if (this.connected) {
@@ -358,6 +394,61 @@ export class WalletPairingSession {
     }
   }
 
+  private async handleInboundMessage(
+    event: MessageEvent,
+    ws: WebSocket,
+    cryptoParams: CryptoParams,
+    topic: string
+  ): Promise<void> {
+    try {
+      if (typeof event.data !== 'string') return
+      const envelope = parseWireEnvelope(JSON.parse(event.data), topic)
+
+      let plaintext: string
+      try {
+        plaintext = await decryptEnvelope(this.wallet, cryptoParams, envelope.ciphertext)
+      } catch (err) {
+        console.warn('[WalletPairingSession] decryptEnvelope failed:', err)
+        return // tampered or wrong key — drop
+      }
+
+      const msg = parseRpcMessage(JSON.parse(plaintext))
+
+      // M4: Replay protection — drop anything not strictly greater than last seq
+      if (msg.seq <= this._lastSeq) {
+        console.warn(
+          '[WalletPairingSession] dropping message: seq',
+          msg.seq,
+          '<= lastSeq',
+          this._lastSeq
+        )
+        return
+      }
+      this._lastSeq = msg.seq
+
+      // Any successfully decrypted message confirms the session is live.
+      // This handles both the pairing_ack path and any race where ack is missed
+      // but an RPC request arrives first.
+      if (!this.connected) {
+        this.connected = true
+        this._status = 'connected'
+        this.listeners.connected.forEach(h => h())
+      }
+
+      // pairing_ack — just a confirmation, no further processing
+      if ('method' in msg && msg.method === 'pairing_ack') return
+
+      // Inbound RPC request
+      if ('method' in msg && msg.id) {
+        void this.handleRpc(msg, ws).catch(err => {
+          this.emitError(err instanceof Error ? err.message : 'Failed to handle wallet request')
+        })
+      }
+    } catch {
+      // silently drop malformed messages
+    }
+  }
+
   // ── Private ──────────────────────────────────────────────────────────────────
 
   private emitError(msg: string): void {
@@ -365,9 +456,8 @@ export class WalletPairingSession {
     this.listeners.error.forEach(h => h(msg))
   }
 
-  private async handleRpc(request: RpcRequest): Promise<void> {
+  private async handleRpc(request: RpcRequest, ws: WebSocket): Promise<void> {
     const { topic, backendIdentityKey } = this.params
-    normalizeBRC100WalletByteFields(request.params)
     const cryptoParams: CryptoParams = {
       protocolID: this.protocolID,
       keyID: topic,
@@ -376,7 +466,25 @@ export class WalletPairingSession {
 
     const sendResponse = async (response: RpcResponse): Promise<void> => {
       const ciphertext = await encryptEnvelope(this.wallet, cryptoParams, stringifyBRC100(response))
-      this.ws?.send(stringifyBRC100({ topic, ciphertext } satisfies WireEnvelope))
+      if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(stringifyBRC100({ topic, ciphertext } satisfies WireEnvelope))
+      }
+    }
+
+    let requestParams: unknown
+    try {
+      normalizeBRC100WalletByteFields(request.params)
+      requestParams = assertSafeWalletValue(request.params, 'wallet relay request parameters')
+      if ((WALLET_METHOD_NAMES as readonly string[]).includes(request.method)) {
+        validateWalletArgs(request.method as WalletMethodName, requestParams)
+      }
+    } catch {
+      await sendResponse({
+        id: request.id,
+        seq: request.seq,
+        error: { code: 400, message: 'Invalid wallet request' }
+      })
+      return
     }
 
     // Unknown method — reject immediately without showing approval UI
@@ -389,48 +497,74 @@ export class WalletPairingSession {
       return
     }
 
-    // Approval gate
-    const needsApproval = !this.autoApproveMethods.has(request.method)
-    if (needsApproval) {
-      const approvalHandler = this.options.onApprovalRequired
-      if (!approvalHandler) {
-        await sendResponse({
-          id: request.id,
-          seq: request.seq,
-          error: { code: 4001, message: 'Approval required but no approval handler is configured' }
-        })
-        return
-      }
-      const approved = await approvalHandler(request.method, request.params)
-      if (!approved) {
-        await sendResponse({
-          id: request.id,
-          seq: request.seq,
-          error: { code: 4001, message: 'User rejected' }
-        })
-        return
-      }
-    }
-
-    // Dispatch to handler
-    if (!this.requestHandler) {
-      await sendResponse({
-        id: request.id,
-        seq: request.seq,
-        error: { code: 501, message: 'No request handler registered' }
-      })
+    if (this.activeRequestCount >= MAX_ACTIVE_MOBILE_REQUESTS) {
+      ws.close(1013, 'Too many active wallet requests')
       return
     }
+    this.activeRequestCount += 1
 
     try {
-      const result = await this.requestHandler(request.method, request.params)
-      await sendResponse({ id: request.id, seq: request.seq, result })
-    } catch (err) {
-      await sendResponse({
-        id: request.id,
-        seq: request.seq,
-        error: { code: 500, message: err instanceof Error ? err.message : 'Handler error' }
-      })
+      // Approval gate
+      const needsApproval = !this.autoApproveMethods.has(request.method)
+      if (needsApproval) {
+        const approvalHandler = this.options.onApprovalRequired
+        if (!approvalHandler) {
+          await sendResponse({
+            id: request.id,
+            seq: request.seq,
+            error: {
+              code: 4001,
+              message: 'Approval required but no approval handler is configured'
+            }
+          })
+          return
+        }
+        const approved = await approvalHandler(
+          request.method,
+          assertSafeWalletValue(requestParams, 'wallet relay approval parameters')
+        )
+        if (approved !== true) {
+          await sendResponse({
+            id: request.id,
+            seq: request.seq,
+            error: { code: 4001, message: 'User rejected' }
+          })
+          return
+        }
+      }
+
+      // Dispatch to handler
+      if (!this.requestHandler) {
+        await sendResponse({
+          id: request.id,
+          seq: request.seq,
+          error: { code: 501, message: 'No request handler registered' }
+        })
+        return
+      }
+
+      try {
+        const result = await this.requestHandler(
+          request.method,
+          assertSafeWalletValue(requestParams, 'wallet relay handler parameters')
+        )
+        const ownedResult = (WALLET_METHOD_NAMES as readonly string[]).includes(request.method)
+          ? validateWalletResult(
+              request.method as (typeof WALLET_METHOD_NAMES)[number],
+              result,
+              requestParams
+            )
+          : assertSafeWalletValue(result, 'wallet relay custom RPC result')
+        await sendResponse({ id: request.id, seq: request.seq, result: ownedResult })
+      } catch (err) {
+        await sendResponse({
+          id: request.id,
+          seq: request.seq,
+          error: { code: 500, message: err instanceof Error ? err.message : 'Handler error' }
+        })
+      }
+    } finally {
+      this.activeRequestCount -= 1
     }
   }
 }

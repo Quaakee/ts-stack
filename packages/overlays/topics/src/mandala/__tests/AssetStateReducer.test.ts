@@ -1,12 +1,16 @@
 import { defaultAssetState, foldAction, AssetAdminState } from '../AssetStateReducer.js'
 import { MandalaActionDetails } from '@bsv/templates'
 
-const S = (over: Partial<AssetAdminState> = {}): AssetAdminState => ({ ...defaultAssetState('x.0'), ...over })
-const d = (o: Partial<MandalaActionDetails>): MandalaActionDetails => ({ kind: 'pause', assetId: 'x.0', ...o } as MandalaActionDetails)
+const S = (over: Partial<AssetAdminState> = {}): AssetAdminState => ({
+  ...defaultAssetState('x.0'),
+  ...over
+})
+const d = (o: Partial<MandalaActionDetails>): MandalaActionDetails =>
+  ({ kind: 'pause', assetId: 'x.0', ...o }) as MandalaActionDetails
 
 describe('foldAction', () => {
   it('register sets issuerIdentityKey from ctx', () => {
-    const s = foldAction(S(), d({ kind: 'register' }), { issuer: '02issuer' })
+    const s = foldAction(S(), d({ kind: 'register' }), { issuer: '02ISSUER' })
     expect(s.issuerIdentityKey).toBe('02issuer')
   })
   it('pause/unpause toggle isPaused', () => {
@@ -14,10 +18,10 @@ describe('foldAction', () => {
     expect(foldAction(S({ isPaused: true }), d({ kind: 'unpause' })).isPaused).toBe(false)
   })
   it('block/unblock identity is idempotent on the denylist', () => {
-    let s = foldAction(S(), d({ kind: 'blockIdentity', identityKey: '02aa' }))
+    let s = foldAction(S(), d({ kind: 'blockIdentity', identityKey: '02AA' }))
     s = foldAction(s, d({ kind: 'blockIdentity', identityKey: '02aa' })) // dup
     expect(s.blockedIdentities).toEqual(['02aa'])
-    s = foldAction(s, d({ kind: 'unblockIdentity', identityKey: '02aa' }))
+    s = foldAction(s, d({ kind: 'unblockIdentity', identityKey: '02AA' }))
     expect(s.blockedIdentities).toEqual([])
   })
   it('allow/unallow identity targets the allowlist only', () => {
@@ -26,17 +30,25 @@ describe('foldAction', () => {
     expect(s.blockedIdentities).toEqual([])
   })
   it('setAccessMode switches mode', () => {
-    expect(foldAction(S(), d({ kind: 'setAccessMode', mode: 'allowlist' })).accessMode).toBe('allowlist')
+    expect(foldAction(S(), d({ kind: 'setAccessMode', mode: 'allowlist' })).accessMode).toBe(
+      'allowlist'
+    )
   })
   it('freezeOutput records {outpoint, amount, owner} from ctx; unfreeze removes by outpoint', () => {
-    let s = foldAction(S(), d({ kind: 'freezeOutput', outpoint: 'tt.2' }), { frozenAmount: 30, frozenOwner: '02own' })
+    let s = foldAction(S(), d({ kind: 'freezeOutput', outpoint: 'TT.2' }), {
+      frozenAmount: 30,
+      frozenOwner: '02OWN'
+    })
     expect(s.frozenOutpoints).toEqual([{ outpoint: 'tt.2', amount: 30, owner: '02own' }])
-    s = foldAction(s, d({ kind: 'unfreezeOutput', outpoint: 'tt.2' }))
+    s = foldAction(s, d({ kind: 'unfreezeOutput', outpoint: 'TT.2' }))
     expect(s.frozenOutpoints).toEqual([])
   })
   it('reissue moves outpoint from frozen to evicted', () => {
-    const frozen = S({ frozenOutpoints: [{ outpoint: 'tt.2', amount: 30, owner: '02own' }] })
-    const s = foldAction(frozen, d({ kind: 'reissue', outpoint: 'tt.2', amount: 30, recipient: '02new' }))
+    const frozen = S({ frozenOutpoints: [{ outpoint: 'TT.2', amount: 30, owner: '02OWN' }] })
+    const s = foldAction(
+      frozen,
+      d({ kind: 'reissue', outpoint: 'tt.2', amount: 30, recipient: '02new' })
+    )
     expect(s.frozenOutpoints).toEqual([])
     expect(s.evictedOutpoints).toEqual(['tt.2'])
   })

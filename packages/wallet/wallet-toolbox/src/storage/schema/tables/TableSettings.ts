@@ -1,4 +1,4 @@
-import * as sdk from '../../../sdk'
+import type * as sdk from '../../../sdk'
 
 export interface TableSettings extends sdk.StorageIdentity, sdk.EntityTimeStamp {
   created_at: Date

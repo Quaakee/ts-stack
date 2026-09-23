@@ -257,7 +257,7 @@ describe('WalletPermissionsManager - Permission Module Support', () => {
       [{ outputs: [] }, 'at least one output'],
       [{ options: { noSend: false } }, 'require noSend'],
       [{ options: { noSend: true, sendWith: ['01'.repeat(32)] } }, 'cannot use sendWith'],
-      [{ options: { noSend: true, noSendChange: [{ txid: '02'.repeat(32), vout: 0 }] } }, 'cannot supply noSendChange'],
+      [{ options: { noSend: true, noSendChange: [`${'02'.repeat(32)}.0`] } }, 'cannot supply noSendChange'],
       [{ options: { noSend: true, returnTXIDOnly: true } }, 'cannot use returnTXIDOnly']
     ])('rejects malformed BRC-177 action shape %# before requesting permissions', async (override, message) => {
       const manager = new WalletPermissionsManager(underlying, 'customToken.domain.com')
@@ -294,9 +294,9 @@ describe('WalletPermissionsManager - Permission Module Support', () => {
     })
 
     it.each([
-      ['not-a-number', 'valid satoshi amounts'],
-      [-1, 'valid satoshi amounts'],
-      [1.5, 'valid satoshi amounts']
+      ['not-a-number', 'valid number of satoshis'],
+      [-1, 'valid number of satoshis'],
+      [1.5, 'valid number of satoshis']
     ])('rejects an invalid BRC-177 output amount %p before spending authorization', async (satoshis, message) => {
       const manager = new WalletPermissionsManager(underlying, 'customToken.domain.com')
       jest.spyOn(manager, 'ensureLabelAccess').mockResolvedValueOnce(true)
@@ -327,10 +327,11 @@ describe('WalletPermissionsManager - Permission Module Support', () => {
           {
             description: 'Overflowing BRC-177 protected amount',
             labels: ['p nosend expiry seconds 30'],
-            outputs: [
-              { lockingScript: '51', satoshis: Number.MAX_SAFE_INTEGER, outputDescription: 'first' },
-              { lockingScript: '51', satoshis: 1, outputDescription: 'second' }
-            ],
+            outputs: Array.from({ length: 5 }, (_unused, index) => ({
+              lockingScript: '51',
+              satoshis: 21e14,
+              outputDescription: `overflow output ${index}`
+            })),
             options: { noSend: true }
           },
           'app.com'
@@ -386,6 +387,33 @@ describe('WalletPermissionsManager - Permission Module Support', () => {
       expect(spending.mock.calls[1][0]).toMatchObject({
         satoshis: 1000,
         allowRecentGrant: false
+      })
+    })
+
+    it('excludes a sendMax sentinel output from the BRC-177 prefunding estimate', async () => {
+      const manager = new WalletPermissionsManager(underlying, 'customToken.domain.com', {
+        seekBasketInsertionPermissions: false
+      })
+      jest.spyOn(manager, 'ensureLabelAccess').mockResolvedValue(true)
+      const spending = jest.spyOn(manager, 'ensureSpendingAuthorization').mockResolvedValue(true)
+      underlying.createAction.mockImplementationOnce(async () => ({ txid: 'abc123', tx: [] }))
+
+      await manager.createAction(
+        {
+          description: 'BRC-177 protected sendMax action',
+          labels: ['p nosend expiry seconds 30'],
+          outputs: [
+            { lockingScript: 'abcd', satoshis: 2099999999999999, outputDescription: 'sweep output' },
+            { lockingScript: 'beef', satoshis: 500, outputDescription: 'fixed output' }
+          ],
+          options: { noSend: true }
+        },
+        'app.com'
+      )
+
+      expect(spending.mock.calls[0][0]).toMatchObject({
+        satoshis: 500,
+        reason: 'BRC-177 protected action prefunding'
       })
     })
 

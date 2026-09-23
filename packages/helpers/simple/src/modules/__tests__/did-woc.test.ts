@@ -1,14 +1,15 @@
 import { processWocSegments, type WocChainState } from '../did-woc'
+import { DID } from '../did'
 
-const document = {
-  '@context': 'https://www.w3.org/ns/did/v1',
-  id: 'did:bsv:example',
-  verificationMethod: [],
-  authentication: []
-}
+const TXID = 'a'.repeat(64)
+const DID_STRING = `did:bsv:${TXID}`
+const PUBKEY = '030dbed53c3613c887ad36e8bde365c2e58f6196735a589cd09d6bc316fa550df4'
+const document = DID.buildDocument(TXID, PUBKEY)
 
 function chainState(): WocChainState {
   return {
+    did: DID_STRING,
+    identityCode: undefined,
     lastDocument: null,
     lastDocTxid: undefined,
     created: '2026-07-28T00:00:00.000Z',
@@ -48,12 +49,40 @@ describe('DID WhatsOnChain transitions', () => {
       lastDocTxid: 'document',
       created: '2026-07-28T00:00:00.000Z',
       updated: '2025-07-28T00:00:00.000Z',
-      foundIssuance: true
+      foundIssuance: true,
+      did: DID_STRING,
+      identityCode: 'identity'
     })
+  })
+
+  it('rejects documents before issuance, from another identity chain, or for another DID', () => {
+    const state = chainState()
+    processWocSegments(['BSVDID', 'identity', JSON.stringify(document)], {}, 'pre-issuance', state)
+    expect(state.lastDocument).toBeNull()
+
+    processWocSegments(['BSVDID', 'identity', '1'], {}, TXID, state)
+    processWocSegments(
+      ['BSVDID', 'other-identity', JSON.stringify(document)],
+      {},
+      'wrong-chain',
+      state
+    )
+    expect(state.lastDocument).toBeNull()
+
+    const foreign = DID.buildDocument('b'.repeat(64), PUBKEY)
+    processWocSegments(
+      ['BSVDID', 'identity', JSON.stringify(foreign)],
+      {},
+      'foreign-document',
+      state
+    )
+    expect(state.lastDocument).toBeNull()
   })
 
   it('returns the last document when the chain is deactivated', () => {
     const state = chainState()
+    state.foundIssuance = true
+    state.identityCode = 'identity'
     state.lastDocument = document
     state.updated = '2026-07-28T01:00:00.000Z'
 

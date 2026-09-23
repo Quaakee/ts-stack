@@ -2,9 +2,9 @@
 id: dependency-release-policy
 title: 'Dependency and Release Policy'
 kind: reference
-version: '1.3.1'
-last_updated: '2026-09-15'
-last_verified: '2026-09-15'
+version: '1.3.2'
+last_updated: '2026-09-23'
+last_verified: '2026-09-23'
 review_cadence_days: 30
 status: stable
 tags: [reference, dependencies, security, releases]
@@ -60,6 +60,23 @@ updates, so an old monthly PR cannot block immediate advisory remediation.
 Security updates are grouped only within a package-manager ecosystem and are
 never delayed into the monthly cross-ecosystem version update. First-party
 `@bsv/*` versions remain owned by the release graph.
+
+Standalone infrastructure uses npm `package-lock.json` files outside the pnpm
+workspace. Its Dependabot entry excludes only the unrelated ancestor
+`pnpm-lock.yaml` and `pnpm-workspace.yaml` support files, avoiding the updater's
+sub-workspace misclassification; the root entry continues to own both files.
+Use recursive filename globs (`**/pnpm-lock.yaml` and
+`**/pnpm-workspace.yaml`): GitHub rejects `..` in exclusion patterns and disables
+all configured update jobs when the configuration is invalid. The early
+dependency policy check rejects that failure before merge. Every infrastructure
+manifest and npm lockfile remains monitored. Remove this
+workaround when Dependabot respects standalone npm boundaries beneath a pnpm root.
+
+The Python code generator accepts uv >=0.11.32 so Dependabot can resolve its
+locked dependency graph with the uv version supplied by GitHub. The codegen
+workflow retains an explicit uv 0.11.32 pin, Python 3.12, `uv run --locked`, and
+byte-for-byte generated-output verification. A resolver proposal does not
+silently change the CI toolchain or authorize different generated types.
 
 Major changes that alter a runtime, compiler, or persisted-data contract are
 held from the routine monthly PR until their focused migration is ready:
@@ -119,16 +136,18 @@ must be a dependency or peer, and clean packed consumers must typecheck it.
 This keeps build-only advisory trees out of consumer installs without shipping
 unresolvable public declarations.
 
-The root workspace carries four narrow audited dependency overrides:
+The root workspace carries six narrow audited dependency overrides:
 
 - Jest 30.4.2 still constrains parts of its reporting and coverage graph to
   minimatch releases with older `brace-expansion` ranges. The follow-up
   GHSA-rgw5-rvv9-x895 requires `brace-expansion` 5.0.9, so the workspace
   substitutes 5.0.9 until every supported path resolves it natively.
-- Stryker 9.6.1's current `typed-rest-client@2.3.1` dependency pins vulnerable
-  `qs@6.15.1` exactly. A parent-scoped substitution selects 6.15.3 until
-  upstream accepts 6.15.2 or newer. This replaces a fragile lock-only
-  substitution that an unrelated graph refresh could silently undo.
+- Express/body-parser, Superagent, and Stryker's `typed-rest-client@2.3.1` can
+  retain vulnerable `qs` releases. A version-bounded substitution selects
+  6.16.0, the first release that also fixes the bracket/comma array-limit bypass
+  and attacker-controlled `isBuffer` denial-of-service advisories. This
+  replaces fragile lock-only selections that an unrelated graph refresh could
+  silently undo.
 - Vite's PostCSS graph can select `nanoid` releases below the current patched
   3.x boundary, so the workspace selects 3.3.18 until that graph resolves it
   natively.
@@ -136,6 +155,14 @@ The root workspace carries four narrow audited dependency overrides:
   consuming only its compatible `parse()` API. The workspace selects TOML
   4.2.0, which fixes both current high-severity parser advisories, until the
   docs plugin adopts the patched line directly.
+- Jest's Istanbul reporting chain and the standalone WAB server can still
+  select `js-yaml` 3.15.1. The workspace and WAB lock select the compatible
+  3.15.2 security release until those parent ranges advance naturally.
+- Metro 0.87 still declares vulnerable `image-size` 1.x. A parent-scoped
+  substitution selects 2.0.4, which retains Metro's CommonJS default-function
+  call shape while moving past the malformed HEIF/JXL and ICNS parser
+  advisories. The child-process regression plus Metro and Hermes mobile gates
+  verify the substitution.
 
 These substitutions are verified through their affected Jest, mutation,
 documentation, and build paths and have owners, evidence, review dates, and
@@ -149,16 +176,15 @@ changed, stale, unowned, or upstream-unlinked override. Elapsed review dates
 produce maintenance reminders in source CI and fail the separate weekly
 maintenance audit (`node scripts/repository-health.mjs --maintenance`).
 
-Wave 40 rechecked the prior 20 selectors against the frozen graphs, current
-upstream manifests, and the advisory audit. The 2026-09-04 security review
-retained those results within the monthly window and added the twenty-first
-selector after reproducing the new TOML advisories. The supported graphs still
+The 2026-09-16 review rechecked all 24 selectors against the frozen graphs,
+current upstream manifests, and the advisory audit. The supported graphs still
 select exact `gaxios@7.1.3`, admit `uuid@9`, and pin `qs@6.15.1` without their
 registered substitutions, while the current frontmatter plugin still requests
-TOML 3.x. New upstream majors can remove some legacy paths only through a
-coordinated Stryker or Google Cloud migration, so no selector can be removed
-safely in isolation. The method, result, count, and next rehearsal are enforced
-in `governance/dependency-release-policy.json`.
+TOML 3.x and Metro 0.87 still requests `image-size` 1.x. New upstream majors can
+remove some legacy paths only through a coordinated Stryker or Google Cloud
+migration. The Metro-scoped `image-size` substitution is independently verified
+through the mobile platform contract. The method, result, count, and next
+rehearsal are enforced in `governance/dependency-release-policy.json`.
 
 The independently locked OpenAPI generator also carries a narrow Redocly
 compatibility override. It is isolated from runtime packages, registered with
@@ -202,7 +228,7 @@ baseline is not silently presented as published; it remains visibly
 ## Advisory disposition
 
 The verified 2026-07-27 frozen root and infrastructure dependency graphs have
-no known audit findings after the registered compatibility substitutions. All
+no known vulnerable dependency issues after the registered compatibility substitutions. All
 other advisory paths were removed at their causes:
 
 - the unused message-box `webpack-dev-server` dependency and its vulnerable

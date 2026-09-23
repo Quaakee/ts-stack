@@ -1,4 +1,5 @@
-import { LockingScript, Utils } from '@bsv/sdk'
+import { toArray, toUTF8 } from '@bsv/sdk/primitives/utils'
+import type LockingScript from '@bsv/sdk/script/LockingScript'
 
 /**
  * StasToken — decoder for **classic STAS** (legacy P2STAS / STAS 1.0) locking
@@ -87,7 +88,7 @@ function readPushes(scriptHex: string, startPos: number, max = 8): string[] {
 function hexToUtf8(hex: string): string {
   if (hex === '') return ''
   try {
-    return Utils.toUTF8(Utils.toArray(hex, 'hex'))
+    return toUTF8(toArray(hex, 'hex'))
   } catch {
     return ''
   }

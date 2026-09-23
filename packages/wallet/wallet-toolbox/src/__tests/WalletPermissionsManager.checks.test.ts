@@ -304,7 +304,7 @@ describe('WalletPermissionsManager - Permission Checks', () => {
             description: 'Insert to default basket',
             outputs: [
               {
-                lockingScript: '0x1234',
+                lockingScript: '1234',
                 satoshis: 1,
                 basket: 'default',
                 outputDescription: 'Nothing to see here'
@@ -404,16 +404,28 @@ describe('WalletPermissionsManager - Permission Checks', () => {
       // Attempt to list a user basket
       await expect(manager.listOutputs({ basket: 'user-basket' }, 'some-user.com')).rejects.toThrow(/Permission denied/)
 
-      // There is one underlying call: internally, we called listOutputs to check if we had permission
-      // (we did not, we sought it, and the user denied). So we see this call here, but we DO NOT see
-      // the actual proxied call (for listing outputs in user-basket), since it was denied.
-      expect(underlying.listOutputs).toHaveBeenCalledTimes(1)
+      // Permission discovery first uses the canonical hostname tag, then a
+      // bounded untagged compatibility lookup for grants minted with another
+      // port. The denied request never reaches the user basket itself.
+      expect(underlying.listOutputs).toHaveBeenCalledTimes(2)
+      expect(underlying.listOutputs).toHaveBeenNthCalledWith(
+        1,
+        {
+          basket: 'admin basket-access',
+          include: 'entire transactions',
+          limit: 10000,
+          tagQueryMode: 'all',
+          tags: ['originator some-user.com', 'basket user-basket']
+        },
+        'admin.com'
+      )
       expect(underlying.listOutputs).toHaveBeenLastCalledWith(
         {
           basket: 'admin basket-access',
           include: 'entire transactions',
+          limit: 10000,
           tagQueryMode: 'all',
-          tags: ['originator some-user.com', 'basket user-basket']
+          tags: ['basket user-basket']
         },
         'admin.com'
       )
@@ -735,7 +747,7 @@ describe('WalletPermissionsManager - Permission Checks', () => {
             outputs: [
               {
                 outputDescription: 'Nothing to see here',
-                lockingScript: 'op_return',
+                lockingScript: '006a',
                 satoshis: 200
               }
             ]

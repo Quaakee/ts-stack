@@ -202,13 +202,12 @@ affected-artifact inventory, mitigation, deprecation, forward fixes, and
 deployment rollback. Public disclosure remains embargoed until coordinated
 with the reporter and affected operators.
 
-OpenSSF Best Practices badge registration is deferred only while
+OpenSSF Best Practices badge registration is deferred while
 [QA issue #400](https://github.com/bsv-blockchain/ts-stack/issues/400) remains
 open, because its coverage, fuzzing, runtime, and manual-suite claims are not
 yet complete enough for a truthful self-assessment. The BSV Association
-security owner must register by **2026-08-31**, or within five business days of
-issue #400 closing, whichever occurs first, and link the resulting project
-record from this guide. Existing Scorecard findings remain governed by
+security owner must register within five business days after issue #400 closes
+and link the resulting project record from this guide. Existing Scorecard findings remain governed by
 `governance/repository-health/exceptions.json`; badge deferral does not waive
 or suppress them.
 

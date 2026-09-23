@@ -86,15 +86,22 @@ with an accepted zero-value receipt. Invalid or failed pricing returns a stable
    ```
 
 5. The middleware bounds and parses the header, verifies the derivation
-   prefix, parses the Atomic BEEF transaction, requires output zero to cover
-   the current price, and atomically claims its transaction ID.
-6. The wallet must return `{ accepted: true }` from `internalizeAction`.
-   Merge/replay-like results do not authorize the route.
-7. `next()` runs with `req.payment`, and
+   prefix, parses the Atomic BEEF transaction, reduces legacy overinclusive
+   envelopes to the declared subject and its dependency closure, and requires
+   output zero to cover the current price.
+6. The wallet must validate and newly accept the remittance with
+   `{ accepted: true }` from `internalizeAction`. Merge/replay-like or malformed
+   results do not authorize the route.
+7. Only after wallet validation does the middleware atomically claim the
+   transaction ID. This prevents invalid derivation material paired with a
+   public transaction from poisoning the replay store.
+8. `next()` runs with `req.payment`, and
    `x-bsv-payment-satoshis-paid` reports the actual output value.
 
-Malformed, duplicate, underfunded, rejected, or ambiguous payments never call
-`next`.
+Wallet verdicts must expose `accepted` and optional `isMerge` as own data
+properties; inherited or accessor-backed authority is rejected without
+invoking accessors. Malformed, duplicate, underfunded, rejected, or ambiguous
+payments never call `next`.
 
 ## Options
 
@@ -126,8 +133,7 @@ Invalid option types fail during startup.
 `InMemoryPaymentReplayStore` is the safe single-process default. It:
 
 - atomically claims each transaction ID once within one process;
-- retains claims after wallet errors because the acceptance outcome may be
-  ambiguous;
+- records only transactions the wallet reported as newly accepted;
 - refuses new claims when its fixed capacity is reached rather than evicting
   an older replay marker; and
 - loses all claims when the process restarts.
@@ -177,7 +183,7 @@ the required price. For free requests it is zero and `tx`/`txid` are empty.
 | 400    | `ERR_INVALID_PAYMENT`           | Atomic BEEF is invalid or output zero is underfunded                     |
 | 400    | `ERR_PAYMENT_FAILED`            | The wallet could not accept the payment                                  |
 | 402    | `ERR_PAYMENT_REQUIRED`          | A payment challenge was issued                                           |
-| 409    | `ERR_PAYMENT_REPLAYED`          | The transaction was claimed before or was not newly accepted             |
+| 409    | `ERR_PAYMENT_REPLAYED`          | The transaction was already claimed or was not newly accepted            |
 | 500    | `ERR_SERVER_MISCONFIGURED`      | Auth middleware did not provide a valid identity                         |
 | 500    | `ERR_PAYMENT_INTERNAL`          | Pricing failed or returned an invalid value                              |
 | 503    | `ERR_PAYMENT_UNAVAILABLE`       | Challenge creation or replay storage is unavailable                      |
@@ -199,12 +205,16 @@ credentialed CORS.
 - Run authentication first and authorization/payment routes after both
   middleware functions.
 - Use a durable atomic replay store for multiple processes or replicas.
-- Do not delete a replay claim automatically after an ambiguous wallet error.
+- Wallet errors and rejected remittances are never inserted into the replay
+  store; investigate an unavailable replay store promptly because the wallet
+  may already have accepted the transaction before that independent gate.
 - Monitor `409` and `503` rates and replay-store capacity.
 - Treat pricing as security-sensitive, deterministic request policy.
 - The wallet remains responsible for validating and safely internalizing the
   supplied BRC-29 remittance.
 - Apply normal request/header limits and rate limiting at the service edge.
+- Logger failures are contained and cannot interrupt payment authorization or
+  change the HTTP result.
 
 ## API
 

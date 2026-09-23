@@ -342,7 +342,7 @@ test('contract findings are deterministic and match their recorded baseline', ()
   const baseline = readJson(path.join(healthDirectory, 'contract-baseline.json'))
 
   assert.deepEqual(compareContractBaseline(baseline, findings), [])
-  assert.deepEqual(createContractBaseline(findings, '2026-07-26'), baseline)
+  assert.deepEqual(createContractBaseline(findings, '2026-09-21'), baseline)
 })
 
 test('contract ratchet detects both new and stale resolved findings', () => {

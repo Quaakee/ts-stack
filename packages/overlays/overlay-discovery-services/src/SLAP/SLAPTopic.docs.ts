@@ -47,6 +47,7 @@ If any step fails, the SLAP output is rejected.
 
 1. **Exact 5 PushDrop Fields**:
    - If fewer or more than 5 fields are found, the SLAP manager will skip the output.
+   - The complete script must be canonical and bounded; non-minimal pushes, extra opcodes, and trailing data are rejected.
 2. **Valid \`service\`**:
    - Must begin with \`ls_\`.
    - Only letters (lowercase) and underscores are allowed, per \`isValidTopicOrServiceName\` (BRC-87).

@@ -1,7 +1,15 @@
 import { TaskArcadeSSE } from '../TaskArcSSE'
 import { ArcSSEEvent } from '../../../services/providers/ArcSSEClient'
 import { EntityProvenTx } from '../../../storage/schema/entities'
-import { Utils } from '@bsv/sdk'
+import { MerklePath, Utils } from '@bsv/sdk'
+
+const TXID_A = 'aa'.repeat(32)
+const TXID_B = 'bb'.repeat(32)
+const TXID_C = 'cc'.repeat(32)
+const TXID_D = 'dd'.repeat(32)
+const TXID_E = 'ee'.repeat(32)
+const TXID_F = 'ff'.repeat(32)
+const DEFAULT_TXID = '01'.repeat(32)
 
 // ── Fake EventSource ─────────────────────────────────────────────────────────
 
@@ -34,7 +42,7 @@ class FakeEventSource {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Build a minimal TableProvenTxReq API object that EntityProvenTxReq can parse */
-function makeReqApi(status: string, txid = 'txid1'): any {
+function makeReqApi(status: string, txid = DEFAULT_TXID): any {
   const now = new Date()
   const sourceTxid = '11'.repeat(32)
   const rawTx = `0100000001${sourceTxid}0000000000ffffffff0101000000000000000000000000`
@@ -115,6 +123,9 @@ function makeMonitor(
       getMerklePath: jest.fn()
     },
     chain: 'test',
+    chaintracks: {
+      isValidRootForHeight: jest.fn().mockResolvedValue(true)
+    },
     storage,
     logEvent: jest.fn().mockResolvedValue(undefined),
     callOnTransactionStatusChanged: jest.fn(),
@@ -140,6 +151,8 @@ describe('TaskArcadeSSE', () => {
       const task = new TaskArcadeSSE(makeMonitor())
       await task.asyncSetup()
       expect(task.sseClient).not.toBeNull()
+      expect(FakeEventSource.instances).toHaveLength(1)
+      await task.asyncSetup()
       expect(FakeEventSource.instances).toHaveLength(1)
     })
 
@@ -183,6 +196,20 @@ describe('TaskArcadeSSE', () => {
       await expect(task.asyncSetup()).resolves.not.toThrow()
       expect(task.sseClient).not.toBeNull()
     })
+
+    test('does not persist endpoint, credential, or cursor values in setup diagnostics', async () => {
+      const monitor = makeMonitor({
+        arcadeUrl: 'https://private-arcade.example.com',
+        loadLastSSEEventId: async () => 'private-cursor'
+      })
+      monitor.options.callbackToken = 'private-token'
+      const task = new TaskArcadeSSE(monitor)
+      await task.asyncSetup()
+      const diagnostics = monitor.logEvent.mock.calls.flat().join(' ')
+      expect(diagnostics).not.toContain('private-arcade')
+      expect(diagnostics).not.toContain('private-cursor')
+      expect(diagnostics).not.toContain('private-token')
+    })
   })
 
   // ── trigger ────────────────────────────────────────────────────────────
@@ -196,7 +223,7 @@ describe('TaskArcadeSSE', () => {
     test('returns run=true after an SSE event is received', async () => {
       const task = new TaskArcadeSSE(makeMonitor())
       await task.asyncSetup()
-      const payload: ArcSSEEvent = { txid: 'aaaa', txStatus: 'MINED', timestamp: '' }
+      const payload: ArcSSEEvent = { txid: TXID_A, txStatus: 'MINED', timestamp: '' }
       FakeEventSource.instances[0].emit('status', { data: JSON.stringify(payload) })
       expect(task.trigger(Date.now()).run).toBe(true)
     })
@@ -210,34 +237,37 @@ describe('TaskArcadeSSE', () => {
       expect(await task.runTask()).toBe('')
     })
 
-    test('drains pending events so trigger returns false afterward', async () => {
+    test('drains serially delivered events without accumulating task promises', async () => {
       const task = new TaskArcadeSSE(makeMonitor())
       await task.asyncSetup()
-      const payload: ArcSSEEvent = { txid: 'bbbb', txStatus: 'SEEN_ON_NETWORK', timestamp: '' }
+      const payload: ArcSSEEvent = { txid: TXID_B, txStatus: 'SEEN_ON_NETWORK', timestamp: '' }
       FakeEventSource.instances[0].emit('status', { data: JSON.stringify(payload) })
       FakeEventSource.instances[0].emit('status', { data: JSON.stringify(payload) })
+      expect(task.trigger(Date.now()).run).toBe(true)
+      await task.runTask()
+      await new Promise(resolve => setTimeout(resolve, 0))
       expect(task.trigger(Date.now()).run).toBe(true)
       await task.runTask()
       expect(task.trigger(Date.now()).run).toBe(false)
     })
 
     test('calls callOnTransactionStatusChanged for each processed event', async () => {
-      const reqApi = makeReqApi('unsent', 'cccc')
+      const reqApi = makeReqApi('unsent', TXID_C)
       const monitor = makeMonitor({ storageOverride: makeStorageWithReqs([reqApi]) })
       const task = new TaskArcadeSSE(monitor)
       await task.asyncSetup()
       FakeEventSource.instances[0].emit('status', {
-        data: JSON.stringify({ txid: 'cccc', txStatus: 'SEEN_ON_NETWORK', timestamp: '' })
+        data: JSON.stringify({ txid: TXID_C, txStatus: 'SEEN_ON_NETWORK', timestamp: '' })
       })
       await task.runTask()
-      expect(monitor.callOnTransactionStatusChanged).toHaveBeenCalledWith('cccc', 'SEEN_ON_NETWORK')
+      expect(monitor.callOnTransactionStatusChanged).toHaveBeenCalledWith(TXID_C, 'SEEN_ON_NETWORK')
     })
 
     test('logs "No matching ProvenTxReq" when storage returns empty', async () => {
       const task = new TaskArcadeSSE(makeMonitor())
       await task.asyncSetup()
       FakeEventSource.instances[0].emit('status', {
-        data: JSON.stringify({ txid: 'dddd', txStatus: 'MINED', timestamp: '' })
+        data: JSON.stringify({ txid: TXID_D, txStatus: 'MINED', timestamp: '' })
       })
       const log = await task.runTask()
       expect(log).toContain('No matching ProvenTxReq')
@@ -367,14 +397,14 @@ describe('TaskArcadeSSE', () => {
     test('MINED may recover an invalid req only through the validated proof path', async () => {
       const { log, monitor } = await runWithStatus('MINED', 'invalid')
       expect(log).not.toContain('already terminal')
-      expect(monitor.services.getMerklePath).toHaveBeenCalledWith('txid1')
+      expect(monitor.services.getMerklePath).toHaveBeenCalledWith(DEFAULT_TXID)
       expect(monitor.storage.sp.updateTransactionsStatus).not.toHaveBeenCalled()
     })
 
     test('MINED may recover a doubleSpend req only through the validated proof path', async () => {
       const { log, monitor } = await runWithStatus('MINED', 'doubleSpend')
       expect(log).not.toContain('already terminal')
-      expect(monitor.services.getMerklePath).toHaveBeenCalledWith('txid1')
+      expect(monitor.services.getMerklePath).toHaveBeenCalledWith(DEFAULT_TXID)
       expect(monitor.storage.sp.updateTransactionsStatus).not.toHaveBeenCalled()
     })
 
@@ -392,9 +422,23 @@ describe('TaskArcadeSSE', () => {
     })
 
     test('MINED uses configured proof services and stores validated proof', async () => {
-      const reqApi = makeReqApi('unmined')
+      const reqApi = makeReqApi('unmined', '44'.repeat(32))
       const storage = makeStorageWithReqs([reqApi])
-      const proof = { name: 'Arcade' } as any
+      const merklePath = new MerklePath(99, [[{ offset: 0, hash: reqApi.txid, txid: true }]])
+      const proof = {
+        name: 'Arcade',
+        merklePath,
+        header: {
+          version: 1,
+          previousHash: '00'.repeat(32),
+          height: 99,
+          merkleRoot: merklePath.computeRoot(reqApi.txid),
+          time: 1,
+          bits: 1,
+          nonce: 1,
+          hash: '55'.repeat(32)
+        }
+      } as any
       const getMerklePath = jest.fn().mockResolvedValue(proof)
       const fromReq = jest.spyOn(EntityProvenTx, 'fromReq').mockResolvedValue({
         toApi: () => ({
@@ -421,7 +465,20 @@ describe('TaskArcadeSSE', () => {
       const log = await task.runTask()
 
       expect(getMerklePath).toHaveBeenCalledWith(reqApi.txid)
-      expect(fromReq).toHaveBeenCalledWith(expect.anything(), proof, false, expect.any(Number))
+      expect(fromReq).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          name: proof.name,
+          merklePath: expect.any(MerklePath),
+          header: expect.objectContaining({
+            height: proof.header.height,
+            merkleRoot: proof.header.merkleRoot
+          })
+        }),
+        false,
+        expect.any(Number),
+        monitor.chaintracks
+      )
       expect(storage.runAsStorageProvider).toHaveBeenCalled()
       expect(storage.sp.updateProvenTxReqDynamics).toHaveBeenLastCalledWith(
         reqApi.provenTxReqId,
@@ -453,6 +510,20 @@ describe('TaskArcadeSSE', () => {
       await task.asyncSetup()
       expect(await task.fetchNow()).toBe(0)
     })
+
+    test('close releases the EventSource and rejects unacknowledged task work', async () => {
+      const task = new TaskArcadeSSE(makeMonitor())
+      await task.asyncSetup()
+      const source = FakeEventSource.instances[0]
+      source.emit('status', { data: JSON.stringify({ txid: TXID_A, txStatus: 'MINED', timestamp: '' }) })
+      expect(task.trigger(Date.now()).run).toBe(true)
+
+      expect(() => task.close()).not.toThrow()
+      expect(source.closed).toBe(true)
+      expect(task.trigger(Date.now()).run).toBe(false)
+      expect(task.sseClient).toBeNull()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
   })
 
   // ── saveLastSSEEventId persistence ────────────────────────────────────
@@ -463,7 +534,7 @@ describe('TaskArcadeSSE', () => {
       const task = new TaskArcadeSSE(makeMonitor({ saveLastSSEEventId }))
       await task.asyncSetup()
       FakeEventSource.instances[0].emit('status', {
-        data: JSON.stringify({ txid: 'eeee', txStatus: 'MINED', timestamp: '' }),
+        data: JSON.stringify({ txid: TXID_E, txStatus: 'MINED', timestamp: '' }),
         lastEventId: '55'
       })
       expect(saveLastSSEEventId).not.toHaveBeenCalled()
@@ -475,13 +546,11 @@ describe('TaskArcadeSSE', () => {
     test('does not checkpoint a storage failure and retries the event', async () => {
       const saveLastSSEEventId = jest.fn().mockResolvedValue(undefined)
       const storage = makeEmptyStorage()
-      storage.findProvenTxReqs
-        .mockRejectedValueOnce(new Error('temporary database error'))
-        .mockResolvedValue([])
+      storage.findProvenTxReqs.mockRejectedValueOnce(new Error('temporary database error')).mockResolvedValue([])
       const task = new TaskArcadeSSE(makeMonitor({ storageOverride: storage, saveLastSSEEventId }))
       await task.asyncSetup()
       FakeEventSource.instances[0].emit('status', {
-        data: JSON.stringify({ txid: 'ffff', txStatus: 'REJECTED', timestamp: '', status: 466 }),
+        data: JSON.stringify({ txid: TXID_F, txStatus: 'REJECTED', timestamp: '', status: 466 }),
         lastEventId: '56'
       })
 
@@ -496,13 +565,14 @@ describe('TaskArcadeSSE', () => {
     })
 
     test('retries the event when cursor persistence fails', async () => {
-      const saveLastSSEEventId = jest.fn()
+      const saveLastSSEEventId = jest
+        .fn()
         .mockRejectedValueOnce(new Error('cursor store unavailable'))
         .mockResolvedValue(undefined)
       const task = new TaskArcadeSSE(makeMonitor({ saveLastSSEEventId }))
       await task.asyncSetup()
       FakeEventSource.instances[0].emit('status', {
-        data: JSON.stringify({ txid: 'ffff', txStatus: 'REJECTED', timestamp: '' }),
+        data: JSON.stringify({ txid: TXID_F, txStatus: 'REJECTED', timestamp: '' }),
         lastEventId: '57'
       })
 

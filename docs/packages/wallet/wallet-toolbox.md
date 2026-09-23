@@ -4,9 +4,9 @@ title: '@bsv/wallet-toolbox'
 kind: package
 domain: wallet
 npm: '@bsv/wallet-toolbox'
-version: '2.13.0'
-last_updated: '2026-09-10'
-last_verified: '2026-09-10'
+version: '2.14.0'
+last_updated: '2026-09-23'
+last_verified: '2026-09-23'
 review_cadence_days: 30
 status: stable
 tags: ['wallet', 'brc100']
@@ -46,13 +46,34 @@ state; possession of a snapshot is possession of the wallet. Store each
 complete snapshot only in an OS Keychain, hardware-backed keystore, or
 comparably trusted secret store. Remote storage and credential-bearing Arcade
 SSE require HTTPS except for explicit loopback development, and transport
-debugging cannot log callback tokens or API credentials.
+debugging cannot log callback tokens or API credentials. Arcade status events
+are validated, copied, and committed one at a time under per-event and aggregate
+queue budgets; no later cursor can advance past a malformed or failed event.
+The stream is silent by default and reports credential-bearing transport errors
+only as a generic signal. Monitor and daemon startup await retryable ChainTracks
+subscriptions, teardown closes SSE/subscriptions before storage, persisted
+diagnostics are bounded, and monitor operational logging requires the additive
+`MonitorOptions.logging` callback.
 
 Spending approvals apply to one operation per prompt and are never cached or
 coalesced. Spending-token accounting reads every action page before authorizing
-a spend. Certificate handling also fails closed: direct and issuer-mediated
-acquisition require a valid certifier signature before storage, and identity
-discovery verifies overlay certificates before decrypting or trust-scoring them.
+a spend. `WalletPermissionsManager` resolves a sendMax (`maxPossibleSatoshis`)
+output's funded amount from the signable transaction by locking script before
+billing it, so a `createAction` call funding the wallet's full balance through
+the permissions manager is authorized and verified for its real amount instead
+of the unfunded sentinel. Certificate handling also fails closed: direct and
+issuer-mediated acquisition require a valid certifier signature before
+storage, and identity discovery verifies overlay certificates before
+decrypting or trust-scoring them.
+
+`relinquishOutput` and `internalizeAction` confirm basket membership before
+mutating it. `relinquishOutput` rejects a basket argument that does not match
+the output's actual current basket, or names a basket that does not exist, so
+an application cannot free an outpoint it does not actually hold by basket
+membership. `internalizeAction`'s basket-insertion merge path rejects
+reclassifying an output that already belongs to a different real basket,
+while re-internalizing into the same basket and inserting a currently
+unbasketed (non-managed-change) output both keep working.
 
 Action-batch workspaces now admit only explicitly connected transaction-graph
 members. Unrelated actions stay on their ordinary storage path, while related
@@ -100,12 +121,96 @@ order; and synchronized trackers keep serving last-good local data.
 WhatsOnChain is an optional, rate-limited mainnet/testnet fallback; no key is
 required.
 
+The configured remote ChainTracks service is authoritative for chain view, but
+its response representation is still adversarially validated. HTTP reads have
+whole-body deadlines and byte ceilings, redirects are prohibited, SSE streams
+have event and idle bounds, and network/header/reorganization results must be
+canonical, proof-of-work-valid, and exactly request-bound. Local submitted and
+remote live-header queues are copy-isolated and bounded to prevent a faulty or
+hostile source from retaining unbounded process memory.
+Remote live metadata must be complete and use positive local identities.
+Reorganization deactivation lists must start at the old tip, contain no
+duplicates, form a descending linked chain, and fit their declared depth before
+wallet monitor callbacks receive them. Remote diagnostics are bounded and
+single-line. The monitor independently authenticates and copies custom-adapter
+events, verifies that every configured chain source matches the wallet network,
+and retains at most 4,096 unique deactivated headers by default. Applications
+can lower this with `MonitorOptions.maxQueuedDeactivatedHeaders`. Prepared-proof
+invalidation is coalesced and drained during teardown, while partial event
+subscriptions and rejected host callbacks are contained as bounded monitor
+events. Optional Chaintracks header/reorg push subscriptions no longer gate
+the scheduler: an event source that declares `supportsReorgEvents: false`
+(such as the built-in HTTP-polling `ChaintracksServiceClient`) is never called,
+and a source that fails to subscribe is retried opportunistically on the next
+tick while every other scheduled task keeps running. A genuine configured-chain
+mismatch still fails closed — subscriptions are never registered against a
+`chaintracksWithEvents` source that reports the wrong chain — and is recorded
+as a `chaintracksEventsError` monitor event.
+
+The legacy `BHServiceClient` also validates current canonical headers for every
+Merkle-root verdict. Its compatibility `cache` is diagnostic state only and is
+never trusted, so a rejected root, caller mutation, or reorganization cannot
+turn an old root into authority. Redirects, endpoints, response bodies, ranges,
+hashes, linkage, and proof of work are bounded and checked before use.
+ChainTracks constructors reject malformed networks, recursion limits, and
+ingestor collections; logging is silent unless the host explicitly provides
+the optional logger. Startup awaits and reports initialization failure, failed
+attempts can retry cleanly, and destruction drains sources and storage even
+before readiness. Event subscriptions are bounded, removed on unsubscribe, and
+copy-isolated between listeners.
+
+Local ChainTracks adapters also enforce stored-state integrity. In-memory
+instances do not share live headers, IndexedDB and Knex require unique active
+headers and consecutive parent linkage, and bounded reorganization walks fail
+closed on missing or cyclic state. Knex uses a transaction-held state row to
+serialize competing tip mutations. Apply all ChainTracks Knex migrations before
+startup. MySQL operators should expect the derived live-header cache to be
+cleared once while legacy truncating `VARBINARY(32)` fields are widened to
+`VARCHAR(64)`; authenticated bulk data is retained and repopulates live state.
+Before downgrading to code that predates this repair, stop all ChainTracks
+writes and verify a database plus authenticated-bulk-data backup. Use the
+current `ChaintracksKnexMigrations` source to roll down only the
+`2026-09-17-001 repair MySQL live-header encodings and bulk blob` ledger entry;
+its schema down is intentionally a no-op. Retain the repaired `VARCHAR(64)` and
+`LONGBLOB` columns, the `chaintracks_state` lock row, and authenticated bulk
+files, and validate that state against the older code in a non-production copy
+before starting it. Never roll down the initial migration, recreate the tables,
+or restore truncating `VARBINARY(32)` identifier columns.
+Bulk-file additions and extensions persist before memory changes. Multi-file
+replacements and initial reconciliation commit atomically in the built-in Knex
+and IndexedDB adapters, and failed commits restore the manager's prior state.
+Custom `ChaintracksStorageBulkFileApi` adapters must implement the additive
+`replaceBulkFiles` method before multi-file changes are enabled; older custom
+adapters fail closed instead of risking a durable gap or stale overlap.
+
+WhatsOnChain is authoritative only when explicitly enabled as a fallback chain
+source. Its service-discovered CDN links are untrusted locators, not operator
+configuration: they must be credential-free public HTTPS, with public-address
+DNS pinning in Node. Manifests, binary objects, recent-header JSON, and legacy
+WebSocket frames have byte, count, ordering, handshake, and idle bounds. Every
+candidate is canonical and proof-of-work-valid before its declared target can
+participate in chain-work selection.
+
 Local ChainTracks height reads now use stale-while-revalidate singleflight,
 while immutable bulk objects coalesce misses and back off failed loads. Node
 services can move complete length, digest, linkage, chain-work, genesis, and
 proof-of-work validation into `NodeBulkFileDataValidator`; filesystem
 deployments can pair content-addressed quarantine storage with a crash-safe,
-per-attempt `DurableFileBulkFileDownloadBudget`.
+per-attempt `DurableFileBulkFileDownloadBudget`. The shared ledger serializes
+reservations across processes; a crash-abandoned `<stateFile>.lock` fails
+closed and must be removed only after an operator proves no writer remains.
+Filesystem cache reads allocate no more than the advertised object size plus
+one rejection byte, and writes must match their advertised length and SHA-256.
+Replacement, promotion, and quarantine serialize across processes through a
+per-digest `<digest>.headers.lock`. Like the budget lock, it is never reclaimed
+automatically after a crash; prove no cache writer remains before removing that
+narrow directory. Cache metadata and byte inputs are snapshotted before any
+lock wait.
+
+Legacy filesystem manifests accept only path-free filenames and are never
+replaced merely because a read, permission, size, parse, or integrity check
+failed. Imported/exported files are bounded and must authenticate as one
+contiguous genesis-anchored header chain with matching digests and chain work.
 
 ## Install
 

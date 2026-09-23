@@ -1,14 +1,20 @@
 import {
-  Utils,
   PublicKey,
   PrivateKey,
   P2PKH,
   Script,
   OP,
   Random,
-  Transaction,
-  Beef
+  Beef,
+  completeBoundAction,
+  createPublicHTTPSFetch,
+  snapshotWalletResultRequest,
+  validateWalletArgs,
+  validateWalletResult
 } from '@bsv/sdk'
+import { sha256 } from '@bsv/sdk/primitives/Hash'
+import { toArray, toBase64, toHex } from '@bsv/sdk/primitives/utils'
+import { validateDIDDocument, validateDIDResolutionResult } from '../core/did-validation'
 import { WalletCore } from '../core/WalletCore'
 import {
   DIDDocument,
@@ -41,7 +47,7 @@ const LEGACY_KEY_TYPE = 'EcdsaSecp256k1VerificationKey2019'
 // ============================================================================
 
 function base64url(bytes: number[]): string {
-  let encoded = Utils.toBase64(bytes).split('+').join('-').split('/').join('_')
+  let encoded = toBase64(bytes).split('+').join('-').split('/').join('_')
   while (encoded.endsWith('=')) {
     encoded = encoded.slice(0, -1)
   }
@@ -64,34 +70,242 @@ function buildOpReturn(identityCode: string, payload: string): Script {
   return new Script()
     .writeOpCode(OP.OP_FALSE)
     .writeOpCode(OP.OP_RETURN)
-    .writeBin(Utils.toArray(BSVDID_MARKER, 'utf8'))
-    .writeBin(Utils.toArray(identityCode, 'utf8'))
-    .writeBin(Utils.toArray(payload, 'utf8'))
+    .writeBin(toArray(BSVDID_MARKER, 'utf8'))
+    .writeBin(toArray(identityCode, 'utf8'))
+    .writeBin(toArray(payload, 'utf8'))
 }
 
 function generateIdentityCode(): string {
-  return Utils.toHex(Random(16))
+  return toHex(Random(16))
+}
+
+function normalizeIdentityCode(value: unknown): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new DIDError('DID identity code must contain 1-128 URL-safe characters')
+  }
+  return value
+}
+
+type OwnDataRecord = Record<string, unknown>
+
+function ownDataRecord(value: unknown, name: string): OwnDataRecord {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${name} must be a plain data object`)
+  }
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${name} must be a plain data object`)
+  }
+  const snapshot = Object.create(null) as OwnDataRecord
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') throw new TypeError(`${name} must not contain symbol properties`)
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    const ownValue =
+      descriptor == null ? undefined : Object.getOwnPropertyDescriptor(descriptor, 'value')
+    if (ownValue == null) {
+      throw new TypeError(`${name}.${key} must be a data property`)
+    }
+    snapshot[key] = ownValue.value
+  }
+  return snapshot
+}
+
+function optionalOwnDataRecord(value: unknown, name: string): OwnDataRecord | undefined {
+  return value == null ? undefined : ownDataRecord(value, name)
+}
+
+function denseOwnArray(value: unknown, name: string, maximum = 10_000): unknown[] {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new TypeError(`${name} must be a bounded dense array`)
+  }
+  const snapshot: unknown[] = []
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+    const ownValue =
+      descriptor == null ? undefined : Object.getOwnPropertyDescriptor(descriptor, 'value')
+    if (ownValue == null) {
+      throw new TypeError(`${name} must be a bounded dense array`)
+    }
+    snapshot.push(ownValue.value)
+  }
+  return snapshot
+}
+
+function denseOwnBytes(value: unknown, name: string): number[] {
+  return denseOwnArray(value, name, 64 * 1024 * 1024).map((byte, index) => {
+    if (!Number.isInteger(byte) || (byte as number) < 0 || (byte as number) > 255) {
+      throw new TypeError(`${name}[${index}] must be a byte`)
+    }
+    return byte as number
+  })
+}
+
+function snapshotServices(value: unknown, name: string): DIDService[] | undefined {
+  if (value == null) return undefined
+  return denseOwnArray(value, name, 32).map((service, index) => {
+    const record = ownDataRecord(service, `${name}[${index}]`)
+    return {
+      id: record.id,
+      type: record.type,
+      serviceEndpoint: record.serviceEndpoint
+    } as DIDService
+  })
+}
+
+function snapshotStringArray(value: unknown, name: string, maximum: number): string[] | undefined {
+  if (value == null) return undefined
+  return denseOwnArray(value, name, maximum).map((entry, index) => {
+    if (typeof entry !== 'string') throw new TypeError(`${name}[${index}] must be a string`)
+    return entry
+  })
+}
+
+function snapshotDIDCreateOptions(value: DIDCreateOptions | undefined): DIDCreateOptions {
+  const record = value == null ? Object.create(null) : ownDataRecord(value, 'DID create options')
+  return Object.assign(Object.create(null), {
+    identityCode: record.identityCode,
+    satoshis: record.satoshis,
+    basket: record.basket,
+    controllerKey: record.controllerKey,
+    services: snapshotServices(record.services, 'DID create services')
+  }) as DIDCreateOptions
+}
+
+function snapshotDIDUpdateOptions(value: DIDUpdateOptions): DIDUpdateOptions {
+  const record = ownDataRecord(value, 'DID update options')
+  return Object.assign(Object.create(null), {
+    did: record.did,
+    services: snapshotServices(record.services, 'DID update services'),
+    additionalKeys: snapshotStringArray(record.additionalKeys, 'DID additional keys', 32)
+  }) as DIDUpdateOptions
+}
+
+interface SafeWalletOutput {
+  outpoint?: string
+  customInstructions?: string
+}
+
+interface SafeListOutputsResult {
+  outputs: SafeWalletOutput[]
+  BEEF?: number[]
+}
+
+async function listOutputsOwnData(
+  client: any,
+  args: Record<string, unknown>
+): Promise<SafeListOutputsResult> {
+  const result = ownDataRecord(await client.listOutputs(args), 'Wallet listOutputs result')
+  const rawOutputs = result.outputs == null ? [] : denseOwnArray(result.outputs, 'Wallet outputs')
+  const outputs = rawOutputs.map((output, index) => {
+    const record = ownDataRecord(output, `Wallet outputs[${index}]`)
+    const outpoint = record.outpoint
+    const customInstructions = record.customInstructions
+    if (outpoint != null && typeof outpoint !== 'string') {
+      throw new TypeError(`Wallet outputs[${index}].outpoint must be a string`)
+    }
+    if (customInstructions != null && typeof customInstructions !== 'string') {
+      throw new TypeError(`Wallet outputs[${index}].customInstructions must be a string`)
+    }
+    return {
+      ...(outpoint == null ? {} : { outpoint }),
+      ...(customInstructions == null ? {} : { customInstructions })
+    }
+  })
+  return {
+    outputs,
+    ...(result.BEEF == null ? {} : { BEEF: denseOwnBytes(result.BEEF, 'Wallet BEEF') })
+  }
+}
+
+async function getPublicKeyOwnData(client: any, args: Record<string, unknown>): Promise<string> {
+  validateWalletArgs('getPublicKey', args)
+  const request = snapshotWalletResultRequest('getPublicKey', args)
+  const result = validateWalletResult('getPublicKey', await client.getPublicKey(args), request)
+  return ownDataRecord(result, 'Wallet getPublicKey result').publicKey as string
+}
+
+async function createActionOwnData(client: any, args: Record<string, unknown>): Promise<string> {
+  validateWalletArgs('createAction', args)
+  const request = snapshotWalletResultRequest('createAction', args)
+  const result = validateWalletResult('createAction', await client.createAction(args), request)
+  return ownDataRecord(result, 'Wallet createAction result').txid as string
+}
+
+/** Bind fragment-relative service IDs without invoking attacker-controlled accessors. */
+function bindRelativeServiceIds(
+  services: DIDService[] | undefined,
+  did: string
+): DIDService[] | undefined {
+  if (services == null) return undefined
+  if (!Array.isArray(services)) return services
+  return services.map((service, index) => {
+    const record = ownDataRecord(service, `DID services[${index}]`)
+    const id = record.id
+    if (typeof id !== 'string' || !id.startsWith('#')) return service
+    return {
+      id: `${did}${id}`,
+      type: record.type,
+      serviceEndpoint: record.serviceEndpoint
+    } as DIDService
+  })
+}
+
+function readPushLength(
+  bytes: number[],
+  opcodeIndex: number
+): { length: number; dataStart: number } | null {
+  const opcode = bytes[opcodeIndex]
+  const firstLengthByte = opcodeIndex + 1
+  if (opcode >= 0x01 && opcode <= 0x4b) {
+    return { length: opcode, dataStart: firstLengthByte }
+  }
+  if (opcode === OP.OP_PUSHDATA1 && firstLengthByte < bytes.length) {
+    return { length: bytes[firstLengthByte], dataStart: firstLengthByte + 1 }
+  }
+  if (opcode === OP.OP_PUSHDATA2 && firstLengthByte + 1 < bytes.length) {
+    return {
+      length: bytes[firstLengthByte] | (bytes[firstLengthByte + 1] << 8),
+      dataStart: firstLengthByte + 2
+    }
+  }
+  if (opcode === OP.OP_PUSHDATA4 && firstLengthByte + 3 < bytes.length) {
+    return {
+      length:
+        (bytes[firstLengthByte] |
+          (bytes[firstLengthByte + 1] << 8) |
+          (bytes[firstLengthByte + 2] << 16) |
+          (bytes[firstLengthByte + 3] << 24)) >>>
+        0,
+      dataStart: firstLengthByte + 4
+    }
+  }
+  return null
 }
 
 function parseOpReturnSegments(scriptHex: string): string[] {
   try {
-    const script = Script.fromHex(scriptHex)
-    const chunks = script.chunks
-    // Find OP_RETURN — segments follow it
-    let startIdx = -1
-    for (let i = 0; i < chunks.length; i++) {
-      if (chunks[i].op === OP.OP_RETURN) {
-        startIdx = i + 1
-        break
+    const bytes = Script.fromHex(scriptHex).toBinary()
+    let opcodeIndex = 0
+    while (opcodeIndex < bytes.length && bytes[opcodeIndex] !== OP.OP_RETURN) {
+      const push = readPushLength(bytes, opcodeIndex)
+      if (push == null) {
+        opcodeIndex++
+      } else {
+        const nextOpcode = push.dataStart + push.length
+        if (nextOpcode > bytes.length) return []
+        opcodeIndex = nextOpcode
       }
     }
-    if (startIdx < 0) return []
+    if (opcodeIndex >= bytes.length - 1) return []
+    opcodeIndex++
 
     const segments: string[] = []
-    for (let i = startIdx; i < chunks.length; i++) {
-      if (chunks[i].data != null) {
-        segments.push(new TextDecoder().decode(new Uint8Array(chunks[i].data ?? [])))
-      }
+    while (opcodeIndex < bytes.length) {
+      const push = readPushLength(bytes, opcodeIndex)
+      if (push == null || push.dataStart + push.length > bytes.length) return []
+      const data = bytes.slice(push.dataStart, push.dataStart + push.length)
+      segments.push(new TextDecoder().decode(new Uint8Array(data)))
+      opcodeIndex = push.dataStart + push.length
     }
     return segments
   } catch {
@@ -107,6 +321,87 @@ const DID_CONTENT_TYPE = 'application/did+ld+json'
 const WOC_API = 'https://api.whatsonchain.com/v1/bsv/main'
 const WOC_RATE_LIMIT_MS = 350
 const WOC_MAX_HOPS = 100
+const DID_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
+const DID_REQUEST_TIMEOUT_MS = 15_000
+
+interface DIDHttpResult {
+  status: number
+  body: unknown
+}
+
+function normalizeResolverUrl(value: string): URL {
+  if (
+    typeof value !== 'string' ||
+    value.length < 1 ||
+    value.length > 2048 ||
+    value !== value.trim()
+  ) {
+    throw new TypeError('Invalid DID resolver URL')
+  }
+  const url = new URL(value)
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    throw new TypeError('DID resolver URL must be credential-free HTTPS without query or fragment')
+  }
+  return url
+}
+
+async function readDIDJson(response: Response): Promise<unknown> {
+  const declared = response.headers?.get('content-length')
+  if (
+    declared != null &&
+    (!/^(0|[1-9]\d*)$/.test(declared) || Number(declared) > DID_RESPONSE_MAX_BYTES)
+  ) {
+    throw new Error('DID resolver response exceeds the configured limit')
+  }
+  const reader = response.body?.getReader()
+  let text = ''
+  if (reader == null) {
+    text = await response.text()
+    if (new TextEncoder().encode(text).byteLength > DID_RESPONSE_MAX_BYTES) {
+      throw new Error('DID resolver response exceeds the configured limit')
+    }
+  } else {
+    const decoder = new TextDecoder('utf-8', { fatal: true })
+    let total = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        total += value.byteLength
+        if (total > DID_RESPONSE_MAX_BYTES) {
+          await reader.cancel()
+          throw new Error('DID resolver response exceeds the configured limit')
+        }
+        text += decoder.decode(value, { stream: true })
+      }
+      text += decoder.decode()
+    } finally {
+      reader.releaseLock()
+    }
+  }
+  return JSON.parse(text) as unknown
+}
+
+async function fetchDIDJson(url: URL, trustedFetch?: typeof fetch): Promise<DIDHttpResult> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), DID_REQUEST_TIMEOUT_MS)
+  try {
+    const fetchClient = trustedFetch ?? createPublicHTTPSFetch(url.origin)
+    const response = await fetchClient(url.toString(), {
+      redirect: 'error',
+      signal: controller.signal
+    })
+    return { status: response.status, body: await readDIDJson(response) }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
 
 /** Return a DIDResolutionResult for a legacy pubkey-based DID. */
 function resolveLegacyDID(identityKey: string): DIDResolutionResult {
@@ -132,15 +427,18 @@ function resolveLegacyDID(identityKey: string): DIDResolutionResult {
 /** Try a proxy resolver; return result or null if unavailable / no match. */
 async function tryProxyResolver(
   didString: string,
-  proxyUrl: string | undefined
+  proxyUrl: string | undefined,
+  trustedFetch?: typeof fetch
 ): Promise<DIDResolutionResult | null> {
   if (proxyUrl == null || proxyUrl === '') return null
   try {
-    const response = await fetch(`${proxyUrl}?did=${encodeURIComponent(didString)}`)
-    if (!response.ok) return null
-    const data: any = await response.json()
-    if (data.didDocument != null || data.didDocumentMetadata?.deactivated === true) {
-      return data as DIDResolutionResult
+    const url = normalizeResolverUrl(proxyUrl)
+    url.searchParams.set('did', didString)
+    const response = await fetchDIDJson(url, trustedFetch)
+    if (response.status !== 200) return null
+    const result = validateDIDResolutionResult(response.body, didString)
+    if (result.didDocument != null || result.didDocumentMetadata.deactivated === true) {
+      return result
     }
   } catch {
     // Proxy unavailable — fall through
@@ -151,26 +449,64 @@ async function tryProxyResolver(
 /** Try the universal resolver directly; return result or null if unavailable. */
 async function tryDirectResolver(
   didString: string,
-  resolverUrl: string | undefined
+  resolverUrl: string | undefined,
+  trustedFetch?: typeof fetch
 ): Promise<DIDResolutionResult | null> {
   if (resolverUrl == null || resolverUrl === '') return null
   try {
-    const response = await fetch(`${resolverUrl}/1.0/identifiers/${didString}`)
-    if (response.ok) {
-      const data: any = await response.json()
-      return {
-        didDocument: data.didDocument ?? data,
-        didDocumentMetadata: data.didDocumentMetadata ?? {},
-        didResolutionMetadata: { contentType: DID_CONTENT_TYPE, ...data.didResolutionMetadata }
-      }
+    const base = normalizeResolverUrl(resolverUrl)
+    const url = new URL(
+      `1.0/identifiers/${encodeURIComponent(didString)}`,
+      `${base.toString().replace(/\/*$/, '')}/`
+    )
+    const response = await fetchDIDJson(url, trustedFetch)
+    if (response.status === 200) {
+      const data = response.body
+      const record = optionalOwnDataRecord(data, 'DID resolver response')
+      const hasEnvelope =
+        record != null && Object.prototype.hasOwnProperty.call(record, 'didDocument')
+      const documentMetadata = hasEnvelope
+        ? optionalOwnDataRecord(record.didDocumentMetadata, 'DID document metadata')
+        : undefined
+      const resolutionMetadata = hasEnvelope
+        ? optionalOwnDataRecord(record.didResolutionMetadata, 'DID resolution metadata')
+        : undefined
+      return validateDIDResolutionResult(
+        {
+          didDocument: hasEnvelope ? record.didDocument : data,
+          didDocumentMetadata: documentMetadata ?? Object.create(null),
+          didResolutionMetadata: {
+            ...resolutionMetadata,
+            contentType: DID_CONTENT_TYPE
+          }
+        },
+        didString
+      )
     }
     if (response.status === 410) {
-      const data: any = await response.json().catch(() => ({}))
-      return {
-        didDocument: data.didDocument ?? null,
-        didDocumentMetadata: { deactivated: true, ...data.didDocumentMetadata },
-        didResolutionMetadata: { contentType: DID_CONTENT_TYPE, ...data.didResolutionMetadata }
-      }
+      const data = optionalOwnDataRecord(response.body, 'DID resolver response')
+      const documentMetadata = optionalOwnDataRecord(
+        data?.didDocumentMetadata,
+        'DID document metadata'
+      )
+      const resolutionMetadata = optionalOwnDataRecord(
+        data?.didResolutionMetadata,
+        'DID resolution metadata'
+      )
+      return validateDIDResolutionResult(
+        {
+          didDocument:
+            data != null && Object.prototype.hasOwnProperty.call(data, 'didDocument')
+              ? data.didDocument
+              : null,
+          didDocumentMetadata: { ...documentMetadata, deactivated: true },
+          didResolutionMetadata: {
+            ...resolutionMetadata,
+            contentType: DID_CONTENT_TYPE
+          }
+        },
+        didString
+      )
     }
   } catch {
     // Resolver unavailable — fall through
@@ -179,63 +515,96 @@ async function tryDirectResolver(
 }
 
 /** Find the latest chain-state custom-instructions entry for a given DID. */
-function findLatestChainStateForDID(outputs: any[], didString: string): any {
-  let latestCI: any = null
+function parsedChainInstructions(output: SafeWalletOutput): OwnDataRecord | null {
+  if (output.customInstructions == null) return null
+  try {
+    return ownDataRecord(JSON.parse(output.customInstructions), 'DID chain instructions')
+  } catch {
+    return null
+  }
+}
+
+function findLatestChainStateForDID(
+  outputs: SafeWalletOutput[],
+  didString: string
+): OwnDataRecord | null {
+  let latestCI: OwnDataRecord | null = null
   for (const output of outputs) {
-    if ((output as any).customInstructions == null) continue
-    try {
-      const ci = JSON.parse((output as any).customInstructions)
-      if (ci.did !== didString) continue
-      latestCI = ci
-    } catch {}
+    const ci = parsedChainInstructions(output)
+    if (ci?.did !== didString) continue
+    latestCI = ci
   }
   return latestCI
 }
 
 /** Find the active chain state and its outpoint for a given DID. */
 function findActiveChainState(
-  outputs: any[],
+  outputs: SafeWalletOutput[],
   didString: string
-): { chainCI: any; chainOutpoint: string } | null {
+): { chainCI: OwnDataRecord; chainOutpoint: string } | null {
   for (const output of outputs) {
-    if ((output as any).customInstructions == null) continue
-    try {
-      const ci = JSON.parse((output as any).customInstructions)
-      if (ci.did === didString && ci.status === 'active') {
-        return { chainCI: ci, chainOutpoint: output.outpoint }
-      }
-    } catch {}
+    const ci = parsedChainInstructions(output)
+    if (ci?.did === didString && ci.status === 'active' && typeof output.outpoint === 'string') {
+      return { chainCI: ci, chainOutpoint: output.outpoint }
+    }
   }
   return null
 }
 
 /** Build a DIDResolutionResult for a deactivated DID from stored CI. */
-function buildDeactivatedResolutionResult(ci: any, didString: string): DIDResolutionResult {
-  const doc =
-    ci.subjectKey == null ? null : DID.buildDocument(ci.issuanceTxid, ci.subjectKey, didString)
-  return {
-    didDocument: doc,
-    didDocumentMetadata: { deactivated: true },
-    didResolutionMetadata: { contentType: DID_CONTENT_TYPE }
+function buildDeactivatedResolutionResult(
+  ci: OwnDataRecord,
+  didString: string
+): DIDResolutionResult {
+  const identifier = DID.parse(didString).identifier
+  if (identifier.length !== 64 || ci.issuanceTxid !== identifier) {
+    throw new DIDError('Stored DID state does not match the requested DID')
   }
+  if (ci.subjectKey != null && typeof ci.subjectKey !== 'string') {
+    throw new DIDError('Stored DID subject key is invalid')
+  }
+  const doc =
+    ci.subjectKey == null
+      ? null
+      : DID.buildDocument(ci.issuanceTxid as string, ci.subjectKey, didString)
+  return validateDIDResolutionResult(
+    {
+      didDocument: doc,
+      didDocumentMetadata: { deactivated: true },
+      didResolutionMetadata: { contentType: DID_CONTENT_TYPE }
+    },
+    didString
+  )
 }
 
 /** Build a DIDResolutionResult for an active DID from stored CI. */
-function buildActiveResolutionResult(ci: any, didString: string): DIDResolutionResult {
+function buildActiveResolutionResult(ci: OwnDataRecord, didString: string): DIDResolutionResult {
+  const identifier = DID.parse(didString).identifier
+  if (identifier.length !== 64 || ci.issuanceTxid !== identifier) {
+    throw new DIDError('Stored DID state does not match the requested DID')
+  }
+  if (typeof ci.subjectKey !== 'string') throw new DIDError('Stored DID subject key is invalid')
   const document = DID.buildDocument(
-    ci.issuanceTxid,
-    ci.subjectKey,
+    ci.issuanceTxid as string,
+    ci.subjectKey as string,
     didString,
-    ci.services ?? undefined
+    snapshotServices(ci.services, 'Stored DID services')
   )
   if (ci.additionalKeys != null) {
-    appendAdditionalKeys(document, ci.additionalKeys as string[], didString)
+    appendAdditionalKeys(
+      document,
+      snapshotStringArray(ci.additionalKeys, 'Stored DID additional keys', 32)!,
+      didString
+    )
   }
-  return {
-    didDocument: document,
-    didDocumentMetadata: {},
-    didResolutionMetadata: { contentType: DID_CONTENT_TYPE }
-  }
+  return validateDIDResolutionResult(
+    {
+      didDocument: document,
+      didDocumentMetadata: {},
+      didResolutionMetadata: { contentType: DID_CONTENT_TYPE }
+    },
+    didString
+  )
 }
 
 /** Append additional verification-method keys to a DID document (mutates document). */
@@ -258,22 +627,25 @@ function appendAdditionalKeys(
  * Rate-limiter for WoC API calls.
  * Returns a fetch-like function that throttles to at most one call per WOC_RATE_LIMIT_MS.
  */
-function makeWocFetcher(): (url: string) => Promise<Response> {
+function makeWocFetcher(trustedFetch?: typeof fetch): (url: string) => Promise<DIDHttpResult> {
   let lastCall = 0
-  return async (url: string): Promise<Response> => {
+  return async (url: string): Promise<DIDHttpResult> => {
     const elapsed = Date.now() - lastCall
     if (lastCall > 0 && elapsed < WOC_RATE_LIMIT_MS) {
       await new Promise(resolve => setTimeout(resolve, WOC_RATE_LIMIT_MS - elapsed))
     }
     lastCall = Date.now()
-    return await fetch(url)
+    return await fetchDIDJson(new URL(url), trustedFetch)
   }
 }
 
 /** Extract BSVDID OP_RETURN segments from a WoC transaction's vout array. */
-function extractBsvdidSegments(vout: any[]): string[] {
-  for (const out of vout) {
-    const hex = out?.scriptPubKey?.hex as string | undefined
+function extractBsvdidSegments(vout: unknown[]): string[] {
+  for (const [index, value] of vout.entries()) {
+    const out = ownDataRecord(value, `WoC outputs[${index}]`)
+    const script = optionalOwnDataRecord(out.scriptPubKey, `WoC outputs[${index}].scriptPubKey`)
+    const hex = script?.hex
+    if (hex != null && typeof hex !== 'string') return []
     if (hex == null || hex === '') continue
     const s = parseOpReturnSegments(hex)
     if (s.length >= 3 && s[0] === BSVDID_MARKER) return s
@@ -284,13 +656,14 @@ function extractBsvdidSegments(vout: any[]): string[] {
 /** Follow the WoC spend index to find the next txid spending output 0. */
 async function fetchNextTxidViaSpend(
   currentTxid: string,
-  wocFetch: (url: string) => Promise<Response>
+  wocFetch: (url: string) => Promise<DIDHttpResult>
 ): Promise<string | null> {
   try {
     const resp = await wocFetch(`${WOC_API}/tx/${currentTxid}/out/0/spend`)
-    if (resp.ok && resp.status !== 404) {
-      const data: any = await resp.json()
-      return data?.txid ?? null
+    if (resp.status === 200) {
+      const result = optionalOwnDataRecord(resp.body, 'WoC spend response')
+      const txid = result?.txid
+      return typeof txid === 'string' && /^[0-9a-f]{64}$/.test(txid) ? txid : null
     }
   } catch {
     /* fall through */
@@ -298,38 +671,22 @@ async function fetchNextTxidViaSpend(
   return null
 }
 
-/** Follow address history to find the next txid in the chain. */
-async function fetchNextTxidViaHistory(
-  txData: any,
-  visited: Set<string>,
-  wocFetch: (url: string) => Promise<Response>
-): Promise<string | null> {
-  const out0Addr = txData.vout?.[0]?.scriptPubKey?.addresses?.[0]
-  if (out0Addr == null) return null
-  try {
-    const resp = await wocFetch(`${WOC_API}/address/${String(out0Addr)}/history`)
-    if (!resp.ok) return null
-    const history = (await resp.json()) as Array<{ tx_hash: string; height: number }>
-    const candidates = history
-      .filter(e => !visited.has(e.tx_hash))
-      .sort((a, b) => b.height - a.height)
-    return candidates.length > 0 ? candidates[0].tx_hash : null
-  } catch {
-    return null
-  }
-}
-
 /** Resolve a DID by following the UTXO chain on WhatsOnChain (extracted logic). */
-async function resolveChainOnWoC(txid: string): Promise<DIDResolutionResult> {
+async function resolveChainOnWoC(
+  txid: string,
+  trustedFetch?: typeof fetch
+): Promise<DIDResolutionResult> {
   const notFound: DIDResolutionResult = {
     didDocument: null,
     didDocumentMetadata: {},
     didResolutionMetadata: { error: 'notFound', message: 'DID not found on chain' }
   }
 
-  const wocFetch = makeWocFetcher()
+  const wocFetch = makeWocFetcher(trustedFetch)
   const visited = new Set<string>()
   const state: WocChainState = {
+    did: DID.fromTxid(txid),
+    identityCode: undefined,
     lastDocument: null,
     lastDocTxid: undefined,
     created: undefined,
@@ -344,18 +701,44 @@ async function resolveChainOnWoC(txid: string): Promise<DIDResolutionResult> {
     visited.add(currentTxid)
 
     const txResp = await wocFetch(`${WOC_API}/tx/${currentTxid}`)
-    if (!txResp.ok) return notFound
-    const txData: any = await txResp.json()
+    if (txResp.status !== 200) return notFound
+    let txData: OwnDataRecord
+    let vout: unknown[]
+    try {
+      txData = ownDataRecord(txResp.body, 'WoC transaction')
+      vout = denseOwnArray(txData.vout, 'WoC transaction outputs')
+    } catch {
+      return notFound
+    }
+    if (txData.txid !== currentTxid) return notFound
+    if (hop > 0) {
+      const previousTxid = [...visited][visited.size - 2]
+      let inputs: OwnDataRecord[]
+      try {
+        inputs = denseOwnArray(txData.vin, 'WoC transaction inputs').map((input, index) =>
+          ownDataRecord(input, `WoC transaction inputs[${index}]`)
+        )
+      } catch {
+        return notFound
+      }
+      if (!inputs.some(input => input.txid === previousTxid && input.vout === 0)) return notFound
+    }
 
-    state.created ??= txData.time == null ? undefined : new Date(txData.time * 1000).toISOString()
+    if (
+      state.created == null &&
+      Number.isSafeInteger(txData.time) &&
+      (txData.time as number) >= 0
+    ) {
+      const created = new Date((txData.time as number) * 1000)
+      if (Number.isFinite(created.getTime())) state.created = created.toISOString()
+    }
 
-    const segments = extractBsvdidSegments((txData.vout as any[] | null) ?? [])
+    const segments = extractBsvdidSegments(vout)
     const earlyExit = processWocSegments(segments, txData, currentTxid, state)
     if (earlyExit != null) return earlyExit
 
     // Follow the chain to the next spending tx
-    let nextTxid = await fetchNextTxidViaSpend(currentTxid, wocFetch)
-    nextTxid ??= await fetchNextTxidViaHistory(txData, visited, wocFetch)
+    const nextTxid = await fetchNextTxidViaSpend(currentTxid, wocFetch)
     if (nextTxid == null) break
     currentTxid = nextTxid
   }
@@ -406,9 +789,15 @@ export class DID {
     if (/^[0-9a-f]{64}$/.test(identifier)) {
       return { method: 'bsv', identifier }
     }
-    if (/^[0-9a-fA-F]{66}$/.test(identifier)) {
-      // Legacy pubkey-based DID
-      return { method: 'bsv', identifier }
+    if (/^(?:02|03)[0-9a-fA-F]{64}$/.test(identifier)) {
+      // Legacy pubkey-based DID. Return one canonical encoding so equivalent
+      // keys cannot acquire distinct DID strings in caches or policy maps.
+      try {
+        const canonical = PublicKey.fromString(identifier).toString()
+        return { method: 'bsv', identifier: canonical }
+      } catch {
+        throw new DIDError('Invalid DID: legacy identifier is not a secp256k1 public key')
+      }
     }
     throw new DIDError(
       'Invalid DID: identifier must be a 64-character lowercase hex txid or 66-character hex public key'
@@ -471,7 +860,7 @@ export class DID {
       doc.service = services
     }
 
-    return doc
+    return validateDIDDocument(doc, did)
   }
 
   /**
@@ -479,18 +868,24 @@ export class DID {
    * Generate a legacy DID Document from an identity key (compressed public key hex).
    */
   static fromIdentityKey(identityKey: string): DIDDocument {
-    if (identityKey === '' || !/^[0-9a-fA-F]{66}$/.test(identityKey)) {
+    let canonical: string
+    try {
+      canonical = PublicKey.fromString(identityKey).toString()
+    } catch {
+      throw new DIDError('Invalid identity key: must be a 66-character hex compressed public key')
+    }
+    if (!/^(?:02|03)[0-9a-f]{64}$/.test(canonical)) {
       throw new DIDError('Invalid identity key: must be a 66-character hex compressed public key')
     }
 
-    const did = `${DID_PREFIX}${identityKey}`
+    const did = `${DID_PREFIX}${canonical}`
     const keyId = `${did}#key-1`
 
     const verificationMethod: DIDVerificationMethod = {
       id: keyId,
       type: LEGACY_KEY_TYPE,
       controller: did,
-      publicKeyHex: identityKey
+      publicKeyHex: canonical
     }
 
     return {
@@ -504,10 +899,18 @@ export class DID {
   }
 
   /**
-   * Get the certificate type used for DID persistence.
+   * Get the legacy certificate type used by previously persisted DID
+   * certificates. Retained so existing records remain discoverable.
    */
   static getCertificateType(): string {
-    return Utils.toBase64(Utils.toArray('did:bsv', 'utf8'))
+    return toBase64(toArray('did:bsv', 'utf8'))
+  }
+
+  /**
+   * Get the canonical 32-byte certificate type used for new DID persistence.
+   */
+  static getCanonicalCertificateType(): string {
+    return toBase64(sha256(toArray('did:bsv', 'utf8')))
   }
 }
 
@@ -534,52 +937,46 @@ async function spendChainOutput(params: {
   const chainKey = PrivateKey.fromHex(chainKeyHex)
 
   // Get BEEF for the chain UTXO
-  const result = await client.listOutputs({
+  const result = await listOutputsOwnData(client, {
     basket,
     include: 'entire transactions',
     includeCustomInstructions: true
-  } as any)
-
-  const beef = new Beef()
-  beef.mergeBeef(result.BEEF as number[])
-  const inputBEEF = beef.toBinary()
-
-  // Create action with custom input (chain UTXO to spend)
-  const response = await client.createAction({
-    description,
-    inputBEEF,
-    inputs: [
-      {
-        outpoint: currentOutpoint,
-        unlockingScriptLength: 108, // P2PKH: sig 73 + push 1 + pubkey 33 + push 1
-        inputDescription: 'DID chain UTXO'
-      }
-    ],
-    outputs: newOutputs,
-    options: { randomizeOutputs: false, acceptDelayedBroadcast: false }
-  } as any)
-
-  if (response?.signableTransaction == null) {
-    throw new DIDError('Expected signableTransaction for chain spend')
-  }
-
-  const signable = response.signableTransaction
-  const txToSign = Transaction.fromBEEF(signable.tx)
-  txToSign.inputs[0].unlockingScriptTemplate = new P2PKH().unlock(chainKey, 'all', false)
-  await txToSign.sign()
-
-  const unlockingScript = txToSign.inputs[0].unlockingScript?.toHex()
-  if (unlockingScript == null || unlockingScript === '')
-    throw new DIDError('Failed to generate unlocking script')
-
-  const finalResult = await client.signAction({
-    reference: signable.reference,
-    spends: { 0: { unlockingScript } }
   })
 
+  if (result.BEEF == null) {
+    throw new DIDError('Wallet did not return the chain transaction BEEF')
+  }
+
+  const beef = new Beef()
+  beef.mergeBeef(result.BEEF)
+  const inputBEEF = beef.toBinary()
+
+  const signed = await completeBoundAction(
+    client,
+    {
+      description,
+      inputBEEF,
+      inputs: [
+        {
+          outpoint: currentOutpoint,
+          unlockingScriptLength: 108, // P2PKH: sig 73 + push 1 + pubkey 33 + push 1
+          inputDescription: 'DID chain UTXO'
+        }
+      ],
+      outputs: newOutputs,
+      options: { randomizeOutputs: false, acceptDelayedBroadcast: false }
+    } as any,
+    {
+      inputSigners: {
+        [currentOutpoint]: async (transaction, inputIndex) =>
+          await new P2PKH().unlock(chainKey, 'all', false).sign(transaction, inputIndex)
+      }
+    }
+  )
+
   return {
-    txid: finalResult.txid ?? '',
-    tx: finalResult.tx
+    txid: signed.id('hex'),
+    tx: signed.toAtomicBEEF()
   }
 }
 
@@ -623,8 +1020,11 @@ function _buildDIDMethods(core: WalletCore): {
     async createDID(options?: DIDCreateOptions): Promise<DIDCreateResult> {
       try {
         const client = core.getClient()
-        const basket = options?.basket ?? core.defaults.didBasket
-        const identityCode = options?.identityCode ?? generateIdentityCode()
+        const safeOptions = snapshotDIDCreateOptions(options)
+        const basket = safeOptions.basket ?? core.defaults.didBasket
+        const identityCode = normalizeIdentityCode(
+          safeOptions.identityCode ?? generateIdentityCode()
+        )
         const protocolID = core.defaults.didProtocolID
 
         // Generate chain key — random PrivateKey for UTXO chain linking
@@ -633,17 +1033,26 @@ function _buildDIDMethods(core: WalletCore): {
         const chainAddress = chainKey.toPublicKey().toAddress()
 
         // Derive subject key
-        const { publicKey: subjectKey } = await client.getPublicKey({
+        const subjectKey = await getPublicKeyOwnData(client, {
           protocolID,
           keyID: `${identityCode}-subject`,
           counterparty: 'anyone'
         })
+        // Validate document inputs before creating the issuance transaction so
+        // malformed service/controller data cannot leave an orphaned chain UTXO.
+        const provisionalDID = `did:bsv:${'0'.repeat(64)}`
+        DID.buildDocument(
+          '0'.repeat(64),
+          subjectKey,
+          provisionalDID,
+          bindRelativeServiceIds(safeOptions.services, provisionalDID)
+        )
 
         // === TX0: Issuance (chain UTXO + OP_RETURN marker) ===
         const chainLockingScript = new P2PKH().lock(chainAddress).toHex()
         const opReturnIssuance = buildOpReturn(identityCode, '1')
 
-        const issuanceResult = await client.createAction({
+        const issuanceTxid = await createActionOwnData(client, {
           description: `DID issuance (${identityCode})`,
           outputs: [
             {
@@ -666,22 +1075,22 @@ function _buildDIDMethods(core: WalletCore): {
               outputDescription: 'DID issuance marker'
             }
           ],
-          options: { randomizeOutputs: false, acceptDelayedBroadcast: false }
+          options: {
+            randomizeOutputs: false,
+            acceptDelayedBroadcast: false,
+            returnTXIDOnly: true
+          }
         })
-
-        const issuanceTxid = issuanceResult.txid ?? ''
-        if (issuanceTxid === '') {
-          throw new DIDError('Issuance transaction did not return a txid')
-        }
 
         const did = DID.fromTxid(issuanceTxid)
 
         // Build document now that we know the DID
+        const services = bindRelativeServiceIds(safeOptions.services, did)
         const document = DID.buildDocument(
           issuanceTxid,
           subjectKey,
           did, // self-sovereign: controller = self
-          options?.services
+          services
         )
 
         // === TX1: Document (spend issuance out 0 via signableTransaction) ===
@@ -690,13 +1099,12 @@ function _buildDIDMethods(core: WalletCore): {
         // Ensure issuance output is tracked in basket (retry up to 3x)
         let found = false
         for (let attempt = 0; attempt < 3; attempt++) {
-          const listResult = await client.listOutputs({
+          const listResult = await listOutputsOwnData(client, {
             basket,
             include: 'locking scripts',
             includeCustomInstructions: true
-          } as any)
-          const outputs = listResult?.outputs ?? []
-          found = outputs.some((o: any) => o.outpoint === issuanceOutpoint)
+          })
+          found = listResult.outputs.some(output => output.outpoint === issuanceOutpoint)
           if (found) break
           await new Promise(resolve => setTimeout(resolve, 500))
         }
@@ -728,6 +1136,7 @@ function _buildDIDMethods(core: WalletCore): {
                 chainKeyHex,
                 subjectKey,
                 issuanceTxid,
+                services,
                 status: 'active'
               }),
               tags: ['did', 'did-chain']
@@ -754,7 +1163,11 @@ function _buildDIDMethods(core: WalletCore): {
 
     /**
      * Resolve a did:bsv DID to its DID Document.
-     * Tries Teranode Universal Resolver first, falls back to WhatsOnChain.
+     * Tries the configured authoritative resolver/proxy first, then the
+     * authoritative WhatsOnChain transaction/spend view. Returned data is
+     * bounded and structurally bound to the requested DID, but the current
+     * response contract carries no cryptographic chain/freshness proof. Do
+     * not use a remotely resolved key as sole authentication evidence.
      */
     async resolveDID(didString: string): Promise<DIDResolutionResult> {
       const parsed = DID.parse(didString)
@@ -773,11 +1186,19 @@ function _buildDIDMethods(core: WalletCore): {
       }
 
       // Try server-side proxy (bypasses CORS for browser clients)
-      const proxyResult = await tryProxyResolver(didString, core.defaults.didProxyUrl)
+      const proxyResult = await tryProxyResolver(
+        didString,
+        core.defaults.didProxyUrl,
+        core.defaults.didFetch
+      )
       if (proxyResult != null) return proxyResult
 
       // Try direct universal resolver (server-side SDK usage)
-      const resolverResult = await tryDirectResolver(didString, core.defaults.didResolverUrl)
+      const resolverResult = await tryDirectResolver(
+        didString,
+        core.defaults.didResolverUrl,
+        core.defaults.didFetch
+      )
       if (resolverResult != null) return resolverResult
 
       // WhatsOnChain direct fallback (server-side only — CORS-blocked in browsers)
@@ -792,14 +1213,13 @@ function _buildDIDMethods(core: WalletCore): {
       const client = core.getClient()
       const basket = core.defaults.didBasket
 
-      const listResult = await client.listOutputs({
+      const listResult = await listOutputsOwnData(client, {
         basket,
         include: 'locking scripts',
         includeCustomInstructions: true
-      } as any)
+      })
 
-      const outputs = listResult?.outputs ?? []
-      const latestCI = findLatestChainStateForDID(outputs, didString)
+      const latestCI = findLatestChainStateForDID(listResult.outputs, didString)
 
       if (latestCI == null) return null
 
@@ -820,14 +1240,14 @@ function _buildDIDMethods(core: WalletCore): {
      */
     async _resolveViaWhatsOnChain(txid: string): Promise<DIDResolutionResult> {
       try {
-        return await resolveChainOnWoC(txid)
-      } catch (error) {
+        return await resolveChainOnWoC(txid, core.defaults.didFetch)
+      } catch {
         return {
           didDocument: null,
           didDocumentMetadata: {},
           didResolutionMetadata: {
             error: 'internalError',
-            message: `WhatsOnChain resolution failed: ${(error as Error).message}`
+            message: 'WhatsOnChain resolution failed'
           }
         }
       }
@@ -839,32 +1259,45 @@ function _buildDIDMethods(core: WalletCore): {
      */
     async updateDID(options: DIDUpdateOptions): Promise<DIDCreateResult> {
       try {
+        const safeOptions = snapshotDIDUpdateOptions(options)
         const client = core.getClient()
-        DID.parse(options.did)
+        DID.parse(safeOptions.did)
         const basket = core.defaults.didBasket
 
-        const listResult = await client.listOutputs({
+        const listResult = await listOutputsOwnData(client, {
           basket,
           include: 'locking scripts',
           includeCustomInstructions: true
-        } as any)
+        })
 
-        const activeState = findActiveChainState(listResult?.outputs ?? [], options.did)
+        const activeState = findActiveChainState(listResult.outputs, safeOptions.did)
         if (activeState == null) {
-          throw new DIDError(`No active chain state found for ${options.did}`)
+          throw new DIDError(`No active chain state found for ${safeOptions.did}`)
         }
         const { chainCI, chainOutpoint } = activeState
         const { identityCode, subjectKey, issuanceTxid, chainKeyHex } = chainCI
-        if (chainKeyHex == null || chainKeyHex === '') {
+        if (typeof chainKeyHex !== 'string' || chainKeyHex === '') {
           throw new DIDError('Chain key not found in output metadata — cannot spend chain UTXO')
+        }
+        if (
+          typeof identityCode !== 'string' ||
+          typeof subjectKey !== 'string' ||
+          typeof issuanceTxid !== 'string'
+        ) {
+          throw new DIDError('Stored DID state is incomplete')
         }
 
         const chainKey = PrivateKey.fromHex(chainKeyHex)
         const chainAddress = chainKey.toPublicKey().toAddress()
 
-        const document = DID.buildDocument(issuanceTxid, subjectKey, options.did, options.services)
-        if (options.additionalKeys != null) {
-          appendAdditionalKeys(document, options.additionalKeys, options.did)
+        const document = DID.buildDocument(
+          issuanceTxid,
+          subjectKey,
+          safeOptions.did,
+          safeOptions.services
+        )
+        if (safeOptions.additionalKeys != null) {
+          appendAdditionalKeys(document, safeOptions.additionalKeys, safeOptions.did)
         }
 
         await spendChainOutput({
@@ -872,7 +1305,7 @@ function _buildDIDMethods(core: WalletCore): {
           basket,
           currentOutpoint: chainOutpoint,
           chainKeyHex,
-          description: `DID update for ${options.did}`,
+          description: `DID update for ${safeOptions.did}`,
           newOutputs: [
             {
               lockingScript: new P2PKH().lock(chainAddress).toHex(),
@@ -881,13 +1314,13 @@ function _buildDIDMethods(core: WalletCore): {
               basket,
               customInstructions: JSON.stringify({
                 type: 'did-update',
-                did: options.did,
+                did: safeOptions.did,
                 identityCode,
                 chainKeyHex,
                 subjectKey,
                 issuanceTxid,
-                services: options.services,
-                additionalKeys: options.additionalKeys,
+                services: safeOptions.services,
+                additionalKeys: safeOptions.additionalKeys,
                 status: 'active'
               }),
               tags: ['did', 'did-chain']
@@ -900,7 +1333,7 @@ function _buildDIDMethods(core: WalletCore): {
           ]
         })
 
-        return { did: options.did, txid: issuanceTxid, identityCode, document }
+        return { did: safeOptions.did, txid: issuanceTxid, identityCode, document }
       } catch (error) {
         if (error instanceof DIDError) throw error
         throw new DIDError(`DID update failed: ${(error as Error).message}`)
@@ -918,19 +1351,23 @@ function _buildDIDMethods(core: WalletCore): {
         DID.parse(didString)
         const basket = core.defaults.didBasket
 
-        const listResult = await client.listOutputs({
+        const listResult = await listOutputsOwnData(client, {
           basket,
           include: 'locking scripts',
           includeCustomInstructions: true
-        } as any)
+        })
 
-        const activeState = findActiveChainState(listResult?.outputs ?? [], didString)
+        const activeState = findActiveChainState(listResult.outputs, didString)
         if (activeState == null) {
           throw new DIDError(`No active chain state found for ${didString}`)
         }
         const { chainCI, chainOutpoint } = activeState
         const { identityCode, chainKeyHex } = chainCI
-        if (chainKeyHex == null || chainKeyHex === '') {
+        if (
+          typeof identityCode !== 'string' ||
+          typeof chainKeyHex !== 'string' ||
+          chainKeyHex === ''
+        ) {
           throw new DIDError('Chain key not found in output metadata — cannot spend chain UTXO')
         }
 
@@ -979,33 +1416,40 @@ function _buildDIDMethods(core: WalletCore): {
         const client = core.getClient()
         const basket = core.defaults.didBasket
 
-        const listResult = await client.listOutputs({
+        const listResult = await listOutputsOwnData(client, {
           basket,
           include: 'locking scripts',
           includeCustomInstructions: true
-        } as any)
+        })
 
-        const outputs = listResult?.outputs ?? []
         const didMap = new Map<string, DIDChainState>()
 
-        for (const output of outputs) {
-          if ((output as any).customInstructions == null) continue
+        for (const output of listResult.outputs) {
+          const ci = parsedChainInstructions(output)
+          if (ci == null) continue
           try {
-            const ci = JSON.parse((output as any).customInstructions)
-            if (ci.did == null || ci.identityCode == null) continue
+            if (typeof ci.did !== 'string' || typeof ci.identityCode !== 'string') continue
 
             // Skip pending issuance outputs (consumed by document TX)
             if (ci.status === 'pending') continue
+
+            const issuanceTxid =
+              typeof ci.issuanceTxid === 'string' ? ci.issuanceTxid : ci.did.replace('did:bsv:', '')
+            if (typeof output.outpoint !== 'string' || !/^[0-9a-f]{64}$/.test(issuanceTxid)) {
+              continue
+            }
+            const created = typeof ci.created === 'string' ? ci.created : new Date().toISOString()
+            const updated = typeof ci.updated === 'string' ? ci.updated : new Date().toISOString()
 
             // Always overwrite with the latest entry (later outputs = newer state)
             didMap.set(ci.did, {
               did: ci.did,
               identityCode: ci.identityCode,
-              issuanceTxid: ci.issuanceTxid ?? ci.did?.replace('did:bsv:', ''),
+              issuanceTxid,
               currentOutpoint: output.outpoint,
               status: ci.status === 'deactivated' ? 'deactivated' : 'active',
-              created: ci.created ?? new Date().toISOString(),
-              updated: ci.updated ?? new Date().toISOString()
+              created,
+              updated
             })
           } catch {}
         }
@@ -1032,11 +1476,13 @@ function _buildDIDMethods(core: WalletCore): {
       const { Certifier } = await import('./certification')
       const identityKey = core.getIdentityKey()
       const didDoc = DID.fromIdentityKey(identityKey) // NOSONAR — deprecated method intentionally uses deprecated API
+      const safeOptions =
+        options == null ? Object.create(null) : ownDataRecord(options, 'DID registration options')
 
-      if (options?.persist !== false) {
+      if (safeOptions.persist !== false) {
         try {
           const certifier = await Certifier.create({
-            certificateType: DID.getCertificateType()
+            certificateType: DID.getCanonicalCertificateType()
           })
 
           await certifier.certify(core, {

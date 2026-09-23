@@ -1,64 +1,97 @@
 import { DIDStorageManager } from './DIDStorageManager.js'
-import { AdmissionMode, LookupFormula, LookupQuestion, LookupService, OutputAdmittedByTopic, OutputSpent, SpendNotificationMode } from '@bsv/overlay'
-import { PushDrop, Utils } from '@bsv/sdk'
-import { DIDQuery } from './types.js'
+import {
+  AdmissionMode,
+  LookupFormula,
+  LookupQuestion,
+  LookupService,
+  OutputAdmittedByTopic,
+  OutputSpent,
+  SpendNotificationMode
+} from '@bsv/overlay'
+import { decodeCanonicalDIDToken } from '@bsv/sdk'
 import { Db } from 'mongodb'
+import {
+  readDate,
+  readInteger,
+  readSortOrder,
+  readString,
+  requireBase64,
+  requireLookupQuery,
+  requireOutpoint
+} from '../shared/queryValidation.js'
 
-class DIDLookupService implements LookupService {
+export class DIDLookupService implements LookupService {
   readonly admissionMode: AdmissionMode = 'locking-script'
   readonly spendNotificationMode: SpendNotificationMode = 'none'
 
-  constructor (public storageManager: DIDStorageManager) { }
+  constructor(public storageManager: DIDStorageManager) {}
 
-  async outputAdmittedByTopic (payload: OutputAdmittedByTopic): Promise<void> {
+  async outputAdmittedByTopic(payload: OutputAdmittedByTopic): Promise<void> {
     if (payload.mode !== 'locking-script') throw new Error('Invalid payload')
     const { txid, outputIndex, topic, lockingScript } = payload
     if (topic !== 'tm_did') return
 
-    const result = PushDrop.decode(lockingScript)
-    // Serial number is stored as base64-encoded bytes
-    const serialNumber = Utils.toBase64(result.fields[0])
+    // Revalidate at the persistence boundary; callers can invoke a lookup
+    // service independently of a colocated topic manager.
+    const { serialNumber } = decodeCanonicalDIDToken(lockingScript)
 
     await this.storageManager.storeRecord(txid, outputIndex, serialNumber)
   }
 
-  async outputSpent (payload: OutputSpent): Promise<void> {
+  async outputSpent(payload: OutputSpent): Promise<void> {
     if (payload.mode !== 'none') throw new Error('Invalid payload')
     const { topic, txid, outputIndex } = payload
     if (topic !== 'tm_did') return
     await this.storageManager.deleteRecord(txid, outputIndex)
   }
 
-  async outputEvicted (txid: string, outputIndex: number): Promise<void> {
+  async outputEvicted(txid: string, outputIndex: number): Promise<void> {
     await this.storageManager.deleteRecord(txid, outputIndex)
   }
 
-  async lookup (question: LookupQuestion): Promise<LookupFormula> {
-    if (question.query === undefined || question.query === null) {
-      throw new Error('A valid query must be provided!')
-    }
-    if (question.service !== 'ls_did') {
-      throw new Error('Lookup service not supported!')
-    }
+  async lookup(question: LookupQuestion): Promise<LookupFormula> {
+    const query = requireLookupQuery(question, 'ls_did', [
+      'serialNumber',
+      'outpoint',
+      'limit',
+      'skip',
+      'sortOrder',
+      'startDate',
+      'endDate'
+    ])
+    const serialNumber = requireBase64(
+      readString(query, 'serialNumber', { maxBytes: 344 }),
+      'serialNumber'
+    )
+    const outpoint = requireOutpoint(readString(query, 'outpoint', { maxBytes: 75 }))
 
-    const questionToAnswer = (question.query as DIDQuery)
-
-    if (questionToAnswer.serialNumber != null) {
-      return await this.storageManager.findByCertificateSerialNumber(questionToAnswer.serialNumber)
+    const limit = readInteger(query, 'limit', 50, 1, 100)
+    const skip = readInteger(query, 'skip', 0, 0, 100000)
+    const sortOrder = readSortOrder(query)
+    const startDate = readDate(query, 'startDate')
+    const endDate = readDate(query, 'endDate')
+    if (startDate !== undefined && endDate !== undefined && startDate > endDate) {
+      throw new Error('Invalid lookup query: startDate must not follow endDate')
     }
-
-    if (questionToAnswer.outpoint != null) {
-      return await this.storageManager.findByOutpoint(questionToAnswer.outpoint)
-    }
-
-    throw new Error('No valid query parameters provided!')
+    return await this.storageManager.findRecords(
+      {
+        serialNumber,
+        txid: outpoint?.txid,
+        outputIndex: outpoint?.outputIndex,
+        startDate,
+        endDate
+      },
+      limit,
+      skip,
+      sortOrder
+    )
   }
 
-  async getDocumentation (): Promise<string> {
-    return 'DID Lookup Service: resolve decentralized identifiers by serial number or outpoint.'
+  async getDocumentation(): Promise<string> {
+    return 'DID Lookup Service: finds canonical legacy DID tokens by serial number or outpoint. The v1 wire format does not establish issuer or subject authority.'
   }
 
-  async getMetaData (): Promise<{
+  async getMetaData(): Promise<{
     name: string
     shortDescription: string
     iconURL?: string
@@ -72,5 +105,7 @@ class DIDLookupService implements LookupService {
   }
 }
 
-function create (db: Db): DIDLookupService { return new DIDLookupService(new DIDStorageManager(db)) }
+function create(db: Db): DIDLookupService {
+  return new DIDLookupService(new DIDStorageManager(db))
+}
 export default create

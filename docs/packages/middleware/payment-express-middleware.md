@@ -3,7 +3,7 @@ id: pkg-payment-express-middleware
 title: '@bsv/payment-express-middleware'
 kind: package
 domain: middleware
-version: '2.1.6'
+version: '2.1.7'
 source_repo: 'bsv-blockchain/ts-stack'
 last_updated: '2026-08-27'
 last_verified: '2026-08-27'
@@ -75,10 +75,14 @@ accepted zero-value receipt. Invalid pricing fails closed.
    `derivationPrefix`, `derivationSuffix`, and `transaction`.
 4. The transaction must be valid Atomic BEEF whose output zero covers the
    current price.
-5. The transaction ID is atomically claimed before the wallet is called.
-6. Only `{ accepted: true }` from a newly internalized payment authorizes the
-   route.
-7. `req.payment.satoshisPaid` and the response header report the actual output
+5. Legacy overinclusive Atomic BEEF is reduced to the declared payment subject
+   and dependency closure before it reaches the wallet or receipt.
+6. Only an own-data `{ accepted: true }` from a newly internalized payment
+   authorizes the route; inherited and accessor-backed verdicts are rejected.
+7. After wallet validation, the transaction ID is atomically claimed. This
+   ordering prevents invalid public BEEF/remittance pairs from poisoning a
+   rightful payment's replay key.
+8. `req.payment.satoshisPaid` and the response header report the actual output
    value.
 
 The raw header is bounded to 64 KiB by default. Duplicated, malformed,
@@ -109,8 +113,11 @@ const replayStore = {
 }
 ```
 
-Claims are retained after ambiguous wallet errors. A derivation nonce proves
-the server created a prefix; it is not an expiring single-use replay database.
+Wallet errors and rejected remittances are not claimed. If the wallet accepts
+but the subsequent replay claim is unavailable, the middleware returns `503`;
+operators must reconcile that ambiguous transaction before asking the payer to
+spend again. A derivation nonce proves the server created a prefix; it is not
+an expiring single-use replay database.
 
 ## Configuration
 
@@ -121,8 +128,8 @@ the server created a prefix; it is not an expiring single-use replay database.
 - `logger` — optional structured `error`/`warn` sink
 
 The logger receives sanitized failure metadata, not exception messages,
-transaction IDs, wallet objects, or payment bodies. HTTP responses are also
-stable and sanitized.
+transaction IDs, wallet objects, or payment bodies. Logger failures are
+contained. HTTP responses are also stable and sanitized.
 
 ## Payment receipt
 
@@ -150,7 +157,8 @@ wildcard origin with credentialed CORS.
 - Run auth first, then payment, then protected routes.
 - Use HTTPS and normal request/header/rate limits.
 - Use durable atomic replay storage across processes and replicas.
-- Never automatically delete a claim after an ambiguous wallet result.
+- Reconcile a transaction after a replay-store failure that follows wallet
+  acceptance; never ask the payer to spend again based only on that `503`.
 - Alert on replay (`409`) and unavailable/capacity (`503`) responses.
 - Keep pricing deterministic and security-reviewed.
 - The wallet remains responsible for safely internalizing the BRC-29

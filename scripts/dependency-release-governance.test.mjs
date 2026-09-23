@@ -9,6 +9,7 @@ import {
   immutableDeploymentImages,
   isAutomationPullRequest,
   parsePnpmOverrides,
+  validateDependabotExclusions,
   validateDependencyReleaseGovernance,
   validatePullRequestEvidence
 } from './dependency-release-governance.mjs'
@@ -21,22 +22,23 @@ test('dependency and release governance is internally complete', () => {
   assert.deepEqual(validateDependencyReleaseGovernance(), [])
 
   const overrides = collectOverrides()
-  assert.equal(overrides.length, 23)
+  assert.equal(overrides.length, 24)
   assert.equal(overrides.filter(entry => entry.selector === 'gaxios').length, 8)
   assert.equal(overrides.filter(entry => entry.selector === 'uuid').length, 3)
   assert.equal(overrides.filter(entry => entry.selector === 'brace-expansion').length, 4)
   assert.equal(overrides.filter(entry => entry.selector === 'toml@<4.2.0').length, 1)
   assert.equal(overrides.filter(entry => entry.selector === 'js-yaml@<3.15.2').length, 1)
   assert.equal(overrides.filter(entry => entry.selector === 'js-yaml').length, 1)
-})
-
-test('image-size patch contains both parser progress guards', () => {
-  const patch = fs.readFileSync(path.join(process.cwd(), 'patches/image-size@1.2.1.patch'), 'utf8')
-  assert.match(
-    patch,
-    /if \(imageLength < SIZE_HEADER \|\| imageLength > input\.length - imageOffset\)/
+  assert.deepEqual(
+    overrides.filter(entry => entry.selector === 'metro@0.87.0>image-size'),
+    [
+      {
+        source: 'pnpm-workspace.yaml',
+        selector: 'metro@0.87.0>image-size',
+        value: '2.0.4'
+      }
+    ]
   )
-  assert.match(patch, /if \(boxSize < 8\)/)
 })
 
 test('pnpm override parsing preserves scoped parent selectors', () => {
@@ -45,12 +47,12 @@ test('pnpm override parsing preserves scoped parent selectors', () => {
 minimumReleaseAge: 1440
 overrides:
   brace-expansion@<5.0.9: 5.0.9
-  'typed-rest-client@2.3.1>qs': 6.15.3
+  qs@<6.16.0: 6.16.0
 trustPolicy: no-downgrade
 `),
     [
       { selector: 'brace-expansion@<5.0.9', value: '5.0.9' },
-      { selector: 'typed-rest-client@2.3.1>qs', value: '6.15.3' }
+      { selector: 'qs@<6.16.0', value: '6.16.0' }
     ]
   )
 })
@@ -146,4 +148,27 @@ test('scheduled dependency verification installs the workspace before docs facts
   assert.ok(install > 0)
   assert.ok(docsFacts > install)
   assert.doesNotMatch(workflow, /^\s*(NODE_AUTH_TOKEN|NPM_TOKEN|registry-url)\s*:/m)
+})
+
+test('Dependabot rejects parent paths before GitHub disables every update job', () => {
+  const invalid = `updates:
+  - package-ecosystem: npm
+    exclude-paths:
+      - '../../pnpm-lock.yaml'
+      - "../../../pnpm-workspace.yaml"
+    ignore:
+      - dependency-name: '..unrelated-name'
+`
+  assert.deepEqual(validateDependabotExclusions(invalid), [
+    "Dependabot exclude-paths line 4 must not contain '..'",
+    "Dependabot exclude-paths line 5 must not contain '..'"
+  ])
+  assert.deepEqual(
+    validateDependabotExclusions(
+      invalid
+        .replace('../../pnpm-lock.yaml', '**/pnpm-lock.yaml')
+        .replace('../../../pnpm-workspace.yaml', '**/pnpm-workspace.yaml')
+    ),
+    []
+  )
 })

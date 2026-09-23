@@ -1,6 +1,6 @@
+import { validateCreateActionArgs, validateSatoshis } from '@bsv/sdk/wallet/validationHelpers'
 import {
   WalletInterface,
-  Utils,
   PushDrop,
   LockingScript,
   Transaction,
@@ -8,7 +8,6 @@ import {
   Base64String,
   PubKeyHex,
   Beef,
-  Validation,
   WalletEncryptArgs,
   WalletDecryptArgs,
   CreateHmacArgs,
@@ -24,11 +23,63 @@ import {
   ListActionsArgs,
   ListActionsResult,
   Telemetry,
-  TelemetryConfig
+  TelemetryConfig,
+  completeBoundAction,
+  createPublicHTTPSFetch,
+  decodeCanonicalPushDrop,
+  Signature
 } from '@bsv/sdk'
+import { toArray, toBase64, toUTF8, toUTF8Strict } from '@bsv/sdk/primitives/utils'
 
 import { parseBrc114ActionTimeLabels } from './utility/brc114ActionTimeLabels'
 import { parseBrc177NoSendExpiryLabels } from './utility/brc177NoSendExpiry'
+import { exactActionSpendSymbol, type ExactActionSpendCarrier } from './utility/exactActionSpend'
+import { WERR_UNAUTHORIZED } from './sdk/WERR_errors'
+// Imported from the leaf module directly (not generateChange.ts, which
+// transitively imports StorageProvider.ts and the full signer/create-action
+// module graph) to avoid an unrelated circular-import edge from this file.
+import { maxPossibleSatoshis } from './storage/methods/maxPossibleSatoshis'
+
+const MAX_PERMISSION_TOKEN_FIELD_BYTES = 1024 * 1024
+const MAX_PERMISSION_TOKEN_PAYLOAD_BYTES = 4 * 1024 * 1024
+const MAX_PERMISSION_TOKEN_LIST_FIELDS = 256
+const MAX_MONEY_SATOSHIS = 21e14
+
+function parseCanonicalPermissionInteger(value: string, label: string, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (!/^(?:0|[1-9]\d*)$/.test(value)) throw new Error(`${label} is not a canonical non-negative integer.`)
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed > maximum) {
+    throw new Error(`${label} is outside the supported range.`)
+  }
+  return parsed
+}
+
+function parsePermissionBoolean(value: string, label: string): boolean {
+  if (value !== 'true' && value !== 'false') throw new Error(`${label} must be true or false.`)
+  return value === 'true'
+}
+
+function parsePermissionCertificateFields(value: string): string[] {
+  const parsed: unknown = JSON.parse(value)
+  if (!Array.isArray(parsed) || parsed.length > MAX_PERMISSION_TOKEN_LIST_FIELDS) {
+    throw new Error('Permission certificate fields must be a bounded array.')
+  }
+  const fields: string[] = []
+  const seen = new Set<string>()
+  for (const field of parsed) {
+    if (
+      typeof field !== 'string' ||
+      field.length === 0 ||
+      new TextEncoder().encode(field).length >= 50 ||
+      seen.has(field)
+    ) {
+      throw new Error('Permission certificate fields are invalid.')
+    }
+    seen.add(field)
+    fields.push(field)
+  }
+  return fields
+}
 
 function brc177PreflightSatoshis(args: object): number {
   const outputs = (args as { outputs?: Array<{ satoshis?: unknown }> }).outputs ?? []
@@ -37,6 +88,13 @@ function brc177PreflightSatoshis(args: object): number {
     if (typeof output.satoshis !== 'number' || !Number.isSafeInteger(output.satoshis) || output.satoshis < 0) {
       throw new Error('BRC-177 outputs must contain valid satoshi amounts')
     }
+    // A sendMax output is requested with the `maxPossibleSatoshis` sentinel
+    // (see storage/methods/generateChange); its real cost is unknowable until
+    // storage funds the transaction, so it cannot contribute a meaningful
+    // amount to this pre-funding estimate. The real amount is still gated by
+    // the post-funding spend check in createAction (computeNetSpend) once it
+    // is known.
+    if (output.satoshis === maxPossibleSatoshis) continue
     total += output.satoshis
     if (!Number.isSafeInteger(total)) throw new Error('BRC-177 output amount exceeds the safely supported range')
   }
@@ -433,7 +491,9 @@ export interface PermissionsManagerConfig {
 
   /**
    * If discoverByIdentityKey / discoverByAttributes are called, do we require permission
-   * for "identity resolution" usage?
+   * for "identity resolution" usage? This covers both locally authoritative contact results and
+   * third-party certificate-overlay results; permission does not change either source's trust
+   * semantics.
    */
   seekPermissionsForIdentityResolution?: boolean
 
@@ -592,6 +652,14 @@ export class WalletPermissionsManager implements WalletInterface {
   private readonly permissionCache: Map<string, { expiry: number; cachedAt: number }> = new Map()
   private readonly recentGrants: Map<string, number> = new Map()
 
+  /** Originator binding for partial actions issued through this manager. */
+  private readonly pendingActionOriginators: Map<string, string> = new Map()
+  /** Exact authorized transaction template for each pending action. */
+  private readonly pendingActionTemplates: Map<string, Transaction> = new Map()
+  /** References that failed authorization and could not be conclusively aborted. */
+  private readonly blockedActionReferences: Set<string> = new Set()
+  private permissionTokenLockingKeyPromise?: Promise<string>
+
   /**
    * Token mints currently being written on-chain, keyed by permission cache
    * key. A granted permission is only cached once its token finishes minting
@@ -624,6 +692,8 @@ export class WalletPermissionsManager implements WalletInterface {
   > = new Map()
 
   private static readonly MANIFEST_CACHE_TTL_MS = 5 * 60 * 1000
+  private static readonly MANIFEST_MAX_BYTES = 256 * 1024
+  private static readonly MANIFEST_TIMEOUT_MS = 10_000
 
   private readonly groupedPermissionFlowTail: Map<string, Promise<void>> = new Map()
 
@@ -644,12 +714,6 @@ export class WalletPermissionsManager implements WalletInterface {
   private static readonly CACHE_TTL_MS = 5 * 60 * 1000
   /** Window during which freshly granted permissions are auto-allowed (except spending). */
   private static readonly RECENT_GRANT_COVER_MS = 15 * 1000
-
-  /** Default ports used when normalizing originator values. */
-  private static readonly DEFAULT_PORTS: Record<string, string> = {
-    'http:': '80',
-    'https:': '443'
-  }
 
   /**
    * Configuration that determines whether to skip or apply various checks and encryption.
@@ -1834,11 +1898,22 @@ export class WalletPermissionsManager implements WalletInterface {
       groupPermissions: GroupedPermissions | null
       counterpartyPermissions: CounterpartyPermissions | null
     }> => {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), WalletPermissionsManager.MANIFEST_TIMEOUT_MS)
       try {
-        const proto = originator.startsWith('localhost:') ? 'http' : 'https'
-        const response = await fetch(`${proto}://${originator}/manifest.json`)
+        const localDevelopment = originator === 'localhost' || originator.startsWith('localhost:')
+        const proto = localDevelopment ? 'http' : 'https'
+        const expectedOrigin = `${proto}://${originator}`
+        // Localhost HTTP is an explicit development compatibility path. Every
+        // public origin uses resolved-address validation and a DNS-pinned
+        // connection so a manifest hostname cannot rebind to a private host.
+        const manifestFetch = localDevelopment ? globalThis.fetch : createPublicHTTPSFetch(expectedOrigin)
+        const response = await manifestFetch(`${expectedOrigin}/manifest.json`, {
+          redirect: 'error',
+          signal: controller.signal
+        })
         if (response.ok) {
-          const manifest = await response.json()
+          const manifest = await this.readBoundedManifest(response)
           const namespace = manifest?.metanet || manifest?.babbage
           const groupPermissions: GroupedPermissions | null = namespace?.groupPermissions || null
           const counterpartyPermissionsDeclared: CounterpartyPermissions | null = this.validateCounterpartyPermissions(
@@ -1853,6 +1928,8 @@ export class WalletPermissionsManager implements WalletInterface {
         }
       } catch {
         // Manifest fetch or parse failed — fall through to return null/null defaults below
+      } finally {
+        clearTimeout(timeout)
       }
 
       const result = { groupPermissions: null, counterpartyPermissions: null }
@@ -1866,6 +1943,52 @@ export class WalletPermissionsManager implements WalletInterface {
     } finally {
       this.manifestFetchInProgress.delete(originator)
     }
+  }
+
+  private async readBoundedManifest(response: Response): Promise<any> {
+    const declaredLength = response.headers?.get('content-length')
+    if (declaredLength != null) {
+      const parsedLength = Number(declaredLength)
+      if (
+        !Number.isSafeInteger(parsedLength) ||
+        parsedLength < 0 ||
+        parsedLength > WalletPermissionsManager.MANIFEST_MAX_BYTES
+      ) {
+        throw new Error('Manifest response exceeds the configured size limit.')
+      }
+    }
+
+    if (response.body == null) {
+      // Test and embedded fetch implementations may expose only json(). Bound
+      // their parsed representation before accepting it.
+      const parsed = await response.json()
+      if (new TextEncoder().encode(JSON.stringify(parsed)).length > WalletPermissionsManager.MANIFEST_MAX_BYTES) {
+        throw new Error('Manifest response exceeds the configured size limit.')
+      }
+      return parsed
+    }
+
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value == null) continue
+      total += value.byteLength
+      if (total > WalletPermissionsManager.MANIFEST_MAX_BYTES) {
+        await reader.cancel()
+        throw new Error('Manifest response exceeds the configured size limit.')
+      }
+      chunks.push(value)
+    }
+    const bytes = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
   }
 
   private async fetchManifestGroupPermissions(originator: string): Promise<GroupedPermissions | null> {
@@ -2569,7 +2692,7 @@ export class WalletPermissionsManager implements WalletInterface {
 
   /** We always use `keyID="1"` and `counterparty="self"` for these encryption ops. */
   private async encryptPermissionTokenField(plaintext: string | number[]): Promise<number[]> {
-    const data = typeof plaintext === 'string' ? Utils.toArray(plaintext, 'utf8') : plaintext
+    const data = typeof plaintext === 'string' ? toArray(plaintext, 'utf8') : plaintext
     const { ciphertext } = await this.underlying.encrypt(
       {
         plaintext: data,
@@ -2595,7 +2718,7 @@ export class WalletPermissionsManager implements WalletInterface {
       let parsed = this.parsedBeefCache.get(beef)
       if (parsed === undefined) {
         try {
-          parsed = Beef.fromBinary(beef)
+          parsed = Beef.fromBinaryStrict(beef)
         } catch {
           parsed = null
         }
@@ -2610,6 +2733,66 @@ export class WalletPermissionsManager implements WalletInterface {
     // Preserve the original behavior (including throwing) for bundles the
     // fast path can't serve.
     return Transaction.fromBEEF(beef ?? [], txid)
+  }
+
+  private async permissionTokenLockingKey(): Promise<string> {
+    const pending =
+      this.permissionTokenLockingKeyPromise ??
+      this.underlying
+        .getPublicKey(
+          {
+            protocolID: WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
+            keyID: '1',
+            counterparty: 'self',
+            forSelf: true
+          },
+          this.adminOriginator
+        )
+        .then(({ publicKey }) => {
+          if (typeof publicKey !== 'string' || !/^(?:02|03)[0-9a-f]{64}$/i.test(publicKey)) {
+            throw new Error('Wallet returned an invalid permission-token locking key.')
+          }
+          return publicKey.toLowerCase()
+        })
+    this.permissionTokenLockingKeyPromise = pending
+    try {
+      return await pending
+    } catch (error) {
+      if (this.permissionTokenLockingKeyPromise === pending) this.permissionTokenLockingKeyPromise = undefined
+      throw error
+    }
+  }
+
+  private async authenticatedPermissionTokenSource(
+    result: ListOutputsResult,
+    output: ListOutputsResult['outputs'][number],
+    dataFieldCount: number
+  ): Promise<{ tx: Transaction; txid: string; outputIndex: number; fields: number[][] } | undefined> {
+    try {
+      const [txid, outputIndex] = this.parseOutpoint(output.outpoint)
+      const tx = this.transactionFromResultBeef(result, txid)
+      if (tx.id('hex').toLowerCase() !== txid) throw new Error('Permission token transaction ID mismatch.')
+      const txOutput = tx.outputs[outputIndex]
+      if (txOutput == null || txOutput.satoshis !== 1 || output.satoshis !== 1) {
+        throw new Error('Permission token source output is invalid.')
+      }
+      const decoded = decodeCanonicalPushDrop(txOutput.lockingScript, {
+        fieldCount: dataFieldCount + 1,
+        maximumFieldBytes: MAX_PERMISSION_TOKEN_FIELD_BYTES,
+        maximumPayloadBytes: MAX_PERMISSION_TOKEN_PAYLOAD_BYTES
+      })
+      if (decoded.lockingPublicKey.toString().toLowerCase() !== (await this.permissionTokenLockingKey())) {
+        throw new Error('Permission token is not controlled by this wallet.')
+      }
+      const fields = decoded.fields.slice(0, -1)
+      const signature = Signature.fromDER(decoded.fields.at(-1)!)
+      if (!signature.verify(fields.flat(), decoded.lockingPublicKey)) {
+        throw new Error('Permission token field signature is invalid.')
+      }
+      return { tx, txid, outputIndex, fields }
+    } catch {
+      return undefined
+    }
   }
 
   private async decryptPermissionTokenField(ciphertext: number[]): Promise<number[]> {
@@ -2635,6 +2818,10 @@ export class WalletPermissionsManager implements WalletInterface {
     }
   }
 
+  private async decryptPermissionTokenText(ciphertext: number[]): Promise<string> {
+    return toUTF8Strict(await this.decryptPermissionTokenField(ciphertext))
+  }
+
   /**
    * Encrypts wallet metadata if configured to do so, otherwise returns the original plaintext for storage.
    * @param plaintext The metadata to encrypt if configured to do so
@@ -2646,13 +2833,13 @@ export class WalletPermissionsManager implements WalletInterface {
     }
     const { ciphertext } = await this.underlying.encrypt(
       {
-        plaintext: Utils.toArray(plaintext, 'utf8'),
+        plaintext: toArray(plaintext, 'utf8'),
         protocolID: WalletPermissionsManager.METADATA_ENCRYPTION_PROTOCOL,
         keyID: '1'
       },
       this.adminOriginator
     )
-    return Utils.toBase64(ciphertext)
+    return toBase64(ciphertext)
   }
 
   /**
@@ -2664,13 +2851,13 @@ export class WalletPermissionsManager implements WalletInterface {
     try {
       const { plaintext } = await this.underlying.decrypt(
         {
-          ciphertext: Utils.toArray(ciphertext, 'base64'),
+          ciphertext: toArray(ciphertext, 'base64'),
           protocolID: WalletPermissionsManager.METADATA_ENCRYPTION_PROTOCOL,
           keyID: '1'
         },
         this.adminOriginator
       )
-      return Utils.toUTF8(plaintext)
+      return toUTF8(plaintext)
     } catch {
       // Decryption failed (e.g. wrong key, unencrypted legacy value) — return original string unchanged
       return ciphertext
@@ -2692,29 +2879,39 @@ export class WalletPermissionsManager implements WalletInterface {
     protoNameDecoded: string
     cptyDecoded: string
   }> {
-    const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(fields[0]))
-    const expiryDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(fields[1])), 10)
-    const privDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(fields[2])) === 'true'
-    const secLevelDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(fields[3])), 10) as
-      0 | 1 | 2
-    const protoNameDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(fields[4]))
-    const cptyDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(fields[5]))
+    const domainDecoded = await this.decryptPermissionTokenText(fields[0])
+    const expiryDecoded = parseCanonicalPermissionInteger(
+      await this.decryptPermissionTokenText(fields[1]),
+      'Permission expiry'
+    )
+    const privDecoded = parsePermissionBoolean(
+      await this.decryptPermissionTokenText(fields[2]),
+      'Permission privileged flag'
+    )
+    const securityLevel = parseCanonicalPermissionInteger(
+      await this.decryptPermissionTokenText(fields[3]),
+      'Permission security level',
+      2
+    )
+    const secLevelDecoded = securityLevel as 0 | 1 | 2
+    const protoNameDecoded = await this.decryptPermissionTokenText(fields[4])
+    const cptyDecoded = await this.decryptPermissionTokenText(fields[5])
     return { domainDecoded, expiryDecoded, privDecoded, secLevelDecoded, protoNameDecoded, cptyDecoded }
   }
 
   private protocolTokenTags(
-    originator: string,
+    originator: string | undefined,
     privileged: boolean,
     securityLevel: SecurityLevel,
     protocolName: string,
     counterparty: string
   ): string[] {
     const tags = [
-      `originator ${originator}`,
       `privileged ${!!privileged}`,
       `protocolName ${protocolName}`,
       `protocolSecurityLevel ${securityLevel}`
     ]
+    if (originator !== undefined) tags.unshift(`originator ${originator}`)
     if (securityLevel === 2) tags.push(`counterparty ${counterparty}`)
     return tags
   }
@@ -2730,11 +2927,10 @@ export class WalletPermissionsManager implements WalletInterface {
       counterparty: string
     }
   ): Promise<PermissionToken | undefined> {
-    const [txid, outputIndex] = this.parseOutpoint(output.outpoint)
-    const tx = this.transactionFromResultBeef(result, txid)
-    const decoded = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-    if (decoded?.fields == null || decoded.fields.length < 6) return undefined
-    const fields = await this.decryptProtocolTokenFields(decoded.fields)
+    const source = await this.authenticatedPermissionTokenSource(result, output, 6)
+    if (source == null) return undefined
+    const { tx, txid, outputIndex } = source
+    const fields = await this.decryptProtocolTokenFields(source.fields)
     if (this.normalizeOriginator(fields.domainDecoded) !== expected.originator) return undefined
     const matches =
       fields.privDecoded === !!expected.privileged &&
@@ -2764,14 +2960,16 @@ export class WalletPermissionsManager implements WalletInterface {
     originator: string,
     basket: string
   ): Promise<PermissionToken | undefined> {
-    const [txid, outputIndex] = this.parseOutpoint(output.outpoint)
-    const tx = this.transactionFromResultBeef(result, txid)
-    const decoded = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-    if (decoded?.fields == null || decoded.fields.length < 3) return undefined
-    const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(decoded.fields[0]))
+    const source = await this.authenticatedPermissionTokenSource(result, output, 3)
+    if (source == null) return undefined
+    const { tx, txid, outputIndex, fields } = source
+    const domainDecoded = await this.decryptPermissionTokenText(fields[0])
     if (this.normalizeOriginator(domainDecoded) !== originator) return undefined
-    const expiryDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(decoded.fields[1])), 10)
-    const basketDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(decoded.fields[2]))
+    const expiryDecoded = parseCanonicalPermissionInteger(
+      await this.decryptPermissionTokenText(fields[1]),
+      'Permission expiry'
+    )
+    const basketDecoded = await this.decryptPermissionTokenText(fields[2])
     if (basketDecoded !== basket) return undefined
     return {
       tx: tx.toBEEF(),
@@ -2797,18 +2995,23 @@ export class WalletPermissionsManager implements WalletInterface {
       fields: string[]
     }
   ): Promise<PermissionToken | undefined> {
-    const [txid, outputIndex] = this.parseOutpoint(output.outpoint)
-    const tx = this.transactionFromResultBeef(result, txid)
-    const decoded = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-    if (decoded?.fields == null || decoded.fields.length < 6) return undefined
-    const [domainRaw, expiryRaw, privRaw, typeRaw, fieldsRaw, verifierRaw] = decoded.fields
-    const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(domainRaw))
+    const source = await this.authenticatedPermissionTokenSource(result, output, 6)
+    if (source == null) return undefined
+    const { tx, txid, outputIndex } = source
+    const [domainRaw, expiryRaw, privRaw, typeRaw, fieldsRaw, verifierRaw] = source.fields
+    const domainDecoded = await this.decryptPermissionTokenText(domainRaw)
     if (this.normalizeOriginator(domainDecoded) !== expected.originator) return undefined
-    const expiryDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(expiryRaw)), 10)
-    const privileged = Utils.toUTF8(await this.decryptPermissionTokenField(privRaw)) === 'true'
-    const certType = Utils.toUTF8(await this.decryptPermissionTokenField(typeRaw))
-    const verifier = Utils.toUTF8(await this.decryptPermissionTokenField(verifierRaw))
-    const allFields = JSON.parse(Utils.toUTF8(await this.decryptPermissionTokenField(fieldsRaw))) as string[]
+    const expiryDecoded = parseCanonicalPermissionInteger(
+      await this.decryptPermissionTokenText(expiryRaw),
+      'Permission expiry'
+    )
+    const privileged = parsePermissionBoolean(
+      await this.decryptPermissionTokenText(privRaw),
+      'Permission privileged flag'
+    )
+    const certType = await this.decryptPermissionTokenText(typeRaw)
+    const verifier = await this.decryptPermissionTokenText(verifierRaw)
+    const allFields = parsePermissionCertificateFields(await this.decryptPermissionTokenText(fieldsRaw))
     const metadataMatches =
       privileged === !!expected.privileged && certType === expected.certType && verifier === expected.verifier
     if (!metadataMatches) return undefined
@@ -2832,65 +3035,13 @@ export class WalletPermissionsManager implements WalletInterface {
 
   /** Parses outpoint string "txid.vout" into [txid, outputIndex]. */
   private parseOutpoint(outpoint: string): [string, number] {
-    const [txid, indexStr] = outpoint.split('.')
-    return [txid, Number.parseInt(indexStr, 10)]
-  }
-
-  /** Normalizes a txid string to lowercase. */
-  private normalizeTxid(txid?: string): string {
-    return (txid ?? '').toLowerCase()
-  }
-
-  /** Reverses a 32-byte hex txid (for endian normalization). */
-  private reverseHexTxid(txid: string): string {
-    const hex = this.normalizeTxid(txid)
-    if (!/^[0-9a-f]{64}$/.test(hex)) return hex
-    const bytes = hex.match(/../g)
-    return bytes != null ? bytes.reverse().join('') : hex
-  }
-
-  /**
-   * Returns true when an outpoint string (e.g. "txid.vout" or "txid:vout") refers to `token`.
-   */
-  private tokenMatchesOutpointString(outpoint: string, token: PermissionToken): boolean {
-    const dot = outpoint.lastIndexOf('.')
-    const colon = outpoint.lastIndexOf(':')
-    const sep = Math.max(dot, colon)
-    if (sep === -1) return false
-    const txidPart = outpoint.slice(0, sep)
-    const vout = Number(outpoint.slice(sep + 1))
-    if (!Number.isFinite(vout)) return false
-    return this.normalizeTxid(txidPart) === this.normalizeTxid(token.txid) && vout === token.outputIndex
-  }
-
-  /**
-   * Finds the index of the tx input that spends the given permission token.
-   * Handles multiple potential field names for TXID and vout.
-   */
-  private findInputIndexForToken(tx: Transaction, token: PermissionToken): number {
-    return (tx.inputs as any[]).findIndex((input: any) => {
-      const txidCandidate: unknown =
-        input?.sourceTXID ??
-        input?.sourceTxid ??
-        input?.sourceTxId ??
-        input?.prevTxId ??
-        input?.prevTxid ??
-        input?.prevTXID ??
-        input?.txid ??
-        input?.txID
-
-      const voutCandidate: unknown =
-        input?.sourceOutputIndex ?? input?.sourceOutput ?? input?.outputIndex ?? input?.vout ?? input?.prevOutIndex
-
-      if (typeof txidCandidate === 'string' && typeof voutCandidate === 'number') {
-        const cand = this.normalizeTxid(txidCandidate)
-        if (cand === this.normalizeTxid(token.txid) && voutCandidate === token.outputIndex) return true
-        if (cand === this.reverseHexTxid(token.txid) && voutCandidate === token.outputIndex) return true
-      }
-
-      const outpointCandidate: unknown = input?.outpoint ?? input?.sourceOutpoint ?? input?.prevOutpoint
-      return typeof outpointCandidate === 'string' && this.tokenMatchesOutpointString(outpointCandidate, token)
-    })
+    const match = /^([0-9a-f]{64})\.(0|[1-9]\d*)$/i.exec(outpoint)
+    if (match == null) throw new Error('Permission token outpoint is invalid.')
+    const outputIndex = Number(match[2])
+    if (!Number.isSafeInteger(outputIndex) || outputIndex > 0xffffffff) {
+      throw new Error('Permission token outpoint is invalid.')
+    }
+    return [match[1].toLowerCase(), outputIndex]
   }
 
   /** Looks for a DPACP permission token matching origin/domain, privileged, protocol, cpty. */
@@ -2900,7 +3051,7 @@ export class WalletPermissionsManager implements WalletInterface {
     protocolID: WalletProtocol,
     counterparty: string,
     includeExpired: boolean,
-    originatorLookupValues?: string[]
+    originatorLookupValues?: Array<string | undefined>
   ): Promise<PermissionToken | undefined> {
     const [secLevel, protoName] = protocolID
     const originsToTry = originatorLookupValues?.length ? originatorLookupValues : [originator]
@@ -2911,7 +3062,8 @@ export class WalletPermissionsManager implements WalletInterface {
           basket: BASKET_MAP.protocol,
           tags: this.protocolTokenTags(originTag, privileged, secLevel, protoName, counterparty),
           tagQueryMode: 'all',
-          include: 'entire transactions'
+          include: 'entire transactions',
+          limit: 10000
         },
         this.adminOriginator
       )
@@ -2938,7 +3090,7 @@ export class WalletPermissionsManager implements WalletInterface {
     privileged: boolean,
     protocolID: WalletProtocol,
     counterparty: string,
-    originatorLookupValues?: string[]
+    originatorLookupValues?: Array<string | undefined>
   ): Promise<PermissionToken[]> {
     const [secLevel, protoName] = protocolID
     const originsToTry = originatorLookupValues?.length ? originatorLookupValues : [originator]
@@ -2951,7 +3103,8 @@ export class WalletPermissionsManager implements WalletInterface {
           basket: BASKET_MAP.protocol,
           tags: this.protocolTokenTags(originTag, privileged, secLevel, protoName, counterparty),
           tagQueryMode: 'all',
-          include: 'entire transactions'
+          include: 'entire transactions',
+          limit: 10000
         },
         this.adminOriginator
       )
@@ -2979,7 +3132,7 @@ export class WalletPermissionsManager implements WalletInterface {
     originator: string,
     basket: string,
     includeExpired: boolean,
-    originatorLookupValues?: string[]
+    originatorLookupValues?: Array<string | undefined>
   ): Promise<PermissionToken | undefined> {
     const originsToTry = originatorLookupValues?.length ? originatorLookupValues : [originator]
 
@@ -2987,9 +3140,12 @@ export class WalletPermissionsManager implements WalletInterface {
       const result = await this.underlying.listOutputs(
         {
           basket: BASKET_MAP.basket,
-          tags: [`originator ${originTag}`, `basket ${basket}`],
+          tags: [originTag === undefined ? undefined : `originator ${originTag}`, `basket ${basket}`].filter(
+            (tag): tag is string => tag !== undefined
+          ),
           tagQueryMode: 'all',
-          include: 'entire transactions'
+          include: 'entire transactions',
+          limit: 10000
         },
         this.adminOriginator
       )
@@ -3012,7 +3168,7 @@ export class WalletPermissionsManager implements WalletInterface {
     certType: string,
     fields: string[],
     includeExpired: boolean,
-    originatorLookupValues?: string[]
+    originatorLookupValues?: Array<string | undefined>
   ): Promise<PermissionToken | undefined> {
     const originsToTry = originatorLookupValues?.length ? originatorLookupValues : [originator]
 
@@ -3020,9 +3176,15 @@ export class WalletPermissionsManager implements WalletInterface {
       const result = await this.underlying.listOutputs(
         {
           basket: BASKET_MAP.certificate,
-          tags: [`originator ${originTag}`, `privileged ${!!privileged}`, `type ${certType}`, `verifier ${verifier}`],
+          tags: [
+            originTag === undefined ? undefined : `originator ${originTag}`,
+            `privileged ${!!privileged}`,
+            `type ${certType}`,
+            `verifier ${verifier}`
+          ].filter((tag): tag is string => tag !== undefined),
           tagQueryMode: 'all',
-          include: 'entire transactions'
+          include: 'entire transactions',
+          limit: 10000
         },
         this.adminOriginator
       )
@@ -3046,7 +3208,7 @@ export class WalletPermissionsManager implements WalletInterface {
   /** Looks for a DSAP token matching origin, returning the first one found. */
   private async findSpendingToken(
     originator: string,
-    originatorLookupValues?: string[]
+    originatorLookupValues?: Array<string | undefined>
   ): Promise<PermissionToken | undefined> {
     const originsToTry = originatorLookupValues?.length ? originatorLookupValues : [originator]
 
@@ -3054,32 +3216,35 @@ export class WalletPermissionsManager implements WalletInterface {
       const result = await this.underlying.listOutputs(
         {
           basket: BASKET_MAP.spending,
-          tags: [`originator ${originTag}`],
+          tags: originTag === undefined ? [] : [`originator ${originTag}`],
           tagQueryMode: 'all',
-          include: 'entire transactions'
+          include: 'entire transactions',
+          limit: 10000
         },
         this.adminOriginator
       )
 
       for (const out of result.outputs) {
-        const [txid, outputIndexStr] = out.outpoint.split('.')
-        const tx = this.transactionFromResultBeef(result, txid)
-        const dec = PushDrop.decode(tx.outputs[Number(outputIndexStr)].lockingScript)
-        if (!dec?.fields || dec.fields.length < 2) continue
-        const domainRaw = dec.fields[0]
-        const amtRaw = dec.fields[1]
+        const source = await this.authenticatedPermissionTokenSource(result, out, 2)
+        if (source == null) continue
+        const { tx, txid, outputIndex, fields } = source
+        const domainRaw = fields[0]
+        const amtRaw = fields[1]
 
-        const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(domainRaw))
+        const domainDecoded = await this.decryptPermissionTokenText(domainRaw)
         const normalizedDomain = this.normalizeOriginator(domainDecoded)
         if (normalizedDomain !== originator) continue
-        const amtDecodedStr = Utils.toUTF8(await this.decryptPermissionTokenField(amtRaw))
-        const authorizedAmount = Number.parseInt(amtDecodedStr, 10)
+        const authorizedAmount = parseCanonicalPermissionInteger(
+          await this.decryptPermissionTokenText(amtRaw),
+          'Permission spending amount',
+          MAX_MONEY_SATOSHIS
+        )
 
         return {
           tx: tx.toBEEF(),
-          txid: out.outpoint.split('.')[0],
-          outputIndex: Number.parseInt(out.outpoint.split('.')[1], 10),
-          outputScript: tx.outputs[Number(outputIndexStr)].lockingScript.toHex(),
+          txid,
+          outputIndex,
+          outputScript: tx.outputs[outputIndex].lockingScript.toHex(),
           satoshis: out.satoshis,
           originator,
           rawOriginator: domainDecoded,
@@ -3174,27 +3339,24 @@ export class WalletPermissionsManager implements WalletInterface {
 
     // Build a transaction with exactly one output, no explicit inputs since the wallet
     // can internally fund it from its balance.
-    await this.createAction(
-      {
-        description: `Grant ${r.type} permission`,
-        outputs: [
-          {
-            lockingScript: script.toHex(),
-            satoshis: 1,
-            outputDescription: `${r.type} permission token`,
-            basket: basketName,
-            tags
-          }
-        ],
-        options: {
-          // Permission persistence must not inherit network-broadcast latency.
-          // The managed-change planner keeps the queued output available as a
-          // last-resort funding source for the resumed request.
-          acceptDelayedBroadcast: true
+    await this.completePermissionTokenAction({
+      description: `Grant ${r.type} permission`,
+      outputs: [
+        {
+          lockingScript: script.toHex(),
+          satoshis: 1,
+          outputDescription: `${r.type} permission token`,
+          basket: basketName,
+          tags
         }
-      },
-      this.adminOriginator
-    )
+      ],
+      options: {
+        // Permission persistence must not inherit network-broadcast latency.
+        // The managed-change planner keeps the queued output available as a
+        // last-resort funding source for the resumed request.
+        acceptDelayedBroadcast: true
+      }
+    })
   }
 
   private async mapWithConcurrency<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -3230,9 +3392,8 @@ export class WalletPermissionsManager implements WalletInterface {
   private async runBestEffortChunk<T, R>(chunk: T[], runChunk: (chunk: T[]) => Promise<R[]>): Promise<R[]> {
     try {
       return await runChunk(chunk)
-    } catch (e) {
+    } catch {
       if (chunk.length <= 1) {
-        console.error('Permission batch failed:', e)
         return []
       }
       const mid = Math.ceil(chunk.length / 2)
@@ -3283,22 +3444,24 @@ export class WalletPermissionsManager implements WalletInterface {
     strict = false
   ): Promise<PermissionRequest[]> {
     const CHUNK = 25
-    return await this.runBestEffortBatches(items, CHUNK, async chunk => {
-      const built = await this.mapWithConcurrency(
-        chunk,
-        8,
-        async c => await this.buildPermissionOutput(c.request, c.expiry, c.amount)
-      )
-      await this.createAction(
-        {
+    return await this.runBestEffortBatches(
+      items,
+      CHUNK,
+      async chunk => {
+        const built = await this.mapWithConcurrency(
+          chunk,
+          8,
+          async c => await this.buildPermissionOutput(c.request, c.expiry, c.amount)
+        )
+        await this.completePermissionTokenAction({
           description: `Grant ${built.length} permissions`,
           outputs: built.map(b => b.output),
           options: { acceptDelayedBroadcast: true }
-        },
-        this.adminOriginator
-      )
-      return built.map(b => b.request)
-    }, strict)
+        })
+        return built.map(b => b.request)
+      },
+      strict
+    )
   }
 
   private async renewPermissionTokensBestEffort(
@@ -3306,67 +3469,78 @@ export class WalletPermissionsManager implements WalletInterface {
     strict = false
   ): Promise<PermissionRequest[]> {
     const CHUNK = 15
-    return await this.runBestEffortBatches(items, CHUNK, async chunk => {
-      const built = await this.mapWithConcurrency(
-        chunk,
-        8,
-        async c => await this.buildPermissionOutput(c.request, c.expiry, c.amount)
-      )
-
-      const inputBeef = new Beef()
-      for (const c of chunk) {
-        inputBeef.mergeBeef(Beef.fromBinary(c.oldToken.tx))
-      }
-
-      const { signableTransaction } = await this.createAction(
-        {
-          description: `Renew ${chunk.length} permissions`,
-          inputBEEF: inputBeef.toBinary(),
-          inputs: chunk.map((c, i) => ({
-            outpoint: `${c.oldToken.txid}.${c.oldToken.outputIndex}`,
-            unlockingScriptLength: 73,
-            inputDescription: `Consume old permission token #${i + 1}`
-          })),
-          outputs: built.map(b => b.output),
-          options: {
-            acceptDelayedBroadcast: true,
-            randomizeOutputs: false,
-            signAndProcess: false
-          }
-        },
-        this.adminOriginator
-      )
-
-      if (!signableTransaction?.reference || !signableTransaction.tx) {
-        throw new Error('Failed to create signable transaction')
-      }
-
-      const partialTx = Transaction.fromAtomicBEEF(signableTransaction.tx)
-      const pushdrop = new PushDrop(this.underlying)
-      const spends: Record<number, { unlockingScript: string }> = {}
-
-      for (let i = 0; i < chunk.length; i++) {
-        const token = chunk[i].oldToken
-        const unlocker = pushdrop.unlock(
-          WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
-          '1',
-          'self',
-          'all',
-          false,
-          1,
-          LockingScript.fromHex(token.outputScript)
+    return await this.runBestEffortBatches(
+      items,
+      CHUNK,
+      async chunk => {
+        const built = await this.mapWithConcurrency(
+          chunk,
+          8,
+          async c => await this.buildPermissionOutput(c.request, c.expiry, c.amount)
         )
-        const unlockingScript = await unlocker.sign(partialTx, i)
-        spends[i] = { unlockingScript: unlockingScript.toHex() }
-      }
 
-      const { txid } = await this.underlying.signAction({
-        reference: signableTransaction.reference,
-        spends
-      })
-      if (!txid) throw new Error('Failed to finalize renewal transaction')
-      return built.map(b => b.request)
-    }, strict)
+        const inputBeef = new Beef()
+        for (const c of chunk) {
+          inputBeef.mergeBeef(Beef.fromBinaryStrict(c.oldToken.tx))
+        }
+
+        await this.completePermissionTokenAction(
+          {
+            description: `Renew ${chunk.length} permissions`,
+            inputBEEF: inputBeef.toBinary(),
+            inputs: chunk.map((c, i) => ({
+              outpoint: `${c.oldToken.txid}.${c.oldToken.outputIndex}`,
+              unlockingScriptLength: 73,
+              inputDescription: `Consume old permission token #${i + 1}`
+            })),
+            outputs: built.map(b => b.output),
+            options: {
+              acceptDelayedBroadcast: true,
+              randomizeOutputs: false,
+              signAndProcess: false
+            }
+          },
+          chunk.map(item => item.oldToken)
+        )
+        return built.map(b => b.request)
+      },
+      strict
+    )
+  }
+
+  private permissionTokenInputSigners(
+    tokens: PermissionToken[]
+  ): NonNullable<NonNullable<Parameters<typeof completeBoundAction>[2]>['inputSigners']> {
+    const inputSigners = Object.create(null) as NonNullable<
+      NonNullable<Parameters<typeof completeBoundAction>[2]>['inputSigners']
+    >
+    const pushdrop = new PushDrop(this.underlying)
+    for (const token of tokens) {
+      const outpoint = `${token.txid}.${token.outputIndex}`
+      const unlocker = pushdrop.unlock(
+        WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
+        '1',
+        'self',
+        'all',
+        false,
+        1,
+        LockingScript.fromHex(token.outputScript)
+      )
+      inputSigners[outpoint] = async (transaction, inputIndex) => await unlocker.sign(transaction, inputIndex)
+    }
+    return inputSigners
+  }
+
+  private async completePermissionTokenAction(
+    args: CreateActionArgs,
+    tokens: PermissionToken[] = []
+  ): Promise<Transaction> {
+    return await completeBoundAction(
+      this,
+      args,
+      { inputSigners: this.permissionTokenInputSigners(tokens) },
+      this.adminOriginator
+    )
   }
 
   private async coalescePermissionTokens(
@@ -3384,10 +3558,10 @@ export class WalletPermissionsManager implements WalletInterface {
     // Merge all input token BEEFs into a single BEEF structure
     const inputBeef = new Beef()
     for (const token of oldTokens) {
-      inputBeef.mergeBeef(Beef.fromBinary(token.tx))
+      inputBeef.mergeBeef(Beef.fromBinaryStrict(token.tx))
     }
 
-    const { signableTransaction } = await this.createAction(
+    const transaction = await this.completePermissionTokenAction(
       {
         description: opts?.description ?? `Coalesce ${oldTokens.length} permission tokens`,
         inputBEEF: inputBeef.toBinary(),
@@ -3411,41 +3585,9 @@ export class WalletPermissionsManager implements WalletInterface {
           signAndProcess: false
         }
       },
-      this.adminOriginator
+      oldTokens
     )
-
-    if (!signableTransaction?.reference || !signableTransaction.tx) {
-      throw new Error('Failed to create signable transaction')
-    }
-
-    // 2) Sign each input - each token needs its own unlocker with the correct locking script
-    const partialTx = Transaction.fromAtomicBEEF(signableTransaction.tx)
-    const pushdrop = new PushDrop(this.underlying)
-
-    const spends: Record<number, { unlockingScript: string }> = {}
-    for (let i = 0; i < oldTokens.length; i++) {
-      const token = oldTokens[i]
-      // Each token requires its own unlocker with the specific locking script
-      const unlocker = pushdrop.unlock(
-        WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
-        '1',
-        'self',
-        'all',
-        false,
-        1,
-        LockingScript.fromHex(token.outputScript)
-      )
-      const unlockingScript = await unlocker.sign(partialTx, i)
-      spends[i] = { unlockingScript: unlockingScript.toHex() }
-    }
-
-    // 3) Finalize the action
-    const { txid } = await this.underlying.signAction({
-      reference: signableTransaction.reference,
-      spends
-    })
-    if (!txid) throw new Error('Failed to finalize coalescing transaction')
-    return txid
+    return transaction.id('hex')
   }
 
   /**
@@ -3498,7 +3640,7 @@ export class WalletPermissionsManager implements WalletInterface {
       // 3) For BRC-100, we do a "createAction" with a partial input referencing oldToken
       //    plus a single new output. We'll hydrate the template, then signAction for the wallet to finalize.
       const oldOutpoint = `${oldToken.txid}.${oldToken.outputIndex}`
-      const { signableTransaction } = await this.createAction(
+      await this.completePermissionTokenAction(
         {
           description: `Renew ${r.type} permission`,
           inputBEEF: oldToken.tx,
@@ -3522,27 +3664,8 @@ export class WalletPermissionsManager implements WalletInterface {
             acceptDelayedBroadcast: true
           }
         },
-        this.adminOriginator
+        [oldToken]
       )
-      const tx = Transaction.fromBEEF(signableTransaction!.tx)
-      const unlocker = new PushDrop(this.underlying).unlock(
-        WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
-        '1',
-        'self',
-        'all',
-        false,
-        1,
-        LockingScript.fromHex(oldToken.outputScript)
-      )
-      const unlockingScript = await unlocker.sign(tx, 0)
-      await this.underlying.signAction({
-        reference: signableTransaction!.reference,
-        spends: {
-          0: {
-            unlockingScript: unlockingScript.toHex()
-          }
-        }
-      })
     }
   }
 
@@ -3671,7 +3794,13 @@ export class WalletPermissionsManager implements WalletInterface {
       )
       await this.collectProtocolTokens(result, originFilter, seen, tokens)
     }
-    return tokens
+    return tokens.filter(
+      token =>
+        (privileged === undefined || token.privileged === privileged) &&
+        (protocolName === undefined || token.protocol === protocolName) &&
+        (protocolSecurityLevel === undefined || token.securityLevel === protocolSecurityLevel) &&
+        (counterparty === undefined || token.counterparty === counterparty)
+    )
   }
 
   /** Builds the base tag array for protocol permission listing. */
@@ -3703,11 +3832,10 @@ export class WalletPermissionsManager implements WalletInterface {
   ): Promise<void> {
     for (const out of result.outputs) {
       if (seen.has(out.outpoint)) continue
-      const [txid, outputIndex] = this.parseOutpoint(out.outpoint)
-      const tx = this.transactionFromResultBeef(result, txid)
-      const dec = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-      if (!dec?.fields || dec.fields.length < 6) continue
-      const f = await this.decryptProtocolTokenFields(dec.fields)
+      const source = await this.authenticatedPermissionTokenSource(result, out, 6)
+      if (source == null) continue
+      const { tx, txid, outputIndex } = source
+      const f = await this.decryptProtocolTokenFields(source.fields)
       const normalizedDomain = this.normalizeOriginator(f.domainDecoded)
       if (originFilter != null && normalizedDomain !== originFilter.normalized) continue
       seen.add(out.outpoint)
@@ -3787,7 +3915,7 @@ export class WalletPermissionsManager implements WalletInterface {
       )
       await this.collectBasketTokens(result, originFilter, seen, tokens)
     }
-    return tokens
+    return params.basket == null ? tokens : tokens.filter(token => token.basketName === params.basket)
   }
 
   /** Decodes and appends basket permission tokens from a listOutputs result. */
@@ -3799,16 +3927,18 @@ export class WalletPermissionsManager implements WalletInterface {
   ): Promise<void> {
     for (const out of result.outputs) {
       if (seen.has(out.outpoint)) continue
-      const [txid, outputIndex] = this.parseOutpoint(out.outpoint)
-      const tx = this.transactionFromResultBeef(result, txid)
-      const dec = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-      if (!dec?.fields || dec.fields.length < 3) continue
-      const [domainRaw, expiryRaw, basketRaw] = dec.fields
-      const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(domainRaw))
+      const source = await this.authenticatedPermissionTokenSource(result, out, 3)
+      if (source == null) continue
+      const { tx, txid, outputIndex } = source
+      const [domainRaw, expiryRaw, basketRaw] = source.fields
+      const domainDecoded = await this.decryptPermissionTokenText(domainRaw)
       const normalizedDomain = this.normalizeOriginator(domainDecoded)
       if (originFilter != null && normalizedDomain !== originFilter.normalized) continue
-      const expiryDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(expiryRaw)), 10)
-      const basketDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(basketRaw))
+      const expiryDecoded = parseCanonicalPermissionInteger(
+        await this.decryptPermissionTokenText(expiryRaw),
+        'Permission expiry'
+      )
+      const basketDecoded = await this.decryptPermissionTokenText(basketRaw)
       seen.add(out.outpoint)
       tokens.push({
         tx: tx.toBEEF(),
@@ -3863,26 +3993,30 @@ export class WalletPermissionsManager implements WalletInterface {
 
     const tokens: PermissionToken[] = []
     for (const out of result.outputs) {
-      const [txid, outputIndexStr] = out.outpoint.split('.')
-      const tx = this.transactionFromResultBeef(result, txid)
-      const dec = PushDrop.decode(tx.outputs[Number(outputIndexStr)].lockingScript)
-      if (!dec?.fields || dec.fields.length < 2) continue
-      const [domainRaw, amtRaw] = dec.fields
-      const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(domainRaw))
-      const amtDecodedStr = Utils.toUTF8(await this.decryptPermissionTokenField(amtRaw))
-      const authorizedAmount = Number.parseInt(amtDecodedStr, 10)
+      const source = await this.authenticatedPermissionTokenSource(result, out, 2)
+      if (source == null) continue
+      const { tx, txid, outputIndex, fields } = source
+      const [domainRaw, amtRaw] = fields
+      const domainDecoded = await this.decryptPermissionTokenText(domainRaw)
+      const authorizedAmount = parseCanonicalPermissionInteger(
+        await this.decryptPermissionTokenText(amtRaw),
+        'Permission spending amount',
+        MAX_MONEY_SATOSHIS
+      )
       tokens.push({
         tx: tx.toBEEF(),
-        txid: out.outpoint.split('.')[0],
-        outputIndex: Number.parseInt(out.outpoint.split('.')[1], 10),
+        txid,
+        outputIndex,
         satoshis: out.satoshis,
-        outputScript: tx.outputs[Number(outputIndexStr)].lockingScript.toHex(),
+        outputScript: tx.outputs[outputIndex].lockingScript.toHex(),
         originator: domainDecoded,
         authorizedAmount,
         expiry: 0
       })
     }
-    return tokens
+    if (params.originator == null) return tokens
+    const normalizedOriginator = this.prepareOriginator(params.originator).normalized
+    return tokens.filter(token => this.normalizeOriginator(token.originator) === normalizedOriginator)
   }
 
   /**
@@ -3936,7 +4070,12 @@ export class WalletPermissionsManager implements WalletInterface {
       )
       await this.collectCertificateTokens(result, originFilter, seen, tokens)
     }
-    return tokens
+    return tokens.filter(
+      token =>
+        (params.privileged === undefined || token.privileged === params.privileged) &&
+        (params.certType === undefined || token.certType === params.certType) &&
+        (params.verifier === undefined || token.verifier === params.verifier)
+    )
   }
 
   /** Decodes and appends certificate permission tokens from a listOutputs result. */
@@ -3948,19 +4087,24 @@ export class WalletPermissionsManager implements WalletInterface {
   ): Promise<void> {
     for (const out of result.outputs) {
       if (seen.has(out.outpoint)) continue
-      const [txid, outputIndex] = this.parseOutpoint(out.outpoint)
-      const tx = this.transactionFromResultBeef(result, txid)
-      const dec = PushDrop.decode(tx.outputs[outputIndex].lockingScript)
-      if (!dec?.fields || dec.fields.length < 6) continue
-      const [domainRaw, expiryRaw, privRaw, typeRaw, fieldsRaw, verifierRaw] = dec.fields
-      const domainDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(domainRaw))
+      const source = await this.authenticatedPermissionTokenSource(result, out, 6)
+      if (source == null) continue
+      const { tx, txid, outputIndex } = source
+      const [domainRaw, expiryRaw, privRaw, typeRaw, fieldsRaw, verifierRaw] = source.fields
+      const domainDecoded = await this.decryptPermissionTokenText(domainRaw)
       const normalizedDomain = this.normalizeOriginator(domainDecoded)
       if (originFilter != null && normalizedDomain !== originFilter.normalized) continue
-      const expiryDecoded = Number.parseInt(Utils.toUTF8(await this.decryptPermissionTokenField(expiryRaw)), 10)
-      const privDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(privRaw)) === 'true'
-      const typeDecoded = Utils.toUTF8(await this.decryptPermissionTokenField(typeRaw))
-      const verifierDec = Utils.toUTF8(await this.decryptPermissionTokenField(verifierRaw))
-      const allFields = JSON.parse(Utils.toUTF8(await this.decryptPermissionTokenField(fieldsRaw))) as string[]
+      const expiryDecoded = parseCanonicalPermissionInteger(
+        await this.decryptPermissionTokenText(expiryRaw),
+        'Permission expiry'
+      )
+      const privDecoded = parsePermissionBoolean(
+        await this.decryptPermissionTokenText(privRaw),
+        'Permission privileged flag'
+      )
+      const typeDecoded = await this.decryptPermissionTokenText(typeRaw)
+      const verifierDec = await this.decryptPermissionTokenText(verifierRaw)
+      const allFields = parsePermissionCertificateFields(await this.decryptPermissionTokenText(fieldsRaw))
       seen.add(out.outpoint)
       tokens.push({
         tx: tx.toBEEF(),
@@ -4064,10 +4208,10 @@ export class WalletPermissionsManager implements WalletInterface {
 
     const inputBeef = new Beef()
     for (const token of oldTokens) {
-      inputBeef.mergeBeef(Beef.fromBinary(token.tx))
+      inputBeef.mergeBeef(Beef.fromBinaryStrict(token.tx))
     }
 
-    const { signableTransaction } = await this.createAction(
+    await this.completePermissionTokenAction(
       {
         description: `Revoke ${oldTokens.length} permissions`,
         inputBEEF: inputBeef.toBinary(),
@@ -4082,51 +4226,8 @@ export class WalletPermissionsManager implements WalletInterface {
           signAndProcess: false
         }
       },
-      this.adminOriginator
+      oldTokens
     )
-
-    if (!signableTransaction?.reference || !signableTransaction.tx) {
-      throw new Error('Failed to create signable transaction')
-    }
-
-    const tx = Transaction.fromAtomicBEEF(signableTransaction.tx)
-
-    const inputsToSign = oldTokens.map(token => {
-      let permInputIndex = this.findInputIndexForToken(tx, token)
-      if (permInputIndex === -1 && tx.inputs.length === 1) {
-        permInputIndex = 0
-      }
-      if (permInputIndex === -1) {
-        throw new Error('Unable to locate permission token input for revocation.')
-      }
-      return { token, permInputIndex }
-    })
-
-    const pushdrop = new PushDrop(this.underlying)
-    const spends: Record<number, { unlockingScript: string }> = {}
-    const signed = await this.mapWithConcurrency(inputsToSign, 8, async ({ token, permInputIndex }) => {
-      const unlocker = pushdrop.unlock(
-        WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
-        '1',
-        'self',
-        'all',
-        false,
-        1,
-        LockingScript.fromHex(token.outputScript)
-      )
-      const unlockingScript = await unlocker.sign(tx, permInputIndex)
-      return { permInputIndex, unlockingScriptHex: unlockingScript.toHex() }
-    })
-
-    for (const s of signed) {
-      spends[s.permInputIndex] = { unlockingScript: s.unlockingScriptHex }
-    }
-
-    const { txid } = await this.underlying.signAction({
-      reference: signableTransaction.reference,
-      spends
-    })
-    if (!txid) throw new Error('Failed to finalize revoke transaction')
   }
 
   /**
@@ -4135,7 +4236,7 @@ export class WalletPermissionsManager implements WalletInterface {
    */
   public async revokePermission(oldToken: PermissionToken): Promise<void> {
     const oldOutpoint = `${oldToken.txid}.${oldToken.outputIndex}`
-    const { signableTransaction } = await this.createAction(
+    await this.completePermissionTokenAction(
       {
         description: 'Revoke permission',
         inputBEEF: oldToken.tx,
@@ -4150,36 +4251,8 @@ export class WalletPermissionsManager implements WalletInterface {
           acceptDelayedBroadcast: true
         }
       },
-      this.adminOriginator
+      [oldToken]
     )
-    const tx = Transaction.fromBEEF(signableTransaction!.tx)
-
-    let permInputIndex = this.findInputIndexForToken(tx, oldToken)
-
-    if (permInputIndex === -1 && tx.inputs.length === 1) {
-      permInputIndex = 0
-    }
-    if (permInputIndex === -1) {
-      throw new Error('Unable to locate permission token input for revocation.')
-    }
-    const unlocker = new PushDrop(this.underlying).unlock(
-      WalletPermissionsManager.PERM_TOKEN_ENCRYPTION_PROTOCOL,
-      '1',
-      'self',
-      'all',
-      false,
-      1,
-      LockingScript.fromHex(oldToken.outputScript)
-    )
-    const unlockingScript = await unlocker.sign(tx, permInputIndex)
-    await this.underlying.signAction({
-      reference: signableTransaction!.reference,
-      spends: {
-        [permInputIndex]: {
-          unlockingScript: unlockingScript.toHex()
-        }
-      }
-    })
   }
 
   /* ---------------------------------------------------------------------
@@ -4190,6 +4263,7 @@ export class WalletPermissionsManager implements WalletInterface {
     args: Parameters<WalletInterface['createAction']>[0],
     originator?: string
   ): ReturnType<WalletInterface['createAction']> {
+    const vargs = validateCreateActionArgs(args)
     // 1) Identify unique P-modules involved (one per schemeID) from both baskets and labels
     const pModulesByScheme = new Map<string, PermissionsModule>()
     const nonPBaskets = this.collectNonPBaskets(args.outputs, pModulesByScheme)
@@ -4231,11 +4305,17 @@ export class WalletPermissionsManager implements WalletInterface {
 
     if (createResult.signableTransaction == null) return createResult
 
-    // 7) Parse the signable tx to determine net spend, then gate on spending authorization.
-    const tx = Transaction.fromAtomicBEEF(createResult.signableTransaction.tx)
+    // 7) Bind the action reference before parsing any storage-provided transaction
+    // data. This ensures malformed BEEF is still aborted and cannot leave an
+    // untracked action that may later be signed under another originator.
     const reference = createResult.signableTransaction.reference
+    if (this.pendingActionOriginators.has(reference)) {
+      throw new WERR_UNAUTHORIZED('The action reference is already pending.')
+    }
+    this.pendingActionOriginators.set(reference, originator ?? '')
 
-    // 7a) SECURITY (GHSA-36f9-7rg5-cpf8) defense-in-depth: confirm every
+    // 7a) Parse the signable tx to determine net spend, then gate on spending
+    // authorization. SECURITY (GHSA-36f9-7rg5-cpf8) defense-in-depth: confirm every
     // caller-requested output actually appears in the transaction we are about to
     // authorize and sign. The locking scripts in the signable transaction
     // originate from storage; a malicious or compromised remote storage provider
@@ -4244,22 +4324,34 @@ export class WalletPermissionsManager implements WalletInterface {
     // recipient. The signer (buildSignableTransaction) rejects this at the
     // source; this is an independent check at the permissions layer.
     try {
-      this.verifyRequestedOutputsPresent(tx, args)
-    } catch (err) {
-      await this.underlying.abortAction({ reference })
-      throw err
-    }
+      const tx = Transaction.fromAtomicBEEF(createResult.signableTransaction.tx)
+      const resolvedOutputSatoshis = this.verifyRequestedOutputsPresent(tx, args)
+      let { netSpent, lineItems } = this.computeNetSpend(
+        tx,
+        args,
+        originalInputDescriptions,
+        originalOutputDescriptions,
+        resolvedOutputSatoshis
+      )
+      const exactWalletSpend = (createResult as ExactActionSpendCarrier)[exactActionSpendSymbol]
+      if (exactWalletSpend !== undefined) {
+        if (
+          !Number.isSafeInteger(exactWalletSpend) ||
+          exactWalletSpend < -MAX_MONEY_SATOSHIS ||
+          exactWalletSpend > MAX_MONEY_SATOSHIS ||
+          exactWalletSpend < netSpent
+        ) {
+          throw new Error('Wallet signer returned an invalid exact action-spend amount.')
+        }
+        const serviceCharge = exactWalletSpend - netSpent
+        if (serviceCharge > 0) {
+          lineItems = [...lineItems, { type: 'output', satoshis: serviceCharge, description: 'Storage service charge' }]
+        }
+        netSpent = exactWalletSpend
+      }
 
-    const { netSpent, lineItems } = this.computeNetSpend(
-      tx,
-      args,
-      originalInputDescriptions,
-      originalOutputDescriptions
-    )
-
-    // 8) If netSpent > 0, require spending authorization. Abort if denied.
-    if (netSpent > 0) {
-      try {
+      // 8) If netSpent > 0, require spending authorization. Abort if denied.
+      if (netSpent > 0) {
         await this.ensureSpendingAuthorization({
           originator: originator!,
           satoshis: netSpent,
@@ -4267,18 +4359,32 @@ export class WalletPermissionsManager implements WalletInterface {
           reason: originalDescription,
           allowRecentGrant: parseBrc177NoSendExpiryLabels(args.labels) == null
         })
-      } catch (err) {
-        await this.underlying.abortAction({ reference })
-        throw err
       }
+      this.pendingActionTemplates.set(reference, tx)
+    } catch (err) {
+      await this.blockAndAbortAction(reference)
+      throw err
     }
 
     // 9) Finalize or return the signable transaction based on whether more signatures are needed.
-    const vargs = Validation.validateCreateActionArgs(args)
     if (vargs.isSignAction) return createResult
 
-    const signResult = await this.underlying.signAction({ reference, spends: {}, options: args.options }, originator)
-    return { ...createResult, ...signResult, signableTransaction: undefined }
+    try {
+      const signResult = await this.underlying.signAction(
+        {
+          reference,
+          spends: {},
+          options: { ...args.options, returnTXIDOnly: false }
+        },
+        originator
+      )
+      this.assertAuthorizedSignResult(reference, {}, signResult)
+      this.clearPendingAction(reference)
+      return { ...createResult, ...signResult, signableTransaction: undefined }
+    } catch (error) {
+      await this.blockAndAbortAction(reference)
+      throw error
+    }
   }
 
   /** Scans outputs to split P-scheme baskets from regular baskets; registers P-modules as a side effect. */
@@ -4363,8 +4469,12 @@ export class WalletPermissionsManager implements WalletInterface {
       transformedArgs = transformed.args
     }
     let createResult = await this.underlying.createAction(transformedArgs as CreateActionArgs, originator)
+    const exactWalletSpend = (createResult as ExactActionSpendCarrier)[exactActionSpendSymbol]
     for (let i = pModules.length - 1; i >= 0; i--) {
       createResult = await pModules[i].onResponse(createResult, { method: 'createAction', originator: originator! })
+    }
+    if (exactWalletSpend !== undefined) {
+      ;(createResult as ExactActionSpendCarrier)[exactActionSpendSymbol] = exactWalletSpend
     }
     return createResult
   }
@@ -4390,11 +4500,32 @@ export class WalletPermissionsManager implements WalletInterface {
    * randomized by default, and a caller may legitimately request the same
    * script+amount more than once.
    *
+   * A sendMax output is requested with the `maxPossibleSatoshis` sentinel
+   * (see storage/methods/generateChange); storage's funding step rewrites it
+   * to the actual funded amount before returning the signable transaction, so
+   * it can never be matched by amount. Fixed-amount outputs are matched first,
+   * as an exact (script, satoshis) multiset exactly as before; any
+   * sentinel-valued requested output is then matched by locking script alone
+   * against whatever the fixed-amount pass left unused. Matching the sentinel
+   * only after fixed-amount outputs are claimed keeps a fixed output that
+   * happens to share the sentinel's locking script from being mis-paired with
+   * it. `generateChange` permits at most one `maxPossibleSatoshis` output per
+   * call; more than one sentinel-valued request is simply matched
+   * independently, first-fit, in requested order.
+   *
+   * @returns the resolved actual satoshis for each requested output index
+   * (identical to the request for a fixed-amount output; the real funded
+   * amount for a sendMax sentinel), so callers can bill the real amount
+   * instead of the sentinel.
    * @throws Error if any caller-requested output is absent from the transaction.
    */
-  private verifyRequestedOutputsPresent(tx: Transaction, args: Parameters<WalletInterface['createAction']>[0]): void {
+  private verifyRequestedOutputsPresent(
+    tx: Transaction,
+    args: Parameters<WalletInterface['createAction']>[0]
+  ): Map<number, number> {
     const requested = args.outputs || []
-    if (requested.length === 0) return
+    const resolved = new Map<number, number>()
+    if (requested.length === 0) return resolved
 
     // All transaction outputs as (script hex, satoshis); each may satisfy at
     // most one requested output.
@@ -4404,9 +4535,16 @@ export class WalletPermissionsManager implements WalletInterface {
       used: false
     }))
 
+    const sentinelIndexes: number[] = []
+
+    // Pass 1: every fixed-amount request must match an exact (script, satoshis) pair.
     for (let i = 0; i < requested.length; i++) {
-      const wantScript = (requested[i].lockingScript ?? '').toLowerCase()
       const wantSats = requested[i].satoshis
+      if (wantSats === maxPossibleSatoshis) {
+        sentinelIndexes.push(i)
+        continue
+      }
+      const wantScript = (requested[i].lockingScript ?? '').toLowerCase()
       const match = available.find(a => !a.used && a.script === wantScript && a.satoshis === wantSats)
       if (match == null) {
         throw new Error(
@@ -4415,25 +4553,49 @@ export class WalletPermissionsManager implements WalletInterface {
         )
       }
       match.used = true
+      resolved.set(i, validateSatoshis(match.satoshis, `signable transaction output ${i} satoshis`))
     }
+
+    // Pass 2: match each sendMax sentinel request by locking script only,
+    // against whatever pass 1 left unused.
+    for (const i of sentinelIndexes) {
+      const wantScript = (requested[i].lockingScript ?? '').toLowerCase()
+      const match = available.find(a => !a.used && a.script === wantScript)
+      if (match == null) {
+        throw new Error(
+          `The transaction returned for signing does not contain caller-requested output ${i} ` +
+            `(locking script and amount). The recipient may have been substituted by storage.`
+        )
+      }
+      match.used = true
+      resolved.set(i, validateSatoshis(match.satoshis, `signable transaction output ${i} satoshis`))
+    }
+
+    return resolved
   }
 
   private computeNetSpend(
     tx: Transaction,
     args: Parameters<WalletInterface['createAction']>[0],
     originalInputDescriptions: Record<number, string>,
-    originalOutputDescriptions: Record<number, string>
+    originalOutputDescriptions: Record<number, string>,
+    resolvedOutputSatoshis: Map<number, number>
   ): { netSpent: number; lineItems: Array<{ type: LineItemType; description: string; satoshis: number }> } {
     const lineItems: Array<{ type: LineItemType; description: string; satoshis: number }> = []
 
     // Sum originator-provided inputs:
     let totalInputSatoshis = 0
     for (const input of tx.inputs) {
-      const outpoint = `${input.sourceTXID}.${input.sourceOutputIndex}`
+      const outpoint = this.inputOutpointForBinding(input)
       const matchingIndex = (args.inputs || []).findIndex(i => i.outpoint === outpoint)
       if (matchingIndex !== -1) {
-        const satoshis = input.sourceTransaction!.outputs[input.sourceOutputIndex].satoshis!
-        totalInputSatoshis += satoshis
+        if (input.sourceTransaction == null) {
+          throw new Error('Caller-provided action input is missing its authenticated source transaction.')
+        }
+        const sourceOutput = input.sourceTransaction.outputs[input.sourceOutputIndex]
+        if (sourceOutput == null) throw new Error('Caller-provided action input source output is missing.')
+        const satoshis = validateSatoshis(sourceOutput.satoshis, 'caller input satoshis')
+        totalInputSatoshis = this.checkedSatoshiTotal(totalInputSatoshis, satoshis, 'caller input total')
         lineItems.push({
           type: 'input',
           description: originalInputDescriptions[matchingIndex] || 'No input description provided',
@@ -4442,39 +4604,190 @@ export class WalletPermissionsManager implements WalletInterface {
       }
     }
 
-    // Sum originator-requested outputs:
-    const totalOutputSatoshis = (args.outputs || []).reduce((acc, out) => acc + out.satoshis, 0)
+    // Sum originator-requested outputs. A sendMax output's requested satoshis
+    // is the `maxPossibleSatoshis` sentinel, not its real cost; bill the
+    // actual funded amount that verifyRequestedOutputsPresent already resolved
+    // against the signable transaction instead of re-deriving it here (an
+    // independent re-lookup by script could mis-pair a fixed output that
+    // shares the sentinel's locking script).
+    let totalOutputSatoshis = 0
     for (const outIndex in args.outputs || []) {
-      const out = args.outputs![outIndex]
+      const index = Number(outIndex)
+      const resolvedSatoshis = resolvedOutputSatoshis.get(index)
+      if (resolvedSatoshis == null) {
+        throw new Error(`Internal error: requested output ${index} was not resolved against the signable transaction.`)
+      }
+      const satoshis = validateSatoshis(resolvedSatoshis, 'requested output satoshis')
+      totalOutputSatoshis = this.checkedSatoshiTotal(totalOutputSatoshis, satoshis, 'requested output total')
       lineItems.push({
         type: 'output',
-        satoshis: out.satoshis,
-        description: originalOutputDescriptions[outIndex] || 'No output description provided'
+        satoshis,
+        description: originalOutputDescriptions[index] || 'No output description provided'
       })
     }
 
     // Add an entry for the transaction fee:
-    const fee = tx.getFee()
+    const fee = validateSatoshis(tx.getFee(), 'network fee')
     lineItems.push({ type: 'fee', satoshis: fee, description: 'Network fee' })
 
     /**
      * Net spend = total foreign outflows minus total foreign inflows plus fee.
      * Domestic wallet inputs/change outputs are not counted — they are internal.
      */
-    const netSpent = totalOutputSatoshis + fee - totalInputSatoshis
+    const grossSpent = this.checkedSatoshiTotal(totalOutputSatoshis, fee, 'gross action spend')
+    const netSpent = grossSpent - totalInputSatoshis
+    if (!Number.isSafeInteger(netSpent) || netSpent < -MAX_MONEY_SATOSHIS || netSpent > MAX_MONEY_SATOSHIS) {
+      throw new Error('Net action spend is outside the supported monetary range.')
+    }
     return { netSpent, lineItems }
+  }
+
+  private checkedSatoshiTotal(left: number, right: number, label: string): number {
+    const total = left + right
+    if (!Number.isSafeInteger(total) || total < 0 || total > MAX_MONEY_SATOSHIS) {
+      throw new Error(`${label} is outside the supported monetary range.`)
+    }
+    return total
+  }
+
+  private inputOutpointForBinding(input: Transaction['inputs'][number]): string {
+    const embeddedTxid = input.sourceTransaction?.id('hex')
+    const explicitTxid = input.sourceTXID?.toLowerCase()
+    if (explicitTxid != null && embeddedTxid != null && explicitTxid !== embeddedTxid) {
+      throw new Error('Wallet action input source transaction is inconsistent.')
+    }
+    const txid = explicitTxid ?? embeddedTxid
+    if (txid == null || !/^[0-9a-f]{64}$/.test(txid)) {
+      throw new Error('Wallet action input transaction ID is invalid.')
+    }
+    if (
+      !Number.isSafeInteger(input.sourceOutputIndex) ||
+      input.sourceOutputIndex < 0 ||
+      input.sourceOutputIndex > 0xffffffff
+    ) {
+      throw new Error('Wallet action input output index is invalid.')
+    }
+    return `${txid}.${input.sourceOutputIndex}`
+  }
+
+  /** Binds a wallet's final result to the exact template that passed authorization. */
+  private assertAuthorizedSignResult(
+    reference: string,
+    spends: Parameters<WalletInterface['signAction']>[0]['spends'],
+    result: Awaited<ReturnType<WalletInterface['signAction']>>
+  ): void {
+    const authorized = this.pendingActionTemplates.get(reference)
+    if (authorized == null) throw new Error('The authorized action template is unavailable.')
+    if (result.tx == null) throw new Error('Wallet finalization omitted transaction data required for binding.')
+    const finalized = Transaction.fromAtomicBEEF(result.tx)
+    if (
+      finalized.version !== authorized.version ||
+      finalized.lockTime !== authorized.lockTime ||
+      finalized.inputs.length !== authorized.inputs.length ||
+      finalized.outputs.length !== authorized.outputs.length
+    ) {
+      throw new Error('Wallet finalization substituted the authorized transaction template.')
+    }
+    for (let index = 0; index < authorized.inputs.length; index++) {
+      if (
+        this.inputOutpointForBinding(finalized.inputs[index]) !==
+          this.inputOutpointForBinding(authorized.inputs[index]) ||
+        (finalized.inputs[index].sequence ?? 0xffffffff) !== (authorized.inputs[index].sequence ?? 0xffffffff)
+      ) {
+        throw new Error('Wallet finalization substituted an authorized transaction input.')
+      }
+      const authorizedScript = authorized.inputs[index].unlockingScript?.toHex() ?? ''
+      if (authorizedScript !== '' && finalized.inputs[index].unlockingScript?.toHex() !== authorizedScript) {
+        throw new Error('Wallet finalization substituted an existing unlocking script.')
+      }
+    }
+    for (let index = 0; index < authorized.outputs.length; index++) {
+      if (
+        finalized.outputs[index].satoshis !== authorized.outputs[index].satoshis ||
+        finalized.outputs[index].lockingScript.toHex() !== authorized.outputs[index].lockingScript.toHex()
+      ) {
+        throw new Error('Wallet finalization substituted an authorized transaction output.')
+      }
+    }
+    for (const [indexText, spend] of Object.entries(spends ?? {})) {
+      if (!/^(0|[1-9]\d*)$/.test(indexText)) throw new Error('Signed input index is invalid.')
+      const index = Number(indexText)
+      if (!Number.isSafeInteger(index) || finalized.inputs[index] == null) {
+        throw new Error('Signed input index is invalid.')
+      }
+      if (
+        typeof spend?.unlockingScript !== 'string' ||
+        !/^(?:[0-9a-f]{2})*$/i.test(spend.unlockingScript) ||
+        finalized.inputs[index].unlockingScript?.toHex().toLowerCase() !== spend.unlockingScript.toLowerCase()
+      ) {
+        throw new Error('Wallet finalization substituted an authorized unlocking script.')
+      }
+    }
+    const finalizedTxid = finalized.id('hex')
+    if (result.txid != null && result.txid.toLowerCase() !== finalizedTxid) {
+      throw new Error('Wallet finalization transaction ID does not match its transaction data.')
+    }
+  }
+
+  private async blockAndAbortAction(reference: string): Promise<void> {
+    this.blockedActionReferences.add(reference)
+    const result = await this.underlying.abortAction({ reference })
+    if (result.aborted === true) this.clearPendingAction(reference)
+  }
+
+  private assertPendingActionOriginator(
+    reference: string,
+    originator: string | undefined,
+    allowBlocked: boolean
+  ): void {
+    if (!allowBlocked && this.blockedActionReferences.has(reference)) {
+      throw new WERR_UNAUTHORIZED('This action was blocked after a failed authorization check.')
+    }
+    const expected = this.pendingActionOriginators.get(reference)
+    if (expected == null) {
+      throw new WERR_UNAUTHORIZED('The action reference was not issued by this permissions manager.')
+    }
+    if (expected !== (originator ?? '')) {
+      throw new WERR_UNAUTHORIZED('The action reference belongs to a different originator.')
+    }
+  }
+
+  private clearPendingAction(reference: string): void {
+    this.pendingActionOriginators.delete(reference)
+    this.pendingActionTemplates.delete(reference)
+    this.blockedActionReferences.delete(reference)
   }
 
   public async signAction(
     ...args: Parameters<WalletInterface['signAction']>
   ): ReturnType<WalletInterface['signAction']> {
-    return await this.underlying.signAction(...args)
+    const [requestArgs, originator] = args
+    this.assertPendingActionOriginator(requestArgs.reference, originator, false)
+    try {
+      const result = await this.underlying.signAction(
+        {
+          ...requestArgs,
+          options: { ...requestArgs.options, returnTXIDOnly: false }
+        },
+        originator
+      )
+      this.assertAuthorizedSignResult(requestArgs.reference, requestArgs.spends, result)
+      this.clearPendingAction(requestArgs.reference)
+      return result
+    } catch (error) {
+      await this.blockAndAbortAction(requestArgs.reference)
+      throw error
+    }
   }
 
   public async abortAction(
     ...args: Parameters<WalletInterface['abortAction']>
   ): ReturnType<WalletInterface['abortAction']> {
-    return await this.underlying.abortAction(...args)
+    const [requestArgs, originator] = args
+    this.assertPendingActionOriginator(requestArgs.reference, originator, true)
+    const result = await this.underlying.abortAction(...args)
+    if (result.aborted === true) this.clearPendingAction(requestArgs.reference)
+    return result
   }
 
   public async listActions(
@@ -5032,6 +5345,8 @@ export class WalletPermissionsManager implements WalletInterface {
         usageType: 'generic'
       })
     }
+    // The underlying wallet may satisfy this with a caller-installed local trust anchor or the
+    // certificate overlay. This permission gate authorizes resolution, not external certification.
     return await this.underlying.discoverByIdentityKey(...args)
   }
 
@@ -5049,6 +5364,8 @@ export class WalletPermissionsManager implements WalletInterface {
         usageType: 'generic'
       })
     }
+    // The underlying wallet may satisfy this with a caller-installed local trust anchor or the
+    // certificate overlay. This permission gate authorizes resolution, not external certification.
     return await this.underlying.discoverByAttributes(...args)
   }
 
@@ -5262,7 +5579,11 @@ export class WalletPermissionsManager implements WalletInterface {
     return true
   }
 
-  /** Normalizes and canonicalizes originator domains (e.g., lowercase + drop default ports). */
+  /**
+   * Normalizes originator domains to their lowercase hostname. BRC-100
+   * permission authority is hostname-scoped, so every port shares the same
+   * grants and admin status.
+   */
   private normalizeOriginator(originator?: string): string {
     if (!originator) return ''
     const trimmed = originator.trim()
@@ -5280,12 +5601,7 @@ export class WalletPermissionsManager implements WalletInterface {
       const hostname = url.hostname.toLowerCase()
       const needsBrackets = hostname.includes(':')
       const baseHost = needsBrackets ? `[${hostname}]` : hostname
-      const port = url.port
-      const defaultPort = WalletPermissionsManager.DEFAULT_PORTS[url.protocol]
-      if (port && defaultPort && port === defaultPort) {
-        return baseHost
-      }
-      return port ? `${baseHost}:${port}` : baseHost
+      return baseHost
     } catch {
       // Fall back to a conservative lowercase trim if URL parsing fails.
       return trimmed.toLowerCase()
@@ -5311,13 +5627,50 @@ export class WalletPermissionsManager implements WalletInterface {
    * representations that should be considered when searching for existing
    * permission tokens (for backwards compatibility).
    */
-  private prepareOriginator(originator?: string): { normalized: string; lookupValues: string[] } {
+  private prepareOriginator(originator?: string): {
+    normalized: string
+    lookupValues: Array<string | undefined>
+  } {
     const trimmed = originator?.trim()
     if (!trimmed) {
       throw new Error('Originator is required for permission checks.')
     }
+    if (/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed)) {
+      throw new Error('Originator must be a domain name with an optional port, without a URL scheme.')
+    }
+    let parsed: URL
+    try {
+      parsed = new URL(`https://${trimmed}`)
+    } catch {
+      throw new Error('Originator must be a valid domain name with an optional port.')
+    }
+    if (
+      parsed.username !== '' ||
+      parsed.password !== '' ||
+      parsed.pathname !== '/' ||
+      parsed.search !== '' ||
+      parsed.hash !== ''
+    ) {
+      throw new Error('Originator must not contain credentials, a path, query parameters, or a fragment.')
+    }
+    const hostname = parsed.hostname.toLowerCase()
+    if (hostname.includes(':') || /^\d+(?:\.\d+){3}$/u.test(hostname)) {
+      throw new Error('IP address originators are not permitted.')
+    }
+    if (
+      hostname !== 'localhost' &&
+      !hostname.split('.').every(label => /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/u.test(label))
+    ) {
+      throw new Error('Originator must be a valid DNS hostname.')
+    }
     const normalized = this.normalizeOriginator(trimmed) || trimmed.toLowerCase()
-    const lookupValues = Array.from(new Set([trimmed, normalized])).filter(Boolean)
+    // Search both current canonical tags and exact legacy tags first. The
+    // untagged bounded fallback lets a grant minted for another port on this
+    // hostname remain usable; decoded token fields are still authenticated and
+    // compared to `normalized` before acceptance.
+    const lookupValues: Array<string | undefined> = Array.from(
+      new Set<string | undefined>([trimmed, normalized, undefined])
+    )
     return { normalized, lookupValues }
   }
 

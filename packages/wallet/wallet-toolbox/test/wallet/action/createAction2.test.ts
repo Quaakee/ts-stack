@@ -19,6 +19,7 @@ import { _tu, TestWalletNoSetup } from '../../utils/TestUtilsWalletStorage'
 const includeTestChaintracks = false
 const noLog = true
 const _logFilePath = path.resolve(__dirname, 'createAction2.test.ts')
+const knownTxids = ['11'.repeat(32), '22'.repeat(32)]
 
 function sanitizeTestName(testName: string): string {
   const cleanTestName = testName.replace(/[^a-zA-Z0-9_]/g, '_')
@@ -307,14 +308,14 @@ describe('createAction2 nosend transactions', () => {
         ],
         labels: ['custom options test'],
         options: {
-          knownTxids: ['tx123', 'tx456'],
+          knownTxids,
           returnTXIDOnly: false,
           noSend: true,
           randomizeOutputs: false
         }
       }
       const spendingResult: CreateActionResult = await wallet.createAction(spendingArgs)
-      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(['tx123', 'tx456']))
+      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(knownTxids))
       const spendingActionsResult = await wallet.listActions({
         labels: ['custom options test'],
         includeInputs: true,
@@ -371,14 +372,14 @@ describe('createAction2 nosend transactions', () => {
         ],
         labels: ['custom options test'],
         options: {
-          knownTxids: ['tx123', 'tx456'],
+          knownTxids,
           returnTXIDOnly: true,
           noSend: true
         }
       }
       const spendingResult: CreateActionResult = await wallet.createAction(spendingArgs)
       expect(spendingResult.tx).not.toBeDefined()
-      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(['tx123', 'tx456']))
+      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(knownTxids))
     }
   })
 
@@ -411,18 +412,18 @@ describe('createAction2 nosend transactions', () => {
         ],
         labels: ['custom options test'],
         options: {
-          knownTxids: ['tx123', 'tx456'],
+          knownTxids,
           returnTXIDOnly: true,
           noSend: true
         }
       }
       const spendingResult: CreateActionResult = await wallet.createAction(spendingArgs)
       expect(spendingResult).toBeDefined()
-      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(['tx123', 'tx456']))
+      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(knownTxids))
       const fundingBeef = Beef.fromBinary(fundingResult.tx!)
       expect(fundingBeef).toBeDefined()
       const _BeefPartyTxids = fundingBeef.txs.map(tx => tx.txid)
-      const expectedTxids = ['tx123', 'tx456']
+      const expectedTxids = knownTxids
       if (spendingArgs.options?.knownTxids) {
         const sortedKnown = [...spendingArgs.options.knownTxids].sort((a, b) => a.localeCompare(b))
         const sortedExpected = [...expectedTxids].sort((a, b) => a.localeCompare(b))
@@ -459,18 +460,18 @@ describe('createAction2 nosend transactions', () => {
           }
         ],
         options: {
-          knownTxids: ['tx123', 'tx456'],
+          knownTxids,
           returnTXIDOnly: false,
           noSend: true
         }
       }
       const spendingResult: CreateActionResult = await wallet.createAction(spendingArgs)
       expect(spendingResult).toBeDefined()
-      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(['tx123', 'tx456']))
+      expect(spendingArgs.options!.knownTxids).toEqual(expect.arrayContaining(knownTxids))
       const fundingBeef = Beef.fromBinary(fundingResult.tx!)
       expect(fundingBeef).toBeDefined()
       const _partyBeefTxids = fundingBeef.txs.map(tx => tx.txid)
-      const expectedTxids = ['tx123', 'tx456']
+      const expectedTxids = knownTxids
       const sortedKnownTxids = [...(spendingArgs.options!.knownTxids ?? [])].sort((a, b) => a.localeCompare(b))
       const sortedExpectedTxids = [...expectedTxids].sort((a, b) => a.localeCompare(b))
       expect(sortedKnownTxids).toEqual(sortedExpectedTxids)

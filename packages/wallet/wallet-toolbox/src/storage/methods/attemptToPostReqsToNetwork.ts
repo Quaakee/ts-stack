@@ -1,11 +1,14 @@
 import { Beef, Transaction, WalletLoggerInterface } from '@bsv/sdk'
 import { StorageProvider } from '../StorageProvider'
 import { EntityProvenTxReq } from '../schema/entities'
-import * as sdk from '../../sdk'
-import { ReqHistoryNote } from '../../sdk'
+import type * as sdk from '../../sdk'
+import type { ReqHistoryNote } from '../../sdk/types'
+import { WalletError } from '../../sdk/WalletError'
+import { WERR_INTERNAL } from '../../sdk/WERR_errors'
 import { wait } from '../../utility/utilityHelpers'
 import { isExactResume, lockExactResumeBinding } from './resumeFailedSendWith'
 import { markConfirmedStaleReqInputs } from './reconcileFailedTransactionInputs'
+import { normalizeWalletOutpoint, validateUtxoStatusResult } from '../../services/validateUtxoStatusResult'
 
 /**
  * Attempt to post one or more `ProvenTxReq` with status 'unsent'
@@ -84,7 +87,7 @@ async function validateReqsAndMergeBeefs(
         r.details.push(vreq)
       }
     } catch (error_: unknown) {
-      const { code, message } = sdk.WalletError.fromUnknown(error_)
+      const { code, message } = WalletError.fromUnknown(error_)
       req.addHistoryNote({ when: new Date().toISOString(), what: 'validateReqError', txid: req.txid, code, message })
       req.attempts++
       if (req.attempts > 6 || message.startsWith('The txid parameter must be known to storage')) {
@@ -106,7 +109,7 @@ async function transferNotesToReqHistories(
 ): Promise<void> {
   for (const txid of txids) {
     const vreq = vreqs.find(r => r.txid === txid)
-    if (vreq == null) throw new sdk.WERR_INTERNAL()
+    if (vreq == null) throw new WERR_INTERNAL()
     const notes: sdk.ReqHistoryNote[] = []
     for (const pbr of pbrs) {
       notes.push(...(pbr.notes || []))
@@ -224,7 +227,7 @@ function applyAggregateStatus(
       req.attempts++
       return { newReqStatus: 'sending', newTxStatus: 'sending' }
     default:
-      throw new sdk.WERR_INTERNAL(`unimplemented AggregateStatus ${status}`)
+      throw new WERR_INTERNAL(`unimplemented AggregateStatus ${status}`)
   }
 }
 
@@ -461,10 +464,54 @@ async function confirmDoubleSpend(
     ar.status = 'success'
     note.newStatus = ar.status
   } else {
-    // Confirmed double spend, get txids of possible competing transactions.
-    await gatherCompetingTxids(ar, beef, services, note, logger)
+    const tx = Transaction.fromBinary(req.rawTx)
+    const { spent, unspent, unknown } = await classifyBroadcastInputSpendEvidence(tx, beef, services)
+    note.inputsSpent = spent
+    note.inputsUnspent = unspent
+    note.inputsUnknown = unknown
+    if (spent > 0) {
+      // At least one exact input has independent positive spent evidence.
+      await gatherCompetingTxids(ar, beef, services, note, logger)
+    } else {
+      // A broadcaster's rejection plus absence from transaction-status indexes
+      // is not proof of a double spend. Preserve another success, otherwise
+      // retry as a service failure without failing or quarantining the action.
+      ar.status = ar.successCount > 0 ? 'success' : 'serviceError'
+      note.newStatus = ar.status
+    }
   }
   req.addHistoryNote(note)
+}
+
+export async function classifyBroadcastInputSpendEvidence(
+  tx: Transaction,
+  beef: Beef,
+  services: Pick<sdk.WalletServices, 'hashOutputScript' | 'getUtxoStatus'>
+): Promise<{ spent: number; unspent: number; unknown: number }> {
+  let spent = 0
+  let unspent = 0
+  let unknown = 0
+  for (const input of tx.inputs) {
+    try {
+      const sourceTxid = input.sourceTXID
+      const sourceOutputIndex = input.sourceOutputIndex
+      if (sourceTxid == null || !Number.isSafeInteger(sourceOutputIndex) || sourceOutputIndex < 0) {
+        throw new Error('invalid input outpoint')
+      }
+      const sourceTx = beef.findTxid(sourceTxid)?.tx
+      const sourceOutput = sourceTx?.outputs[sourceOutputIndex]
+      if (sourceOutput == null) throw new Error('missing input source')
+      const outpoint = normalizeWalletOutpoint(`${sourceTxid}.${sourceOutputIndex}`)!
+      const hash = services.hashOutputScript(sourceOutput.lockingScript.toHex())
+      const result = validateUtxoStatusResult(await services.getUtxoStatus(hash, undefined, outpoint), outpoint)
+      if (result.status !== 'success') unknown++
+      else if (result.isUtxo) unspent++
+      else spent++
+    } catch {
+      unknown++
+    }
+  }
+  return { spent, unspent, unknown }
 }
 
 /**

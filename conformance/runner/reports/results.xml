@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="bsv-conformance" tests="6690" failures="0" errors="0" skipped="0">
+<testsuites name="bsv-conformance" tests="6694" failures="0" errors="0" skipped="0">
   <testsuite name="auth/brc31-handshake" tests="16" failures="0" errors="0" skipped="0">
     <testcase name="auth.brc31-handshake.1" classname="auth/brc31-handshake" time="0"/>
     <testcase name="auth.brc31-handshake.2" classname="auth/brc31-handshake" time="0"/>
@@ -6841,5 +6841,11 @@
     <testcase name="wallet.storage.adapterconformance.16" classname="wallet/storage/adapter-conformance" time="0"/>
     <testcase name="wallet.storage.adapterconformance.17" classname="wallet/storage/adapter-conformance" time="0"/>
     <testcase name="wallet.storage.adapterconformance.18" classname="wallet/storage/adapter-conformance" time="0"/>
+  </testsuite>
+  <testsuite name="wallet/storage/sync-transfer" tests="4" failures="0" errors="0" skipped="0">
+    <testcase name="wallet.storage.sync-transfer.frame" classname="wallet/storage/sync-transfer" time="0"/>
+    <testcase name="wallet.storage.sync-transfer.truncated" classname="wallet/storage/sync-transfer" time="0"/>
+    <testcase name="wallet.storage.sync-transfer.trailing" classname="wallet/storage/sync-transfer" time="0"/>
+    <testcase name="wallet.storage.sync-transfer.short-header" classname="wallet/storage/sync-transfer" time="0"/>
   </testsuite>
 </testsuites>

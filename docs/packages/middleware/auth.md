@@ -3,7 +3,7 @@ id: pkg-auth
 title: '@bsv/auth'
 kind: package
 domain: middleware
-version: '0.1.4'
+version: '0.1.5'
 last_updated: '2026-08-27'
 last_verified: '2026-08-27'
 review_cadence_days: 30
@@ -48,6 +48,15 @@ Client and server must use the same protocol. Production verification must
 inject an atomic `consumeNonce` implementation. A process-local map is suitable
 only for one process; replicated or restarting services need a shared store
 with uniqueness and expiry.
+
+The verifier counterparty participates in key derivation at every valid
+security level. The level controls wallet consent (`0` silent, `1` per app, `2`
+per counterparty), so choose it deliberately and prefer level 2 when each
+verifier needs separate user approval. Proof data, signature bytes, and wallet
+verdicts must be plain own data rather than inherited or accessor-backed
+authority, and are snapshotted before asynchronous wallet work. Structured
+request bodies reject non-finite numbers and negative zero because their JSON
+encodings are ambiguous.
 
 The package publishes strict ESM and CommonJS entry points and supports Node.js
 22 or newer. See the

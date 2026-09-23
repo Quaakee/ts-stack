@@ -1,6 +1,10 @@
 import { MandalaActionDetails, MandalaActionKind } from '@bsv/templates'
 
-export interface FrozenRef { outpoint: string, amount: number, owner: string }
+export interface FrozenRef {
+  outpoint: string
+  amount: number
+  owner: string
+}
 
 export interface AssetAdminState {
   assetId: string
@@ -16,7 +20,11 @@ export interface AssetAdminState {
   lastAdmitSeq: number
 }
 
-export interface FoldContext { frozenAmount?: number, frozenOwner?: string, issuer?: string }
+export interface FoldContext {
+  frozenAmount?: number
+  frozenOwner?: string
+  issuer?: string
+}
 
 export const defaultAssetState = (assetId: string): AssetAdminState => ({
   assetId,
@@ -32,8 +40,15 @@ export const defaultAssetState = (assetId: string): AssetAdminState => ({
   lastAdmitSeq: 0
 })
 
-const addUnique = (xs: string[], x: string): string[] => xs.includes(x) ? xs : [...xs, x]
-const remove = (xs: string[], x: string): string[] => xs.filter(v => v !== x)
+const normalized = (value: string): string => value.toLowerCase()
+const addUnique = (xs: string[], x: string): string[] => {
+  const canonical = normalized(x)
+  return xs.some(value => normalized(value) === canonical) ? xs : [...xs, canonical]
+}
+const remove = (xs: string[], x: string): string[] => {
+  const canonical = normalized(x)
+  return xs.filter(value => normalized(value) !== canonical)
+}
 
 type Handler = (s: AssetAdminState, d: MandalaActionDetails, ctx: FoldContext) => void
 
@@ -41,32 +56,63 @@ type Handler = (s: AssetAdminState, d: MandalaActionDetails, ctx: FoldContext) =
 // never mutating the input state or its arrays. issue/redeem and unknown
 // kinds have no handler: no control-state change.
 const HANDLERS: Partial<Record<MandalaActionKind, Handler>> = {
-  register: (s, _d, ctx) => { if (typeof ctx.issuer === 'string') s.issuerIdentityKey = ctx.issuer },
-  pause: (s) => { s.isPaused = true },
-  unpause: (s) => { s.isPaused = false },
-  blockIdentity: (s, d) => { if (typeof d.identityKey === 'string') s.blockedIdentities = addUnique(s.blockedIdentities, d.identityKey) },
-  unblockIdentity: (s, d) => { if (typeof d.identityKey === 'string') s.blockedIdentities = remove(s.blockedIdentities, d.identityKey) },
-  allowIdentity: (s, d) => { if (typeof d.identityKey === 'string') s.allowedIdentities = addUnique(s.allowedIdentities, d.identityKey) },
-  unallowIdentity: (s, d) => { if (typeof d.identityKey === 'string') s.allowedIdentities = remove(s.allowedIdentities, d.identityKey) },
-  setAccessMode: (s, d) => { if (d.mode === 'denylist' || d.mode === 'allowlist') s.accessMode = d.mode },
+  register: (s, _d, ctx) => {
+    if (typeof ctx.issuer === 'string') s.issuerIdentityKey = normalized(ctx.issuer)
+  },
+  pause: s => {
+    s.isPaused = true
+  },
+  unpause: s => {
+    s.isPaused = false
+  },
+  blockIdentity: (s, d) => {
+    if (typeof d.identityKey === 'string')
+      s.blockedIdentities = addUnique(s.blockedIdentities, d.identityKey)
+  },
+  unblockIdentity: (s, d) => {
+    if (typeof d.identityKey === 'string')
+      s.blockedIdentities = remove(s.blockedIdentities, d.identityKey)
+  },
+  allowIdentity: (s, d) => {
+    if (typeof d.identityKey === 'string')
+      s.allowedIdentities = addUnique(s.allowedIdentities, d.identityKey)
+  },
+  unallowIdentity: (s, d) => {
+    if (typeof d.identityKey === 'string')
+      s.allowedIdentities = remove(s.allowedIdentities, d.identityKey)
+  },
+  setAccessMode: (s, d) => {
+    if (d.mode === 'denylist' || d.mode === 'allowlist') s.accessMode = d.mode
+  },
   freezeOutput: (s, d, ctx) => {
     if (typeof d.outpoint === 'string') {
+      const outpoint = normalized(d.outpoint)
       s.frozenOutpoints = [
-        ...s.frozenOutpoints.filter(f => f.outpoint !== d.outpoint),
-        { outpoint: d.outpoint, amount: ctx.frozenAmount ?? 0, owner: ctx.frozenOwner ?? '' }
+        ...s.frozenOutpoints.filter(f => normalized(f.outpoint) !== outpoint),
+        {
+          outpoint,
+          amount: ctx.frozenAmount ?? 0,
+          owner: normalized(ctx.frozenOwner ?? '')
+        }
       ]
     }
   },
-  unfreezeOutput: (s, d) => { if (typeof d.outpoint === 'string') s.frozenOutpoints = s.frozenOutpoints.filter(f => f.outpoint !== d.outpoint) },
+  unfreezeOutput: (s, d) => {
+    if (typeof d.outpoint === 'string') {
+      const outpoint = normalized(d.outpoint)
+      s.frozenOutpoints = s.frozenOutpoints.filter(f => normalized(f.outpoint) !== outpoint)
+    }
+  },
   reissue: (s, d) => {
     if (typeof d.outpoint === 'string') {
-      s.frozenOutpoints = s.frozenOutpoints.filter(f => f.outpoint !== d.outpoint)
-      s.evictedOutpoints = addUnique(s.evictedOutpoints, d.outpoint)
+      const outpoint = normalized(d.outpoint)
+      s.frozenOutpoints = s.frozenOutpoints.filter(f => normalized(f.outpoint) !== outpoint)
+      s.evictedOutpoints = addUnique(s.evictedOutpoints, outpoint)
     }
   }
 }
 
-export function foldAction (
+export function foldAction(
   state: AssetAdminState,
   details: MandalaActionDetails,
   ctx: FoldContext = {}

@@ -4,7 +4,20 @@ export interface RequestedCertificateTypeIDAndFieldList {
   [certificateTypeID: string]: string[]
 }
 
-// Define the structure for the requested certificates set
+/**
+ * BRC-103 v0.1 certificate request/allowlist.
+ *
+ * The current wire/API contract does not express all-of, any-of, threshold, or
+ * optional-field semantics. For compatibility, validation establishes only
+ * that every supplied certificate and disclosed field belongs to this set; it
+ * does not establish that every listed type or field was supplied. Each party
+ * remains free to choose what to request, what to provide, and how much to
+ * disclose. The library standardizes selective revelation; it never declares
+ * the actual disclosures sufficient for an application's decision. An
+ * application must inspect the received certificates and decrypted fields and
+ * terminate or constrain the session, access, or operation whenever those
+ * actual disclosures do not satisfy its own policy.
+ */
 export interface RequestedCertificateSet {
   certifiers: string[]
   types: RequestedCertificateTypeIDAndFieldList
@@ -13,17 +26,18 @@ export interface RequestedCertificateSet {
 export interface AuthMessage {
   version: string
   messageType:
-  | 'initialRequest'
-  | 'initialResponse'
-  | 'certificateRequest'
-  | 'certificateResponse'
-  | 'general'
+    'initialRequest' | 'initialResponse' | 'certificateRequest' | 'certificateResponse' | 'general'
   identityKey: string // Sender's public key (used for identity verification)
   nonce?: string // Sender's nonce (256-bit random value)
   initialNonce?: string
   yourNonce?: string // The recipient's nonce from a previous message (if applicable)
   certificates?: VerifiableCertificate[] // Optional: List of certificates (if required/requested)
-  requestedCertificates?: RequestedCertificateSet // Optional: List of requested certificates
+  /**
+   * Requested disclosure allowlist. Initial-exchange copies are not signed and
+   * can be altered in transit. Authorization must depend on the certificates
+   * and fields actually received and validated, never on this request alone.
+   */
+  requestedCertificates?: RequestedCertificateSet
   payload?: number[] // The actual message data (optional, could be a string or an object)
   signature?: number[] // Digital signature covering the entire message
 }
@@ -34,13 +48,25 @@ export interface Transport {
 }
 
 export interface PeerSession {
+  /**
+   * True after the peer has proved control of the session identity key. This is
+   * transport authentication, not application authorization or proof that all
+   * configured certificate attributes were supplied.
+   */
   isAuthenticated: boolean
   sessionNonce?: string
   peerNonce?: string
   peerIdentityKey?: string
   lastUpdate: number
   certificatesRequired?: boolean
+  /** True when supplied certificates fit the legacy v0.1 request allowlist. */
   certificatesValidated?: boolean
-  /** Local snapshot of the initial certificate request, never taken from a response. */
-  requestedCertificates?: RequestedCertificateSet
+  /**
+   * Local handshake policy snapshot. Session stores must retain this field; never sent on the
+   * wire. A zero-field (BRC-52 metadata-only) proof is accepted only against this retained
+   * snapshot, never against a configured default.
+   */
+  certificatePolicy?: RequestedCertificateSet
+  /** Locally issued standalone requests, keyed by their nonce. Not a wire correlation field. */
+  pendingCertificateRequests?: Record<string, RequestedCertificateSet>
 }

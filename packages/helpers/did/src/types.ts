@@ -1,4 +1,5 @@
-import type { PrivateKey, PublicKey } from '@bsv/sdk'
+import type PrivateKey from '@bsv/sdk/primitives/PrivateKey'
+import type PublicKey from '@bsv/sdk/primitives/PublicKey'
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[]
@@ -74,13 +75,20 @@ export interface GeneratePresentationOptions {
   audience?: string
   nonce?: string
   issuedAt?: number
+  verificationOptions?: SdJwtVcVerificationOptions
 }
 
 export interface SdJwtVcVerificationOptions {
   issuerPublicKey?: PublicKeyInput | Jwk
+  expectedIssuer?: string
+  expectedVct?: string
+  expectedCredentialAudience?: string
   expectedAudience?: string
   expectedNonce?: string
   requireKeyBinding?: boolean
+  now?: number
+  clockToleranceSeconds?: number
+  maxKeyBindingAgeSeconds?: number
 }
 
 export interface SdJwtVcVerificationResult {

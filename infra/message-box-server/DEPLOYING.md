@@ -94,6 +94,57 @@ Back up the database before schema changes and retain the prior immutable image
 for application rollback. A rollback must consider whether a migration is
 backward-compatible with the prior application version.
 
+For paid sends, a periodic snapshot alone is not a sufficient recovery source:
+the wallet mutation is external to the database transaction. Retain continuous
+point-in-time/binlog history and independent wallet transaction/audit evidence
+from each snapshot through the present. After any restore, keep paid sends
+disabled until every post-snapshot wallet action, replay claim, and
+`prepared`, `wallet_accepted`, or `completed` intent has been reconstructed and
+reconciled. The paid-send recovery objective is zero silent loss of replay or
+intent evidence; an unresolved window is an availability event, not permission
+to retry or request another spend.
+
+The payment migrations create both `payment_replays` and
+`message_payment_intents`; preserve both tables across every rollout. Custom
+embedded deployments must upgrade their replay-store adapter before deploying:
+it must implement `TransactionalPaymentReplayStore.claimInTransaction` and
+write `payment_replays` through the supplied Knex transaction. Keep `claim` for
+route-level payment middleware. Do not emulate rollback by deleting a claim
+after an error, because a concurrent request may already own the same
+transaction ID. The standard server uses `KnexPaymentReplayStore` and needs no
+adapter migration. Transactional body-payment claims must store
+`expires_at = NULL` and remain non-expiring: recipient-only payments have no
+server-wallet freshness verdict, so pruning such a claim would make the old
+transaction reusable for a different message.
+`MESSAGE_BOX_PAYMENT_REPLAY_TTL_DAYS` applies only to ordinary route-level
+BRC-105 claims.
+
+`message_payment_intents` is the durable cross-boundary recovery protocol. A
+`prepared` row binds the transaction ID to the exact canonical request before
+wallet mutation, and its attempt token prevents concurrent requests from taking
+ownership. `wallet_accepted` records an accepted wallet result after a
+non-retryable message transaction failure so an exact retry can finish without
+internalizing twice. `completed` means the message and non-expiring replay claim
+committed. A process termination after wallet acceptance but before the
+`wallet_accepted` update leaves an intentionally ambiguous `prepared` row;
+reconcile that wallet transaction and row manually before allowing another
+attempt or asking the payer to spend again. Never delete or reassign
+`prepared` or `wallet_accepted` rows as a retry mechanism, and retain intent
+rows unless a future reviewed retention policy proves that their replay and
+recovery obligations have ended.
+
+An application rollback cannot be image-only, and mixed-version replicas are
+unsupported once paid-send traffic begins. An older image neither implements
+this recovery protocol nor contains the new migration file, so migration-list
+validation may refuse to start it against the migrated database. Prefer a
+roll-forward. If rollback is unavoidable, stop and drain every replica,
+reconcile every intent, and restore the prior image together with a verified
+pre-migration database backup before restoring traffic. The down migration
+intentionally refuses to drop `message_payment_intents` while any row exists;
+never delete recovery rows merely to bypass that guard. Fresh body-payment
+requests with a server delivery output still require a newly accepted wallet
+result, and `isMerge: true` without a matching accepted intent fails closed.
+
 ## Probes
 
 - `GET /healthz` — liveness; does not authenticate or disclose dependencies

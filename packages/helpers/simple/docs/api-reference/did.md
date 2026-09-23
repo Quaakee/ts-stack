@@ -2,6 +2,13 @@
 
 The DID module provides W3C-compatible Decentralized Identifiers (`did:bsv:`) backed by BSV identity keys. It includes the standalone `DID` utility class and wallet-integrated methods.
 
+> **Security boundary:** remote resolution treats the configured resolver,
+> application proxy, and transaction/spend-index provider as authoritative.
+> Results are bounded, structurally validated, requested-DID bound, and checked
+> for reported output-0 linkage, but the current result contains no
+> cryptographic chain/freshness evidence. Do not use a remotely resolved key as
+> sole authentication or irreversible-payment authority.
+
 **Source:** `src/modules/did.ts`
 
 ## DID Class
@@ -20,8 +27,8 @@ static fromIdentityKey(identityKey: string): DIDDocument
 
 Generate a W3C DID Document from a compressed public key.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Parameter     | Type     | Description                            |
+| ------------- | -------- | -------------------------------------- |
 | `identityKey` | `string` | 66-character hex compressed public key |
 
 **Returns:** [`DIDDocument`](types.md#diddocument)
@@ -53,8 +60,8 @@ static parse(didString: string): DIDParseResult
 
 Parse a `did:bsv:` string and extract the identity key.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Parameter   | Type     | Description             |
+| ----------- | -------- | ----------------------- |
 | `didString` | `string` | A `did:bsv:` DID string |
 
 **Returns:**
@@ -73,16 +80,16 @@ static isValid(didString: string): boolean
 
 Validate a `did:bsv:` string format.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Parameter   | Type     | Description        |
+| ----------- | -------- | ------------------ |
 | `didString` | `string` | String to validate |
 
 **Returns:** `true` if the string is a valid `did:bsv:` DID, `false` otherwise.
 
 ```typescript
-DID.isValid('did:bsv:02a1b2c3...')  // true
-DID.isValid('did:eth:0x123')         // false
-DID.isValid('not-a-did')             // false
+DID.isValid('did:bsv:02a1b2c3...') // true
+DID.isValid('did:eth:0x123') // false
+DID.isValid('not-a-did') // false
 ```
 
 ### DID.getCertificateType()
@@ -91,9 +98,21 @@ DID.isValid('not-a-did')             // false
 static getCertificateType(): string
 ```
 
-Get the base64-encoded certificate type used for DID persistence.
+Get the legacy base64-encoded certificate type used by DID certificates
+persisted by earlier releases.
 
 **Returns:** Base64 encoding of `'did:bsv'`.
+
+Use this identifier only to recognize records exported for an explicit offline
+migration. New registrations use `DID.getCanonicalCertificateType()`, the
+base64-encoded SHA-256 digest of `'did:bsv'`, because BRC-100 certificate types
+are exactly 32 bytes. Current SDK wallet methods reject the short legacy type,
+so it must not be placed in `WalletInterface` filter arrays.
+
+```typescript
+const canonicalType = DID.getCanonicalCertificateType() // wallet operations
+const legacyType = DID.getCertificateType() // offline migration matching only
+```
 
 ## Wallet Methods
 
@@ -118,8 +137,8 @@ resolveDID(didString: string): DIDDocument
 
 Resolve any `did:bsv:` string to its DID Document. **Synchronous**.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Parameter   | Type     | Description             |
+| ----------- | -------- | ----------------------- |
 | `didString` | `string` | A `did:bsv:` DID string |
 
 **Throws:** `DIDError` if the DID format is invalid.
@@ -137,13 +156,15 @@ async registerDID(options?: { persist?: boolean }): Promise<DIDDocument>
 
 Persist this wallet's DID as a BSV certificate.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `options.persist` | `boolean` | `true` | If `false`, returns the DID Document without persisting |
+| Parameter         | Type      | Default | Description                                             |
+| ----------------- | --------- | ------- | ------------------------------------------------------- |
+| `options.persist` | `boolean` | `true`  | If `false`, returns the DID Document without persisting |
 
 **What happens:**
+
 1. Builds the DID Document from the identity key
-2. Creates an ephemeral `Certifier` with `certificateType: DID.getCertificateType()`
+2. Creates an ephemeral `Certifier` with the canonical 32-byte
+   `certificateType: DID.getCanonicalCertificateType()`
 3. Issues a certificate containing:
    - `didId`: The full DID string
    - `didType`: `'identity'`

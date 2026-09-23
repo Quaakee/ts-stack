@@ -214,14 +214,93 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
-- Local 2.6.1 patch candidate: support zero-field BRC-52 proofs in initial
-  responses using a retained local request and expected peer identity. Empty or
-  omitted keyrings require the exact issuer/type/empty-field request and no
-  decryption occurs. Keep the holder's exact-verifier `proveCertificate` call.
-  Refuse metadata-only standalone responses; mid-session zero-field proofs and
-  replay protection remain unsupported. Custom session stores must preserve
-  `PeerSession.requestedCertificates` for zero-field support; legacy nonempty
-  and no-certificate behavior remains compatible. No wire-format change or publication.
+### ATLAS maintained fork — zero-field initial certificate proofs
+
+- Accept BRC-52 zero-field proofs in the `initialResponse` handshake path only
+  against the handshake `PeerSession.certificatePolicy` snapshot that the
+  session store actually retained. An empty or omitted keyring must match an
+  exact issuer/type request with `fields=[]`; no field decryption occurs and
+  any keyring entry is refused for that request. The holder still calls
+  `proveCertificate` for the exact verifier and empty field list, so wallet
+  permission denial propagates. Standalone `certificateResponse` messages with
+  an empty keyring remain refused. Session stores that drop `certificatePolicy`
+  keep legacy nonempty-disclosure and no-certificate behaviour, but zero-field
+  validation fails closed. No wire-format change or npm publication.
+
+### 2.8.2 candidate — wallet discovery timeout lifecycle
+
+- Keep React Native and XDM discovery bounded without carrying the short probe
+  timeout into later wallet operations that may wait for user approval.
+- Preserve caller-configured operation timeouts, listener cleanup, response
+  validation and origin checks. No API or wire migration is required.
+- Applications using automatic discovery must upgrade their bundled SDK; a
+  wallet-only upgrade does not change the SDK served by an application.
+- This source candidate is not published until the protected npm workflow completes.
+
+### 2.8.1 candidate — portable authenticated empty fields
+
+- Fix portable AES-GCM decryption of valid authenticated empty plaintext. This
+  restores native/browser/mobile interoperability for empty encrypted fields.
+- Preserve historical encryption bytes and full authentication-tag validation;
+  add independent native-oracle tests across AES key sizes, IV lengths and block
+  boundaries, plus tampering and forced-portable SymmetricKey coverage.
+- Migration: none. Existing accounts, ciphertexts and public APIs are unchanged.
+  Publication remains subject to the protected npm workflow.
+
+### 2.8.0 candidate — authenticated boundaries and additive secure TOTP APIs
+
+- Correct empty authenticated HTTP response preimages to use the BRC-104 `-1`
+  length sentinel. Public transport byte vectors and real AuthFetch/Express
+  signature tests cover 204 and empty 401/403/404 responses and status tampering.
+  Non-empty responses and conforming servers require no migration.
+
+- Add `TOTP.generateSecure()` and `TOTP.validateSecure()` for conventional
+  six-digit, zero-padded codes while retaining the published two-digit,
+  unpadded `generate()` and `validate()` behavior for wire compatibility.
+
+- Bind authenticated general messages, certificate requests, and certificate
+  responses to the identity stored in the nonce-selected session. Reject
+  mismatched transport identity metadata and dispatch only the identity used
+  for signature verification. The BRC-103 v0.1 wire envelope, nonce derivation,
+  payload bytes, and signature format are unchanged.
+- Own and bound every BRC-103 message, policy, certificate, proof, and byte
+  collection before asynchronous wallet work. Reject inherited/accessor data,
+  malformed public keys/outpoints/base64/DER, excessive frames, unrequested
+  proof fields, and certificate mutation during signing. New master keyrings
+  encode 32-byte keys while preserving decryption of legacy minimal encodings.
+- Prevent inbound traffic from retargeting `Peer`'s implicit outbound
+  destination, preserve authenticated sessions during capacity pressure, cap
+  AuthFetch's received-certificate buffer, and parse payment amounts as exact
+  positive safe integers.
+- Bound SimplifiedFetch request/response framing and signed-header work. Redact
+  URL credentials/path/query, sensitive header values, transaction bytes, and
+  payment derivation data from AuthFetch diagnostics; the wallet remains the
+  BRC-105 spending-authorization boundary.
+- Require every completed `createAction` and `signAction` transaction to carry
+  direct source-value evidence, either in its returned BEEF or in the immutable
+  `createAction.inputBEEF` request. Reject duplicate input outpoints and
+  zero-input value creation. Deferred `signableTransaction` results retain
+  historical partial-BEEF compatibility. Completed `signAction` results, and
+  `createAction` results without matching request evidence, must include the
+  direct source transactions in their returned BEEF.
+- Restore explicit byte-wise initial-response nonce concatenation so verifier
+  behavior remains correct if nonce base64 framing changes in the future.
+- Document two v0.1 compatibility limits: initial certificate members are not
+  covered by the nonce-pair signature, and `RequestedCertificateSet` is an
+  allowlist rather than a complete type/field-fulfillment assertion. Use signed
+  post-handshake requests and explicit application authorization where needed.
+- Clarify the intended Contacts trust model throughout the identity API and
+  guides: a saved identity-key association is authoritative local policy based
+  on the user's independent validation, like an accepted self-signed
+  certificate, but is neither transferable nor third-party certification.
+
+### 2.7.0 candidate — authentication policy and settlement acceptance
+
+- Bind standalone certificate validation to local handshake and dynamic request
+  snapshots while retaining the BRC-103 v0.1 wire shape. Shared session adapters
+  must retain the new optional local policy fields and coordinate writers.
+- Clarify that certificate callbacks observe committed validation and cannot veto it.
+- Require `accepted: true` from the wallet before accepting BRC-29 settlement.
 
 - Stop late certificate work and session recovery from dispatching requests after
   an AuthFetch authentication timeout. Preserve the original gateway error and
@@ -263,9 +342,26 @@ All notable changes to this project will be documented in this file. The format 
 - Add `LookupResolver.queryDetailed()` and per-outcome host-settlement counts
   so security-sensitive callers can distinguish authoritative empty answers
   from partial availability.
+- Add bounded LookupResolver discovery: later SLAP tracker advertisements can
+  join an active query, hosts are scheduled fairly under concurrency and byte
+  limits, and HTTP bodies are read incrementally. Raw `query$` output remains
+  unverified; `onEvidence` is the C02 intake seam. Existing 2s host / 5s
+  tracker delays, reputation/backoff, freeform answers, and CORS/public
+  lookup request headers are unchanged.
 
 ### Changed
 
+- LookupResolver host cache no longer lets a tighter-limit discovery satisfy a
+  later larger query, and `query()` still throws the historical no-competent-hosts
+  error when a deadline expires before any host is admitted.
+- `LookupResolver.query()` and `queryDetailed()` now reject with an `AbortError`
+  when the caller's `options.signal` cancels the attempt, at any host count,
+  instead of flattening a cancelled run into an empty output list. `query$()`
+  still reports the cancellation as a `terminalReason: 'cancelled'` snapshot.
+- A lookup that exhausts a client resource budget during SLAP discovery, before
+  any host is admitted, now throws `LookupResourceLimitError` naming the limit
+  instead of the historical no-competent-hosts error. That message is reserved
+  for a deadline or a settled attempt that genuinely found no host.
 - Batch BEEF mutation bookkeeping and reuse compound Merkle intermediate hashes.
   The optional asynchronous P2PKH backend now forwards its already validated
   compressed public key directly into the unlocking script. Existing BEEF
@@ -321,6 +417,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Re-queue a `TransactionEvidenceCoordinator` candidate that was displaced by a
+  concurrency-limited attempt instead of discarding it. A same-txid alternate
+  candidate already admitted to a job could previously be lost without ever
+  being tried when every concurrency slot was in use at the moment of its
+  retry, causing an otherwise-valid candidate to fail with `limit`. No public
+  API change; internal candidate/byte accounting is unaffected.
+
 - Use asynchronous platform SHA-256 for ProtoWallet signature payloads of at
   least 64 KiB. Preserve deterministic signatures, direct digests, short input
   behavior, and portable fallback over a snapshot if native hashing is unavailable
@@ -374,6 +477,12 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Security
 
+- `HTTPSOverlayLookupFacilitator` now issues lookup and SLAP tracker discovery
+  requests with `redirect: 'error'`. A SLAP-advertised host can no longer
+  redirect the serialized lookup body to an origin that the advertised-host
+  scheme and credential checks never saw, such as `http:`, loopback, or
+  link-local. A redirected response is recorded as an ordinary availability
+  failure for the advertised host.
 - Treat cryptographic verification as successful only when it returns an
   affirmative result: `GlobalKVStore` rejects forged controller-signed overlay
   values, and `IdentityClient` refuses to publish signature-invalid identity

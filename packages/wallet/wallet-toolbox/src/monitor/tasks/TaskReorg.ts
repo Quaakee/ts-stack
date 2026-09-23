@@ -30,7 +30,7 @@ export class TaskReorg extends WalletMonitorTask {
 
   process: DeactivedHeader[] = []
 
-  constructor (
+  constructor(
     monitor: Monitor,
     public agedMsecs = Monitor.oneMinute * 10,
     public maxRetries = 3
@@ -43,20 +43,19 @@ export class TaskReorg extends WalletMonitorTask {
    * @param nowMsecsSinceEpoch current time in milliseconds since epoch.
    * @returns `run` true iff there are aged deactivated headers to process.
    */
-  trigger (nowMsecsSinceEpoch: number): { run: boolean } {
+  trigger(nowMsecsSinceEpoch: number): { run: boolean } {
     const cutoff = nowMsecsSinceEpoch - this.agedMsecs
     const q = this.monitor.deactivatedHeaders
     while (q.length > 0 && cutoff > q[0].whenMsecs) {
-      // Prepare to process deactivated headers that have aged sufficiently (agedMsecs)
-      const header = q.shift()!
-      this.process.push(header)
+      const header = this.monitor.shiftDeactivatedHeader()
+      if (header != null) this.process.push(header)
     }
     return {
       run: this.process.length > 0
     }
   }
 
-  async runTask (): Promise<string> {
+  async runTask(): Promise<string> {
     let log = ''
 
     for (;;) {
@@ -73,7 +72,7 @@ export class TaskReorg extends WalletMonitorTask {
           log += `      maximum retries ${this.maxRetries} exceeded\n`
         } else {
           log += '    retrying...\n'
-          this.monitor.deactivatedHeaders.push({
+          this.monitor.enqueueDeactivatedHeader({
             header: header.header,
             whenMsecs: Date.now(),
             tries: header.tries + 1

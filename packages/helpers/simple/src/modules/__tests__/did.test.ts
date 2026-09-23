@@ -16,11 +16,16 @@ describe('DID utilities', () => {
       method: 'bsv',
       identifier: PUBKEY
     })
+    expect(DID.parse(`did:bsv:${PUBKEY.toUpperCase()}`).identifier).toBe(PUBKEY)
   })
 
   it('rejects invalid DID strings', () => {
     expect(() => DID.parse('did:example:abc')).toThrow('Invalid DID')
     expect(() => DID.parse('did:bsv:not-hex')).toThrow('identifier must be')
+    // x equal to the secp256k1 field prime is not a valid curve point.
+    expect(() =>
+      DID.parse('did:bsv:02fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f')
+    ).toThrow('secp256k1')
   })
 
   it('validates DID strings without throwing', () => {
@@ -88,7 +93,8 @@ describe('DID utilities', () => {
     expect(() => DID.fromIdentityKey('abcd')).toThrow('Invalid identity key')
   })
 
-  it('returns the DID certificate type', () => {
+  it('preserves the legacy DID certificate type and exposes the canonical type', () => {
     expect(DID.getCertificateType()).toBe('ZGlkOmJzdg==')
+    expect(DID.getCanonicalCertificateType()).toBe('27RVS21ckZ2muZPmRwbj1AF1/9kN2U5Ev9YRljZovQ8=')
   })
 })

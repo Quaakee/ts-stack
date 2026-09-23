@@ -8,7 +8,7 @@ packages:
 
 # Supply-chain policy belongs in pnpm-workspace.yaml (pnpm 10 does not read
 # these settings from package.json). Keep native lifecycle scripts deny-by-
-# default, delay ordinary new releases for 24 hours, and reject provenance
+# default, delay ordinary new releases for seven days, and reject provenance
 # downgrades. First-party @bsv/* releases are exempt from the delay so a
 # coordinated stack release can consume freshly published siblings.
 allowBuilds:
@@ -19,10 +19,13 @@ allowBuilds:
   mongodb-memory-server: true
   sqlite3: true
   unrs-resolver: true
+# Reject registry-bypassing git, URL, and local references introduced by
+# transitive dependencies. Workspace-owned direct links remain explicit.
+blockExoticSubdeps: true
 # Require manifests to declare their runtime and build peers explicitly. This
 # keeps unused optional tooling peers out of the frozen dependency graph.
 autoInstallPeers: false
-minimumReleaseAge: 1440
+minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
   - '@bsv/*'
 
@@ -38,24 +41,19 @@ overrides:
   # though it only consumes the compatible parse() API. webpack-cli already
   # accepts TOML 4; keep both paths on the first release fixing the advisories.
   toml@<4.2.0: 4.2.0
-  # Stryker's latest typed-rest-client 2.3.1 pins vulnerable qs 6.15.1
-  # exactly. Keep this parent-scoped substitution until upstream publishes a
-  # release that depends on qs 6.15.2 or newer.
-  'typed-rest-client@2.3.1>qs': 6.15.3
+  # Express/body-parser, Superagent, and Stryker's typed-rest-client can retain
+  # vulnerable qs releases. Select the first release fixing the bracket/comma
+  # array-limit and attacker-controlled isBuffer advisories across every path.
+  qs@<6.16.0: 6.16.0
   # Jest's istanbul reporting chain (@istanbuljs/load-nyc-config, ts-jest,
   # jsdom, webpack-cli) still pulls js-yaml 3.15.1, affected by unbounded CPU
   # use on empty merge sources. Select the first patched 3.x release.
   js-yaml@<3.15.2: 3.15.2
-patchedDependencies:
-  image-size@1.2.1: patches/image-size@1.2.1.patch
-auditConfig:
-  # These advisories have no published fixed image-size release. The committed
-  # pnpm patch rejects their non-progressing ICNS, HEIF, and JPEG XL records;
-  # keep ignoring only these exact advisory IDs until Metro can consume a
-  # patched upstream release.
-  ignoreGhsas:
-    - GHSA-5p2g-fcmc-qvqq
-    - GHSA-w3rx-r6r6-pgpr
+  # Metro 0.87 still declares image-size ^1.0.2. Use the first maintained
+  # release after the HEIF/JXL and ICNS non-progressing-parser advisories while
+  # retaining Metro's CommonJS default-function contract. The mobile platform
+  # gate exercises image dimensions, bundling, and Hermes compilation.
+  'metro@0.87.0>image-size': 2.0.4
 strictDepBuilds: true
 trustPolicy: no-downgrade
 # Apply provenance downgrade checks to the recent supply-chain window. Older

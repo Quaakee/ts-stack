@@ -85,8 +85,6 @@ describe('auth middleware helpers', () => {
           'Content-Type': 'application/json; charset=utf-8',
           authorization: 'Bearer token',
           'x-bsv-auth-signature': 'excluded',
-          'x-bsv-array': ['first', 'second'],
-          'x-bsv-undefined': undefined,
           accept: 'excluded'
         }
       } as any,
@@ -94,20 +92,27 @@ describe('auth middleware helpers', () => {
     )
 
     const reader = new Utils.Reader(writer.toArray())
-    expect(reader.readVarIntNum()).toBe(5)
+    expect(reader.readVarIntNum()).toBe(3)
     expect([
-      [readString(reader), readString(reader)],
-      [readString(reader), readString(reader)],
       [readString(reader), readString(reader)],
       [readString(reader), readString(reader)],
       [readString(reader), readString(reader)]
     ]).toEqual([
       ['authorization', 'Bearer token'],
       ['content-type', 'application/json'],
-      ['x-bsv-array', 'first'],
-      ['x-bsv-undefined', ''],
       ['x-bsv-z', 'last']
     ])
+  })
+
+  it('rejects ambiguous repeated or missing signed header values', () => {
+    for (const value of [['first', 'second'], undefined]) {
+      expect(() =>
+        writeRequestHeadersToWriter(
+          { headers: { 'x-bsv-value': value } } as any,
+          new Utils.Writer()
+        )
+      ).toThrow('one exact string value')
+    }
   })
 
   it('writes an individual header pair', () => {
@@ -136,6 +141,16 @@ describe('auth middleware helpers', () => {
       expected: Utils.toArray('{"hello":"world"}', 'utf8')
     },
     {
+      body: false,
+      contentType: 'application/json',
+      expected: Utils.toArray('false', 'utf8')
+    },
+    {
+      body: 'value',
+      contentType: 'application/json',
+      expected: Utils.toArray('"value"', 'utf8')
+    },
+    {
       body: { hello: 'world', n: '1' },
       contentType: ['application/x-www-form-urlencoded; charset=utf-8'],
       expected: Utils.toArray('hello=world&n=1', 'utf8')
@@ -159,12 +174,10 @@ describe('auth middleware helpers', () => {
   })
 
   it.each([
-    [[0, -1, 256], undefined],
-    [{}, 'text/plain'],
+    [undefined, undefined],
     ['', 'text/plain'],
-    [{}, 'application/x-www-form-urlencoded'],
-    ['hello', 'application/octet-stream']
-  ])('writes an empty sentinel for an unsupported body', (body, contentType) => {
+    [{}, 'application/x-www-form-urlencoded']
+  ])('writes an empty sentinel for an absent body', (body, contentType) => {
     const writer = new Utils.Writer()
     writeBodyToWriter(
       {
@@ -175,6 +188,41 @@ describe('auth middleware helpers', () => {
     )
 
     expect(readBody(writer)).toBeUndefined()
+  })
+
+  it.each([
+    [[0, -1, 256], undefined],
+    [{}, 'text/plain'],
+    ['hello', 'application/octet-stream']
+  ])('rejects a nonempty body that cannot be represented canonically', (body, contentType) => {
+    expect(() =>
+      writeBodyToWriter(
+        {
+          body,
+          headers: contentType === undefined ? {} : { 'content-type': contentType }
+        } as any,
+        new Utils.Writer()
+      )
+    ).toThrow('cannot be represented canonically')
+  })
+
+  it('rejects lossy URL-encoded structures and sparse byte arrays', () => {
+    expect(() =>
+      writeBodyToWriter(
+        {
+          body: { account: { role: 'admin' } },
+          headers: { 'content-type': 'application/x-www-form-urlencoded' }
+        } as any,
+        new Utils.Writer()
+      )
+    ).toThrow('exact string fields')
+
+    const sparse = Array(2) as number[]
+    sparse[1] = 7
+    expect(() =>
+      writeBodyToWriter({ body: sparse, headers: {} } as any, new Utils.Writer())
+    ).toThrow('cannot be represented canonically')
+    expect(convertValueToArray(sparse, {})).toEqual(Utils.toArray('[null,7]', 'utf8'))
   })
 
   it('logs body classification only when debug logging is enabled', () => {
@@ -201,6 +249,40 @@ describe('auth middleware helpers', () => {
     })
     expect(JSON.stringify(debug.mock.calls)).not.toContain('hello')
     expect(debug).toHaveBeenNthCalledWith(2, '[writeBodyToWriter] No valid body to write')
+  })
+
+  it('logs exact binary, JSON, and empty form classifications without body content', () => {
+    const debug = jest.fn()
+    const logger = { debug, log: jest.fn() } as unknown as typeof console
+
+    writeBodyToWriter(
+      { body: new Uint8Array([1, 2, 3]), headers: {} } as any,
+      new Utils.Writer(),
+      logger,
+      'debug'
+    )
+    writeBodyToWriter(
+      { body: { secret: 'value' }, headers: { 'content-type': 'application/json' } } as any,
+      new Utils.Writer(),
+      logger,
+      'debug'
+    )
+    writeBodyToWriter(
+      { body: {}, headers: { 'content-type': 'application/x-www-form-urlencoded' } } as any,
+      new Utils.Writer(),
+      logger,
+      'debug'
+    )
+
+    expect(debug.mock.calls).toEqual([
+      ['[writeBodyToWriter] Body recognized as Uint8Array', { length: 3 }],
+      [
+        '[writeBodyToWriter] Body recognized as JSON',
+        { length: Utils.toArray('{"secret":"value"}', 'utf8').length }
+      ],
+      ['[writeBodyToWriter] No valid body to write']
+    ])
+    expect(JSON.stringify(debug.mock.calls)).not.toContain('secret')
   })
 
   it('converts supported response values without mutating existing content types', () => {
@@ -238,5 +320,24 @@ describe('auth middleware helpers', () => {
     expect(debug).toHaveBeenNthCalledWith(1, 'with data', { ok: true })
     expect(debug).toHaveBeenNthCalledWith(2, 'without data')
     expect(debug).toHaveBeenCalledTimes(2)
+  })
+
+  it('contains throwing and accessor-backed optional loggers', () => {
+    const throwing = {
+      log: (): never => {
+        throw new Error('logger failure')
+      },
+      debug: (): never => {
+        throw new Error('logger failure')
+      }
+    } as unknown as typeof console
+    expect(() => makeDebugLogger(throwing, 'debug')('safe', { ok: true })).not.toThrow()
+
+    const accessor = Object.defineProperty({}, 'debug', {
+      get(): never {
+        throw new Error('getter failure')
+      }
+    }) as typeof console
+    expect(() => getLogMethod(accessor, 'debug')('safe')).not.toThrow()
   })
 })

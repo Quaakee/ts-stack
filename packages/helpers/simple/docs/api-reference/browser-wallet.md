@@ -54,6 +54,10 @@ const wallet = await createWallet({
 })
 ```
 
+The bundled registry is a legacy unauthenticated directory. Its results do not
+prove control of an identity key and must not be used alone to select a payment
+recipient.
+
 ## Available Methods
 
 `BrowserWallet` includes all methods from:

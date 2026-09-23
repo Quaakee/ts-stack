@@ -1,6 +1,4 @@
 import {
-  Hash,
-  Utils,
   Random,
   SymmetricKey,
   AbortActionArgs,
@@ -62,11 +60,16 @@ import {
   LookupResolution,
   Transaction,
   PushDrop,
+  LockingScript,
   CreateActionInput,
   SHIPBroadcaster,
   Telemetry,
-  TelemetryConfig
+  TelemetryConfig,
+  completeBoundAction,
+  decodeCanonicalPushDrop
 } from '@bsv/sdk'
+import { sha256 } from '@bsv/sdk/primitives/Hash'
+import { Reader, Writer, toArray, toHex, toUTF8 } from '@bsv/sdk/primitives/utils'
 import { PrivilegedKeyManager } from './sdk/PrivilegedKeyManager'
 import { argon2id, createSHA256, createSHA512, pbkdf2 } from './utility/hashWasm'
 
@@ -140,9 +143,9 @@ function addPasswordKdf(token: UMPToken, protocolFields: number[][], kdfVersionF
   if (kdfAlgorithmField == null || kdfParamsField == null || kdfParamsField.length > 1024) {
     return false
   }
-  const kdfParams = JSON.parse(Utils.toUTF8(kdfParamsField)) as Record<string, unknown>
+  const kdfParams = JSON.parse(toUTF8(kdfParamsField)) as Record<string, unknown>
   const passwordKdf: UMPToken['passwordKdf'] = {
-    algorithm: Utils.toUTF8(kdfAlgorithmField) as 'pbkdf2-sha512' | 'argon2id',
+    algorithm: toUTF8(kdfAlgorithmField) as 'pbkdf2-sha512' | 'argon2id',
     iterations: kdfParams.iterations as number,
     memoryKiB: kdfParams.memoryKiB as number | undefined,
     parallelism: kdfParams.parallelism as number | undefined,
@@ -203,6 +206,27 @@ function stripVerifiedPushDropSignature(fields: number[][], lockingPublicKey: an
   }
 
   return fields
+}
+
+function decodeAuthenticatedUMPFields(lockingScript: LockingScript): ReturnType<typeof decodeCanonicalPushDrop> {
+  const decoded = decodeCanonicalPushDrop(lockingScript, {
+    fieldCount: [12, 13, 15, 16],
+    maximumFieldBytes: MAX_STATE_SNAPSHOT_BYTES,
+    maximumPayloadBytes: MAX_STATE_SNAPSHOT_BYTES
+  })
+  const fields = stripVerifiedPushDropSignature(decoded.fields, decoded.lockingPublicKey)
+  if (fields.length !== decoded.fields.length - 1) {
+    throw new Error('UMP token field signature is missing or invalid')
+  }
+  const kdfVersionFieldIndex = findKdfVersionFieldIndex(fields)
+  if (
+    (kdfVersionFieldIndex === -1 && fields.length > 12) ||
+    (kdfVersionFieldIndex === 11 && fields.length !== 14) ||
+    (kdfVersionFieldIndex === 12 && fields.length !== 15)
+  ) {
+    throw new Error('UMP token field layout is invalid')
+  }
+  return { ...decoded, fields }
 }
 
 /**
@@ -640,7 +664,7 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
     return this.findToken(
       {
         service: 'ls_users',
-        query: { presentationHash: Utils.toHex(hash) }
+        query: { presentationHash: toHex(hash) }
       },
       'presentation',
       options
@@ -658,7 +682,7 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
     return this.findToken(
       {
         service: 'ls_users',
-        query: { recoveryHash: Utils.toHex(hash) }
+        query: { recoveryHash: toHex(hash) }
       },
       'recovery',
       options
@@ -698,7 +722,7 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
       question.query[lookupKind === 'presentation' ? 'presentationHash' : 'recoveryHash'].toLowerCase()
     const matchingTokens = tokens.filter(
       token =>
-        Utils.toHex(lookupKind === 'presentation' ? token.presentationHash : token.recoveryHash).toLowerCase() ===
+        toHex(lookupKind === 'presentation' ? token.presentationHash : token.recoveryHash).toLowerCase() ===
         expectedHash
     )
 
@@ -815,19 +839,17 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
    * predecessor rather than an independently minted token.
    */
   private consumesIdentity(tx: Transaction, token: UMPToken): boolean {
-    const presentationHash = Utils.toHex(token.presentationHash)
-    const recoveryHash = Utils.toHex(token.recoveryHash)
+    const presentationHash = toHex(token.presentationHash)
+    const recoveryHash = toHex(token.recoveryHash)
     for (const input of tx.inputs) {
       const source = input.sourceTransaction
       if (source == null || input.sourceOutputIndex == null) continue
       const sourceOutput = source.outputs[input.sourceOutputIndex]
       if (sourceOutput == null) continue
       try {
-        const decoded = PushDrop.decode(sourceOutput.lockingScript)
-        if (decoded.fields == null) continue
-        const fields = stripVerifiedPushDropSignature(decoded.fields, decoded.lockingPublicKey)
+        const { fields } = decodeAuthenticatedUMPFields(sourceOutput.lockingScript)
         if (fields.length < 11 || fields[6]?.length !== 32 || fields[7]?.length !== 32) continue
-        if (Utils.toHex(fields[6]) === presentationHash || Utils.toHex(fields[7]) === recoveryHash) {
+        if (toHex(fields[6]) === presentationHash || toHex(fields[7]) === recoveryHash) {
           return true
         }
       } catch {
@@ -975,10 +997,14 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
       /* forSelf= */ true,
       /* includeSignature= */ true
     )
-    const tokenOutput = [{ lockingScript: script.toHex(), satoshis: 1, outputDescription: 'New UMP token output' }]
+    const tokenScript = script.toHex()
+    const tokenOutput = [{ lockingScript: tokenScript, satoshis: 1, outputDescription: 'New UMP token output' }]
 
     // 2) Resolve the old-token input (if provided) and create the action.
     const { resolvedOldToken, inputToken } = await this.resolveOldInput(oldTokenToConsume)
+    if (resolvedOldToken != null && inputToken != null) {
+      await this.assertOwnedUMPInput(wallet, adminOriginator, resolvedOldToken, inputToken)
+    }
     const inputs: CreateActionInput[] = resolvedOldToken?.currentOutpoint
       ? [
           {
@@ -989,27 +1015,40 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
         ]
       : []
 
-    const createResult = await this.createAction(
-      wallet,
-      adminOriginator,
+    const createArgs: CreateActionArgs = {
+      description: resolvedOldToken == null ? 'Create new UMP token' : 'Renew UMP token (consume old, create new)',
       inputs,
-      tokenOutput,
-      inputToken,
-      resolvedOldToken
-    )
-
-    // 3) If the wallet fully processed it (no signable tx), broadcast and return.
-    if (!createResult.signableTransaction) {
-      return this.broadcastFinal(createResult)
+      outputs: tokenOutput,
+      inputBEEF: inputToken?.beef,
+      options: { randomizeOutputs: false, acceptDelayedBroadcast: false }
+    }
+    const inputSigners = Object.create(null) as NonNullable<
+      NonNullable<Parameters<typeof completeBoundAction>[2]>['inputSigners']
+    >
+    if (resolvedOldToken?.currentOutpoint != null) {
+      const unlocker = new PushDrop(wallet, adminOriginator).unlock([2, 'admin user management token'], '1', 'self')
+      inputSigners[resolvedOldToken.currentOutpoint] = async (transaction, inputIndex) =>
+        await unlocker.sign(transaction, inputIndex)
     }
 
-    // 4) Sign and broadcast: with old token input or without.
-    const reference = createResult.signableTransaction.reference
-    const partialTx = Transaction.fromBEEF(createResult.signableTransaction.tx)
-    if (resolvedOldToken?.currentOutpoint) {
-      return this.renewToken(wallet, adminOriginator, reference, partialTx)
+    const operation = resolvedOldToken == null ? 'create' : 'renew'
+    let transaction: Transaction
+    try {
+      transaction = await this.completeUMPAction(wallet, createArgs, inputSigners, adminOriginator)
+    } catch (error) {
+      this.telemetry.capture({
+        name: 'wallet-toolbox.ump.action.failed',
+        component: 'wallet-toolbox.ump',
+        severity: 'error',
+        attributes: {
+          operation,
+          oldTokenInputRequired: resolvedOldToken != null
+        },
+        error
+      })
+      throw error
     }
-    return this.broadcastNew(wallet, adminOriginator, reference)
+    return await this.broadcastUMPTransaction(transaction, tokenScript, operation)
   }
 
   /** Assembles the ordered number[][] fields array from a UMPToken. */
@@ -1030,12 +1069,12 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
     if (token.umpVersion === 3 && token.passwordKdf != null) {
       const vi = token.profilesEncrypted == null ? 11 : 12
       fields[vi] = [token.umpVersion]
-      fields[vi + 1] = Utils.toArray(token.passwordKdf.algorithm, 'utf8')
+      fields[vi + 1] = toArray(token.passwordKdf.algorithm, 'utf8')
       const kdfParams: Record<string, number> = { iterations: token.passwordKdf.iterations }
       if (token.passwordKdf.memoryKiB !== undefined) kdfParams.memoryKiB = token.passwordKdf.memoryKiB
       if (token.passwordKdf.parallelism !== undefined) kdfParams.parallelism = token.passwordKdf.parallelism
       if (token.passwordKdf.hashLength !== undefined) kdfParams.hashLength = token.passwordKdf.hashLength
-      fields[vi + 2] = Utils.toArray(JSON.stringify(kdfParams), 'utf8')
+      fields[vi + 2] = toArray(JSON.stringify(kdfParams), 'utf8')
     }
     return fields
   }
@@ -1052,98 +1091,74 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
     return { resolvedOldToken: oldTokenToConsume, inputToken }
   }
 
-  /** Creates the UMP action without dropping a required old-token input on failure. */
-  private async createAction(
+  /** Proves the exact predecessor is an authenticated token controlled by this wallet. */
+  private async assertOwnedUMPInput(
     wallet: WalletInterface,
     adminOriginator: OriginatorDomainNameStringUnder250Bytes,
-    inputs: CreateActionInput[],
-    outputs: Array<{ lockingScript: string; satoshis: number; outputDescription: string }>,
-    inputToken: { beef: number[]; outputIndex: number } | undefined,
-    resolvedOldToken: UMPToken | undefined
-  ): Promise<Awaited<ReturnType<WalletInterface['createAction']>>> {
-    try {
-      return await wallet.createAction(
-        {
-          description: resolvedOldToken == null ? 'Create new UMP token' : 'Renew UMP token (consume old, create new)',
-          inputs,
-          outputs,
-          inputBEEF: inputToken?.beef,
-          options: { randomizeOutputs: false, acceptDelayedBroadcast: false }
-        },
-        adminOriginator
-      )
-    } catch (error) {
-      this.telemetry.capture({
-        name: 'wallet-toolbox.ump.action.failed',
-        component: 'wallet-toolbox.ump',
-        severity: 'error',
-        attributes: {
-          operation: resolvedOldToken == null ? 'create' : 'renew',
-          oldTokenInputRequired: resolvedOldToken != null
-        },
-        error
-      })
-      throw error
+    oldToken: UMPToken,
+    inputToken: { beef: number[]; outputIndex: number }
+  ): Promise<void> {
+    const transaction = Transaction.fromBEEF(inputToken.beef)
+    const sourceOutput = transaction.outputs[inputToken.outputIndex]
+    if (sourceOutput == null) throw new Error('Previous UMP token source output is missing.')
+    const decoded = decodeAuthenticatedUMPFields(sourceOutput.lockingScript)
+    if (
+      decoded.fields[6]?.length !== 32 ||
+      decoded.fields[7]?.length !== 32 ||
+      toHex(decoded.fields[6]) !== toHex(oldToken.presentationHash) ||
+      toHex(decoded.fields[7]) !== toHex(oldToken.recoveryHash)
+    ) {
+      throw new Error('Previous UMP token identity does not match its authenticated source.')
+    }
+    const { publicKey } = await wallet.getPublicKey(
+      {
+        protocolID: [2, 'admin user management token'],
+        keyID: '1',
+        counterparty: 'self',
+        forSelf: true
+      },
+      adminOriginator
+    )
+    if (publicKey.toLowerCase() !== decoded.lockingPublicKey.toString().toLowerCase()) {
+      throw new Error('Previous UMP token is not controlled by this wallet.')
     }
   }
 
-  /** Handles a fully-finalized (no signable tx) createAction result — broadcasts and returns outpoint. */
-  private async broadcastFinal(
-    createResult: Awaited<ReturnType<WalletInterface['createAction']>>
-  ): Promise<OutpointString> {
-    const finalTxid =
-      createResult.txid || (createResult.tx != null ? Transaction.fromAtomicBEEF(createResult.tx).id('hex') : undefined)
-    if (!finalTxid) throw new Error('UMP transaction was not finalized.')
-    if (createResult.tx == null) throw new Error('UMP transaction data missing.')
-    const broadcastTx = Transaction.fromAtomicBEEF(createResult.tx)
-    const result = await this.broadcaster.broadcast(broadcastTx)
-    this.assertBroadcast(result, 'create-finalized')
-    return `${finalTxid}.0`
+  /** Completes an action only after exact request, input, output, and final-transaction binding. */
+  private async completeUMPAction(
+    wallet: WalletInterface,
+    createArgs: CreateActionArgs,
+    inputSigners: NonNullable<Parameters<typeof completeBoundAction>[2]>['inputSigners'],
+    adminOriginator: OriginatorDomainNameStringUnder250Bytes
+  ): Promise<Transaction> {
+    return await completeBoundAction(wallet, createArgs, { inputSigners }, adminOriginator)
   }
 
-  /** Signs the old-token input and broadcasts — used during UMP token renewal. */
-  private async renewToken(
-    wallet: WalletInterface,
-    adminOriginator: OriginatorDomainNameStringUnder250Bytes,
-    reference: string,
-    partialTx: Transaction
+  /** Broadcasts a bound UMP transaction and returns the exact, uniquely matching token output. */
+  private async broadcastUMPTransaction(
+    transaction: Transaction,
+    tokenScript: string,
+    operation: 'renew' | 'create'
   ): Promise<OutpointString> {
-    const unlocker = new PushDrop(wallet, adminOriginator).unlock([2, 'admin user management token'], '1', 'self')
-    const unlockingScript = await unlocker.sign(partialTx, 0)
-    const signResult = await wallet.signAction(
-      { reference, spends: { 0: { unlockingScript: unlockingScript.toHex() } } },
-      adminOriginator
+    const normalizedScript = tokenScript.toLowerCase()
+    const matchingOutputs = transaction.outputs.flatMap((output, index) =>
+      output.satoshis === 1 && output.lockingScript.toHex().toLowerCase() === normalizedScript ? [index] : []
     )
-    const finalTxid =
-      signResult.txid || (signResult.tx == null ? '' : Transaction.fromAtomicBEEF(signResult.tx).id('hex'))
-    if (!finalTxid) throw new Error('Could not finalize renewed UMP token.')
-    if (signResult.tx == null) throw new Error('Renewed UMP token transaction data missing.')
-    const result = await this.broadcaster.broadcast(Transaction.fromAtomicBEEF(signResult.tx))
-    this.assertBroadcast(result, 'renew')
-    return `${finalTxid}.0`
-  }
-
-  /** Signs without input spending and broadcasts — used when creating a brand-new UMP token. */
-  private async broadcastNew(
-    wallet: WalletInterface,
-    adminOriginator: OriginatorDomainNameStringUnder250Bytes,
-    reference: string
-  ): Promise<OutpointString> {
-    const signResult = await wallet.signAction({ reference, spends: {} }, adminOriginator)
-    const finalTxid =
-      signResult.txid || (signResult.tx == null ? '' : Transaction.fromAtomicBEEF(signResult.tx).id('hex'))
-    if (!finalTxid) throw new Error('Could not finalize new UMP token.')
-    if (signResult.tx == null) throw new Error('New UMP token transaction data missing.')
-    const result = await this.broadcaster.broadcast(Transaction.fromAtomicBEEF(signResult.tx))
-    this.assertBroadcast(result, 'create')
-    return `${finalTxid}.0`
+    if (matchingOutputs.length !== 1) {
+      throw new Error('Final UMP transaction must contain exactly one requested token output.')
+    }
+    const txid = transaction.id('hex')
+    const result = await this.broadcaster.broadcast(transaction)
+    this.assertBroadcast(result, operation, txid)
+    return `${txid}.${matchingOutputs[0]}`
   }
 
   private assertBroadcast(
     result: Awaited<ReturnType<SHIPBroadcaster['broadcast']>>,
-    operation: 'create-finalized' | 'renew' | 'create'
+    operation: 'renew' | 'create',
+    expectedTxid: string
   ): void {
-    const succeeded = result.status === 'success'
+    const succeeded = result.status === 'success' && result.txid.toLowerCase() === expectedTxid.toLowerCase()
     this.telemetry.capture({
       name: succeeded ? 'wallet-toolbox.ump.broadcast.completed' : 'wallet-toolbox.ump.broadcast.failed',
       component: 'wallet-toolbox.ump',
@@ -1155,7 +1170,8 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
       }
     })
     if (!succeeded) {
-      throw new Error(`UMP token broadcast failed (${result.code}).`)
+      const reason = result.status === 'error' ? result.code : 'transaction ID mismatch'
+      throw new Error(`UMP token broadcast failed (${reason}).`)
     }
   }
 
@@ -1186,12 +1202,7 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
       const tx = Transaction.fromBEEF(output.beef)
       const txOutput = tx.outputs[output.outputIndex]
       if (txOutput == null) return undefined
-      const decoded = PushDrop.decode(txOutput.lockingScript)
-      if (decoded.fields == null || decoded.fields.length < 11 || decoded.fields.length > 16) {
-        return undefined
-      }
-
-      const protocolFields = stripVerifiedPushDropSignature(decoded.fields, decoded.lockingPublicKey)
+      const { fields: protocolFields } = decodeAuthenticatedUMPFields(txOutput.lockingScript)
       if (
         protocolFields.length < 11 ||
         protocolFields.slice(0, 11).some(field => field.length === 0 || field.length > MAX_STATE_SNAPSHOT_BYTES)
@@ -1234,6 +1245,14 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
   private async findByOutpoint(outpoint: string): Promise<{ beef: number[]; outputIndex: number } | undefined> {
     const correlationId = this.telemetry.enabled === true ? this.telemetry.createCorrelationId() : undefined
     const startedAt = Date.now()
+    const match = /^([0-9a-f]{64})\.(0|[1-9]\d*)$/i.exec(outpoint)
+    const requestedOutputIndex = match == null ? Number.NaN : Number(match[2])
+    if (match == null || !Number.isSafeInteger(requestedOutputIndex) || requestedOutputIndex > 0xffffffff) {
+      const diagnostics = this.emptyStats(correlationId)
+      this.lookupFailed('outpoint', 'token-malformed', diagnostics, startedAt)
+      throw new UMPTokenLookupError('token-malformed', diagnostics)
+    }
+    const normalizedOutpoint = `${match[1].toLowerCase()}.${requestedOutputIndex}`
     let resolution: LookupResolution
     try {
       resolution = await this.resolver.queryDetailed(
@@ -1263,7 +1282,32 @@ export class OverlayUMPTokenInteractor implements UMPTokenInteractor {
       }
       return undefined
     }
-    return resolution.answer.outputs[0]
+    const diagnostics = this.diagnosticsFor(resolution)
+    const matchingOutputs: Array<{ beef: number[]; outputIndex: number }> = []
+    try {
+      for (const output of resolution.answer.outputs) {
+        if (!Number.isSafeInteger(output.outputIndex) || output.outputIndex < 0 || output.outputIndex > 0xffffffff) {
+          throw new Error('UMP lookup returned an invalid output index')
+        }
+        const transaction = Transaction.fromBEEF(output.beef)
+        if (
+          transaction.outputs[output.outputIndex] == null ||
+          `${transaction.id('hex')}.${output.outputIndex}` !== normalizedOutpoint
+        ) {
+          throw new Error('UMP lookup substituted the requested outpoint')
+        }
+        matchingOutputs.push(output)
+      }
+    } catch (error) {
+      this.lookupFailed('outpoint', 'token-malformed', diagnostics, startedAt, error)
+      throw new UMPTokenLookupError('token-malformed', diagnostics, { cause: error })
+    }
+    if (matchingOutputs.length === 0) {
+      this.lookupFailed('outpoint', 'token-malformed', diagnostics, startedAt)
+      throw new UMPTokenLookupError('token-malformed', diagnostics)
+    }
+    matchingOutputs.sort((left, right) => right.beef.length - left.beef.length)
+    return matchingOutputs[0]
   }
 }
 
@@ -1518,7 +1562,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     }
 
     this.authenticationFlow = 'unknown'
-    const hash = Hash.sha256(key)
+    const hash = sha256(key)
     const startedAt = Date.now()
     this.telemetry.capture({
       name: 'wallet-toolbox.authentication.account-lookup.started',
@@ -1586,7 +1630,7 @@ export class CWIStyleWalletManager implements WalletInterface {
   /** Handles the password step for an existing user — derives keys, sets up infrastructure. */
   private async unlockExisting(password: string): Promise<void> {
     if (this.currentUMPToken == null) throw new Error('Provide presentation or recovery key first.')
-    const derivedPasswordKey = await derivePasswordKey(this.currentUMPToken, Utils.toArray(password, 'utf8'))
+    const derivedPasswordKey = await derivePasswordKey(this.currentUMPToken, toArray(password, 'utf8'))
     let rootPrimaryKey: number[]
     let rootPrivilegedKey: number[] | undefined
 
@@ -1623,7 +1667,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     const passwordSalt = Random(32)
     const passwordKey = await derivePasswordKey(
       { passwordSalt, passwordKdf: this.kdfConfig },
-      Utils.toArray(password, 'utf8')
+      toArray(password, 'utf8')
     )
     const rootPrimaryKey = Random(32)
     const rootPrivilegedKey = Random(32)
@@ -1647,8 +1691,8 @@ export class CWIStyleWalletManager implements WalletInterface {
       presentationRecoveryPrimary: presentationRecovery.encrypt(rootPrimaryKey) as number[],
       passwordPrimaryPrivileged: primaryPassword.encrypt(rootPrivilegedKey) as number[],
       presentationRecoveryPrivileged: presentationRecovery.encrypt(rootPrivilegedKey) as number[],
-      presentationHash: Hash.sha256(this.presentationKey),
-      recoveryHash: Hash.sha256(recoveryKey),
+      presentationHash: sha256(this.presentationKey),
+      recoveryHash: sha256(recoveryKey),
       presentationKeyEncrypted: await wrapKey(this.presentationKey),
       passwordKeyEncrypted: await wrapKey(passwordKey),
       recoveryKeyEncrypted: await wrapKey(recoveryKey),
@@ -1705,7 +1749,7 @@ export class CWIStyleWalletManager implements WalletInterface {
 
     if (this.authenticationMode === 'recovery-key-and-password') {
       // Wait for password
-      const hash = Hash.sha256(recoveryKey)
+      const hash = sha256(recoveryKey)
       const token = await this.UMPTokenInteractor.findByRecoveryKeyHash(hash)
       if (token == null) throw new Error('No user found with this recovery key')
       this.authenticationFlow = 'existing-user'
@@ -1745,7 +1789,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     }
 
     const snapshotKey = Random(32)
-    const snapshotPreimageWriter = new Utils.Writer()
+    const snapshotPreimageWriter = new Writer()
 
     // Write root primary key
     snapshotPreimageWriter.write(this.rootPrimaryKey)
@@ -1763,7 +1807,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     const snapshotPayload = new SymmetricKey(snapshotKey).encrypt(snapshotPreimage) as number[]
 
     // Build final snapshot (Version 2)
-    const snapshotWriter = new Utils.Writer()
+    const snapshotWriter = new Writer()
     snapshotWriter.writeUInt8(2) // Version
     snapshotWriter.write(snapshotKey)
     snapshotWriter.write(this.activeProfileId) // Active profile ID
@@ -1800,7 +1844,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       ) {
         throw new Error('Snapshot is empty, oversized, or contains invalid bytes.')
       }
-      const reader = new Utils.Reader(snapshot)
+      const reader = new Reader(snapshot)
       const version = reader.readUInt8()
 
       let snapshotKey: number[]
@@ -1820,13 +1864,13 @@ export class CWIStyleWalletManager implements WalletInterface {
 
       // Decrypt payload
       const decryptedPayload = new SymmetricKey(snapshotKey).decrypt(encryptedPayload) as number[]
-      const payloadReader = new Utils.Reader(decryptedPayload)
+      const payloadReader = new Reader(decryptedPayload)
 
       // Read root primary key
       const rootPrimaryKey = payloadReader.read(32)
 
       // Read serialized UMP token
-      const tokenLen = payloadReader.readVarIntNum()
+      const tokenLen = payloadReader.readVarIntNumStrict(false)
       const tokenBytes = payloadReader.read(tokenLen)
       const token = this.deserializeUMPToken(tokenBytes)
 
@@ -2114,7 +2158,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       passwordSalt,
       passwordKdf: kdfToUse
     }
-    const newPasswordKey = await derivePasswordKey(tempTokenForKdf, Utils.toArray(newPassword, 'utf8'))
+    const newPasswordKey = await derivePasswordKey(tempTokenForKdf, toArray(newPassword, 'utf8'))
 
     // Decrypt existing factors needed for re-encryption, using the *root* privileged key manager
     const recoveryKey = await this.getFactor('recoveryKey')
@@ -2329,7 +2373,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     let profilesEncrypted: number[] | undefined
     if (profiles != null && profiles.length > 0) {
       const profilesJson = JSON.stringify(profiles)
-      const profilesBytes = Utils.toArray(profilesJson, 'utf8')
+      const profilesBytes = toArray(profilesJson, 'utf8')
       profilesEncrypted = new SymmetricKey(rootPrimaryKey).encrypt(profilesBytes) as number[]
     }
 
@@ -2345,8 +2389,8 @@ export class CWIStyleWalletManager implements WalletInterface {
       presentationRecoveryPrimary: presentationRecovery.encrypt(rootPrimaryKey) as number[],
       passwordPrimaryPrivileged: primaryPassword.encrypt(rootPrivilegedKey) as number[],
       presentationRecoveryPrivileged: presentationRecovery.encrypt(rootPrivilegedKey) as number[],
-      presentationHash: Hash.sha256(presentationKey),
-      recoveryHash: Hash.sha256(recoveryKey),
+      presentationHash: sha256(presentationKey),
+      recoveryHash: sha256(recoveryKey),
       presentationKeyEncrypted: (
         await tempRootPrivilegedKeyManager.encrypt({
           plaintext: presentationKey,
@@ -2432,7 +2476,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       throw new Error('Token must have outpoint for serialization')
     }
 
-    const writer = new Utils.Writer()
+    const writer = new Writer()
     const hasKdfMetadata = token.umpVersion === 3 && token.passwordKdf
     writer.writeUInt8(hasKdfMetadata ? 3 : 2) // Version 3 for KDF, 2 for legacy
 
@@ -2466,7 +2510,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     if (hasKdfMetadata) {
       writer.writeUInt8(1) // Flag indicating KDF metadata present
       writer.writeUInt8(token.umpVersion!) // On-chain UMP version
-      const algorithmBytes = Utils.toArray(token.passwordKdf!.algorithm, 'utf8')
+      const algorithmBytes = toArray(token.passwordKdf!.algorithm, 'utf8')
       writeArray(algorithmBytes)
 
       // Serialize KDF params as JSON
@@ -2482,7 +2526,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       if (token.passwordKdf!.hashLength !== undefined) {
         kdfParams.hashLength = token.passwordKdf!.hashLength
       }
-      const kdfParamsBytes = Utils.toArray(JSON.stringify(kdfParams), 'utf8')
+      const kdfParamsBytes = toArray(JSON.stringify(kdfParams), 'utf8')
       writeArray(kdfParamsBytes)
     } else if (writer.toArray()[0] === 3) {
       // Version 3 without KDF metadata (shouldn't happen, but handle gracefully)
@@ -2490,7 +2534,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     }
 
     // Write outpoint string
-    const outpointBytes = Utils.toArray(token.currentOutpoint, 'utf8')
+    const outpointBytes = toArray(token.currentOutpoint, 'utf8')
     writer.writeVarIntNum(outpointBytes.length)
     writer.write(outpointBytes)
 
@@ -2501,7 +2545,7 @@ export class CWIStyleWalletManager implements WalletInterface {
    * Deserializes a UMP token from binary format (Handles Version 1, 2, and 3).
    */
   private deserializeUMPToken(bin: number[]): UMPToken {
-    const reader = new Utils.Reader(bin)
+    const reader = new Reader(bin)
     const version = reader.readUInt8()
 
     if (version !== 1 && version !== 2 && version !== 3) {
@@ -2509,7 +2553,7 @@ export class CWIStyleWalletManager implements WalletInterface {
     }
 
     const readArray = (): number[] => {
-      const length = reader.readVarIntNum()
+      const length = reader.readVarIntNumStrict(false)
       if (length <= 0 || length > MAX_STATE_SNAPSHOT_BYTES) {
         throw new Error('UMP token field exceeds allowed bounds.')
       }
@@ -2546,10 +2590,10 @@ export class CWIStyleWalletManager implements WalletInterface {
       if (kdfFlag === 1) {
         umpVersion = reader.readUInt8() // On-chain UMP version
         const algorithmBytes = readArray()
-        const algorithm = Utils.toUTF8(algorithmBytes) as 'pbkdf2-sha512' | 'argon2id'
+        const algorithm = toUTF8(algorithmBytes) as 'pbkdf2-sha512' | 'argon2id'
 
         const kdfParamsBytes = readArray()
-        const kdfParamsJson = Utils.toUTF8(kdfParamsBytes)
+        const kdfParamsJson = toUTF8(kdfParamsBytes)
 
         const kdfParams = JSON.parse(kdfParamsJson) as Record<string, unknown>
         passwordKdf = {
@@ -2566,9 +2610,9 @@ export class CWIStyleWalletManager implements WalletInterface {
     }
 
     // Read outpoint string
-    const outpointLen = reader.readVarIntNum()
+    const outpointLen = reader.readVarIntNumStrict(false)
     const outpointBytes = reader.read(outpointLen)
-    const currentOutpoint = Utils.toUTF8(outpointBytes)
+    const currentOutpoint = toUTF8(outpointBytes)
     if (currentOutpoint.length > 128 || !/^[^\s.:]+[.:]\d+$/.test(currentOutpoint)) {
       throw new Error('Serialized UMP token contains an invalid outpoint.')
     }
@@ -2624,10 +2668,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       // 2. Otherwise, derive from password
       const password = await this.passwordRetriever(reason, async (passwordCandidate: string) => {
         try {
-          const derivedPasswordKey = await derivePasswordKey(
-            this.currentUMPToken!,
-            Utils.toArray(passwordCandidate, 'utf8')
-          )
+          const derivedPasswordKey = await derivePasswordKey(this.currentUMPToken!, toArray(passwordCandidate, 'utf8'))
           const privilegedDecryptor = this.XOR(this.rootPrimaryKey!, derivedPasswordKey)
           const decryptedPrivileged = new SymmetricKey(privilegedDecryptor).decrypt(
             this.currentUMPToken!.passwordPrimaryPrivileged
@@ -2642,7 +2683,7 @@ export class CWIStyleWalletManager implements WalletInterface {
       })
 
       // Decrypt the root privileged key using the confirmed password (with token-driven KDF)
-      const derivedPasswordKey = await derivePasswordKey(this.currentUMPToken!, Utils.toArray(password, 'utf8'))
+      const derivedPasswordKey = await derivePasswordKey(this.currentUMPToken!, toArray(password, 'utf8'))
       const privilegedDecryptor = this.XOR(this.rootPrimaryKey!, derivedPasswordKey)
       const rootPrivilegedBytes = new SymmetricKey(privilegedDecryptor).decrypt(
         this.currentUMPToken!.passwordPrimaryPrivileged
@@ -2658,7 +2699,7 @@ export class CWIStyleWalletManager implements WalletInterface {
         const decryptedProfileBytes = new SymmetricKey(rootKey).decrypt(
           this.currentUMPToken.profilesEncrypted
         ) as number[]
-        const profilesJson = Utils.toUTF8(decryptedProfileBytes)
+        const profilesJson = toUTF8(decryptedProfileBytes)
         const profiles = JSON.parse(profilesJson) as unknown
         if (!Array.isArray(profiles) || profiles.length > 1000 || !profiles.every(isValidProfile)) {
           throw new Error('Decrypted profile data is invalid or exceeds supported bounds.')

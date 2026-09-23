@@ -1,20 +1,27 @@
 import { WalletRelayClient, WalletRelayError } from '../src/client/WalletRelayClient.js'
 import type { SessionInfo } from '../src/types.js'
+import { PrivateKey, ProtoWallet } from '@bsv/sdk'
 
+const SESSION_ID = 'A'.repeat(43)
+const OLD_SESSION_ID = 'B'.repeat(43)
+const GONE_SESSION_ID = 'C'.repeat(43)
+const EXPIRED_SESSION_ID = 'D'.repeat(43)
+const DESKTOP_TOKEN = 'E'.repeat(32)
+const RPC_ID = '00000000-0000-4000-8000-000000000001'
+const PUBLIC_KEY = new PrivateKey(1).toPublicKey().toString()
 const pendingSession: SessionInfo = {
-  sessionId: 'session-1',
+  sessionId: SESSION_ID,
   status: 'pending',
-  qrDataUrl: 'data:image/png;base64,test',
-  pairingUri: 'wallet://pair?topic=session-1',
-  desktopToken: 'desktop-secret'
+  qrDataUrl: 'data:image/png;base64,iVBORw0KGgo=',
+  pairingUri: `wallet://pair?topic=${SESSION_ID}`,
+  desktopToken: DESKTOP_TOKEN
 }
 
 function response(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
+  return new Response(JSON.stringify(body), {
     status,
-    json: jest.fn().mockResolvedValue(body)
-  } as unknown as Response
+    headers: { 'content-type': 'application/json' }
+  })
 }
 
 function storage(): Storage {
@@ -73,6 +80,11 @@ describe('WalletRelayClient session lifecycle', () => {
     )
   })
 
+  it('validates the request-log retention bound', () => {
+    expect(() => new WalletRelayClient({ maxLogEntries: -1 })).toThrow(/maxLogEntries/)
+    expect(() => new WalletRelayClient({ maxLogEntries: 10_001 })).toThrow(/maxLogEntries/)
+  })
+
   it.each([
     ['http://localhost:3001', 'http://localhost:3001/api/session'],
     ['http://wallet.localhost:3001/relay/', 'http://wallet.localhost:3001/relay/api/session'],
@@ -81,7 +93,10 @@ describe('WalletRelayClient session lifecycle', () => {
     fetchMock.mockResolvedValueOnce(response(pendingSession))
     const client = new WalletRelayClient({ apiUrl })
     await client.createSession()
-    expect(fetchMock).toHaveBeenCalledWith(expected)
+    expect(fetchMock).toHaveBeenCalledWith(
+      expected,
+      expect.objectContaining({ redirect: 'error', signal: expect.anything() })
+    )
     client.destroy()
   })
 
@@ -95,15 +110,18 @@ describe('WalletRelayClient session lifecycle', () => {
 
     await expect(client.createSession()).resolves.toEqual(pendingSession)
 
-    expect(fetchMock).toHaveBeenCalledWith('https://relay.example/api/session')
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example/api/session',
+      expect.objectContaining({ redirect: 'error', signal: expect.anything() })
+    )
     expect(client.session).toEqual(pendingSession)
     expect(client.error).toBeNull()
     expect(onSessionChange).toHaveBeenCalledWith(pendingSession)
     expect(
       JSON.parse(sessionStorage.getItem('wallet-relay-session:https://relay.example/api')!)
     ).toMatchObject({
-      sessionId: 'session-1',
-      desktopToken: 'desktop-secret',
+      sessionId: SESSION_ID,
+      desktopToken: DESKTOP_TOKEN,
       status: 'pending'
     })
     client.destroy()
@@ -124,8 +142,8 @@ describe('WalletRelayClient session lifecycle', () => {
     sessionStorage.setItem(
       'resume-key',
       JSON.stringify({
-        sessionId: 'session-1',
-        desktopToken: 'desktop-secret',
+        sessionId: SESSION_ID,
+        desktopToken: DESKTOP_TOKEN,
         qrDataUrl: pendingSession.qrDataUrl,
         pairingUri: pendingSession.pairingUri,
         status: 'pending',
@@ -133,17 +151,20 @@ describe('WalletRelayClient session lifecycle', () => {
       })
     )
     fetchMock.mockResolvedValueOnce(
-      response({ sessionId: 'session-1', status: 'connected' } satisfies SessionInfo)
+      response({ sessionId: SESSION_ID, status: 'connected' } satisfies SessionInfo)
     )
     const client = new WalletRelayClient({ sessionStorageKey: 'resume-key' })
 
     await expect(client.resumeSession()).resolves.toEqual({
-      sessionId: 'session-1',
+      sessionId: SESSION_ID,
       status: 'connected',
       qrDataUrl: pendingSession.qrDataUrl,
       pairingUri: pendingSession.pairingUri
     })
-    expect(fetchMock).toHaveBeenCalledWith('/api/session/session-1')
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/session/${SESSION_ID}`,
+      expect.objectContaining({ redirect: 'error', signal: expect.anything() })
+    )
     client.destroy()
   })
 
@@ -157,8 +178,8 @@ describe('WalletRelayClient session lifecycle', () => {
     sessionStorage.setItem(
       'resume-key',
       JSON.stringify({
-        sessionId: 'old',
-        desktopToken: 'token',
+        sessionId: OLD_SESSION_ID,
+        desktopToken: DESKTOP_TOKEN,
         status: 'pending',
         savedAt: Date.now() - 11
       })
@@ -169,8 +190,8 @@ describe('WalletRelayClient session lifecycle', () => {
     sessionStorage.setItem(
       'resume-key',
       JSON.stringify({
-        sessionId: 'gone',
-        desktopToken: 'token',
+        sessionId: GONE_SESSION_ID,
+        desktopToken: DESKTOP_TOKEN,
         status: 'pending',
         savedAt: Date.now()
       })
@@ -181,14 +202,14 @@ describe('WalletRelayClient session lifecycle', () => {
     sessionStorage.setItem(
       'resume-key',
       JSON.stringify({
-        sessionId: 'expired',
-        desktopToken: 'token',
+        sessionId: EXPIRED_SESSION_ID,
+        desktopToken: DESKTOP_TOKEN,
         status: 'pending',
         savedAt: Date.now()
       })
     )
     fetchMock.mockResolvedValueOnce(
-      response({ sessionId: 'expired', status: 'expired' } satisfies SessionInfo)
+      response({ sessionId: EXPIRED_SESSION_ID, status: 'expired' } satisfies SessionInfo)
     )
     await expect(client.resumeSession()).resolves.toBeNull()
   })
@@ -198,16 +219,16 @@ describe('WalletRelayClient session lifecycle', () => {
     fetchMock
       .mockResolvedValueOnce(response(pendingSession))
       .mockResolvedValueOnce(
-        response({ sessionId: 'session-1', status: 'connected' } satisfies SessionInfo)
+        response({ sessionId: SESSION_ID, status: 'connected' } satisfies SessionInfo)
       )
       .mockResolvedValueOnce(
-        response({ sessionId: 'session-1', status: 'disconnected' } satisfies SessionInfo)
+        response({ sessionId: SESSION_ID, status: 'disconnected' } satisfies SessionInfo)
       )
       .mockResolvedValueOnce(
-        response({ sessionId: 'session-1', status: 'expired' } satisfies SessionInfo)
+        response({ sessionId: SESSION_ID, status: 'expired' } satisfies SessionInfo)
       )
       .mockResolvedValueOnce(
-        response({ sessionId: 'session-1', status: 'expired' } satisfies SessionInfo)
+        response({ sessionId: SESSION_ID, status: 'expired' } satisfies SessionInfo)
       )
     const client = new WalletRelayClient({
       pollInterval: 100,
@@ -233,6 +254,59 @@ describe('WalletRelayClient session lifecycle', () => {
     expect(sessionStorage).toHaveLength(0)
   })
 
+  it('does not overlap slow polls or let a stale poll revive a disconnected session', async () => {
+    let resolvePoll!: (value: Response) => void
+    const slowPoll = new Promise<Response>(resolve => {
+      resolvePoll = resolve
+    })
+    fetchMock
+      .mockResolvedValueOnce(response(pendingSession))
+      .mockReturnValueOnce(slowPoll)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    const client = new WalletRelayClient({ pollInterval: 10 })
+    await client.createSession()
+    await jest.advanceTimersByTimeAsync(10)
+    await jest.advanceTimersByTimeAsync(100)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    await client.disconnect()
+    resolvePoll(response({ sessionId: SESSION_ID, status: 'connected' }))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(client.session).toBeNull()
+    expect(sessionStorage).toHaveLength(0)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('retires a session that arrives after creation was cancelled', async () => {
+    let resolveCreation!: (value: Response) => void
+    const pendingCreation = new Promise<Response>(resolve => {
+      resolveCreation = resolve
+    })
+    fetchMock
+      .mockReturnValueOnce(pendingCreation)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    const client = new WalletRelayClient()
+    const creation = client.createSession()
+    await client.disconnect()
+    resolveCreation(response(pendingSession))
+
+    await expect(creation).rejects.toMatchObject({ code: 'REQUEST_CANCELLED' })
+    await Promise.resolve()
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `/api/session/${SESSION_ID}`,
+      expect.objectContaining({
+        method: 'DELETE',
+        headers: { 'X-Desktop-Token': DESKTOP_TOKEN }
+      })
+    )
+    expect(client.session).toBeNull()
+    expect(sessionStorage).toHaveLength(0)
+  })
+
   it('disconnects server-side when authenticated and always tears down locally', async () => {
     fetchMock
       .mockResolvedValueOnce(response(pendingSession))
@@ -241,10 +315,17 @@ describe('WalletRelayClient session lifecycle', () => {
     await client.createSession()
 
     await expect(client.disconnect()).resolves.toBeUndefined()
-    expect(fetchMock).toHaveBeenLastCalledWith('/api/session/session-1', {
-      method: 'DELETE',
-      headers: { 'X-Desktop-Token': 'desktop-secret' }
-    })
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `/api/session/${SESSION_ID}`,
+      expect.objectContaining({
+        method: 'DELETE',
+        headers: { 'X-Desktop-Token': DESKTOP_TOKEN },
+        redirect: 'error',
+        signal: expect.anything()
+      })
+    )
+    expect(client.session).toBeNull()
+    expect(sessionStorage).toHaveLength(0)
   })
 })
 
@@ -265,35 +346,56 @@ describe('WalletRelayClient requests', () => {
     )
   })
 
+  it('rejects malformed wallet arguments before logging or crossing the network', async () => {
+    const client = await connectedClient()
+    const callsBeforeRequest = fetchMock.mock.calls.length
+
+    await expect(
+      client.sendRequest('getPublicKey', { identityKey: 'true' } as never)
+    ).rejects.toThrow(/identityKey/)
+    expect(fetchMock).toHaveBeenCalledTimes(callsBeforeRequest)
+    expect(client.log).toHaveLength(0)
+    client.destroy()
+  })
+
   it('sends authenticated requests, resolves the log, and exposes a cached wallet proxy', async () => {
     const onLogChange = jest.fn()
     fetchMock.mockResolvedValueOnce(response({ ...pendingSession, status: 'connected' }))
     const client = new WalletRelayClient({ onLogChange })
     await client.createSession()
-    fetchMock.mockResolvedValueOnce(response({ result: { publicKey: '02abc' } }))
+    fetchMock.mockResolvedValueOnce(
+      response({ id: RPC_ID, seq: 1, result: { publicKey: PUBLIC_KEY } })
+    )
 
     const wallet = client.wallet
     await expect(wallet.getPublicKey({ identityKey: true })).resolves.toEqual({
-      publicKey: '02abc'
+      publicKey: PUBLIC_KEY
     })
 
     expect(client.wallet).toBe(wallet)
-    expect(fetchMock).toHaveBeenLastCalledWith('/api/request/session-1', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Desktop-Token': 'desktop-secret'
-      },
-      body: JSON.stringify({ method: 'getPublicKey', params: { identityKey: true } })
-    })
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `/api/request/${SESSION_ID}`,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Desktop-Token': DESKTOP_TOKEN
+        },
+        body: JSON.stringify({ method: 'getPublicKey', params: { identityKey: true } }),
+        redirect: 'error',
+        signal: expect.anything()
+      })
+    )
     expect(client.log).toHaveLength(1)
     expect(client.log[0]).toMatchObject({
       pending: false,
-      response: { result: { publicKey: '02abc' } }
+      response: { result: { publicKey: PUBLIC_KEY } }
     })
     expect(onLogChange).toHaveBeenCalledTimes(2)
 
-    fetchMock.mockResolvedValueOnce(response({ error: { code: 42, message: 'wallet rejected' } }))
+    fetchMock.mockResolvedValueOnce(
+      response({ id: RPC_ID, seq: 2, error: { code: 42, message: 'wallet rejected' } })
+    )
     await expect(wallet.getPublicKey({ identityKey: true })).rejects.toMatchObject({
       message: 'wallet rejected',
       code: 42
@@ -301,27 +403,55 @@ describe('WalletRelayClient requests', () => {
     client.destroy()
   })
 
+  it('bounds or disables retention of security-sensitive request results', async () => {
+    fetchMock.mockResolvedValueOnce(response({ ...pendingSession, status: 'connected' }))
+    const onLogChange = jest.fn()
+    const client = new WalletRelayClient({ maxLogEntries: 1, onLogChange })
+    await client.createSession()
+    fetchMock
+      .mockResolvedValueOnce(response({ id: RPC_ID, seq: 1, result: { publicKey: PUBLIC_KEY } }))
+      .mockResolvedValueOnce(response({ id: RPC_ID, seq: 2, result: { publicKey: PUBLIC_KEY } }))
+
+    await client.sendRequest('getPublicKey', { identityKey: true, keyID: 'first' })
+    await client.sendRequest('getPublicKey', { identityKey: true, keyID: 'second' })
+    expect(client.log).toHaveLength(1)
+    expect(onLogChange.mock.calls.every(([log]) => log.length <= 1)).toBe(true)
+    client.destroy()
+
+    const disabled = new WalletRelayClient({ maxLogEntries: 0 })
+    fetchMock.mockResolvedValueOnce(response({ ...pendingSession, status: 'connected' }))
+    await disabled.createSession()
+    fetchMock.mockResolvedValueOnce(
+      response({ id: RPC_ID, seq: 3, result: { publicKey: PUBLIC_KEY } })
+    )
+    await disabled.sendRequest('getPublicKey', { identityKey: true })
+    expect(disabled.log).toEqual([])
+    disabled.destroy()
+  })
+
   it('keeps request bytes portable and repairs responses from historical relay JSON', async () => {
     const client = await connectedClient()
-    const mangledTx = JSON.parse(JSON.stringify(new Uint8Array([4, 5, 6])))
+    const mangledPlaintext = JSON.parse(JSON.stringify(new Uint8Array([4, 5, 6])))
     fetchMock.mockResolvedValueOnce(
       response({
-        result: { signableTransaction: { tx: mangledTx, reference: 'cmVm' } }
+        id: RPC_ID,
+        seq: 1,
+        result: { plaintext: mangledPlaintext }
       })
     )
 
-    const result = await client.sendRequest('createAction', {
-      description: 'test action',
-      inputBEEF: new Uint8Array([1, 2, 3])
+    const result = await client.sendRequest('decrypt', {
+      protocolID: [0, 'test encryption'],
+      keyID: 'portable-bytes',
+      counterparty: 'self',
+      ciphertext: new Uint8Array([1, 2, 3])
     })
 
     const lastCall = fetchMock.mock.calls[fetchMock.mock.calls.length - 1]
     expect(JSON.parse(String(lastCall?.[1]?.body))).toMatchObject({
-      params: { inputBEEF: [1, 2, 3] }
+      params: { ciphertext: [1, 2, 3] }
     })
-    expect(result.result).toEqual({
-      signableTransaction: { tx: [4, 5, 6], reference: 'cmVm' }
-    })
+    expect(result.result).toEqual({ plaintext: [4, 5, 6] })
     client.destroy()
   })
 
@@ -335,7 +465,7 @@ describe('WalletRelayClient requests', () => {
     const client = await connectedClient()
     fetchMock.mockResolvedValueOnce(response({ error: message }, status))
 
-    await expect(client.sendRequest('getPublicKey')).rejects.toMatchObject({
+    await expect(client.sendRequest('getPublicKey', { identityKey: true })).rejects.toMatchObject({
       message,
       code
     })
@@ -350,10 +480,44 @@ describe('WalletRelayClient requests', () => {
     const client = await connectedClient()
     fetchMock.mockRejectedValueOnce('offline')
 
-    await expect(client.sendRequest('getPublicKey')).rejects.toMatchObject({
+    await expect(client.sendRequest('getPublicKey', { identityKey: true })).rejects.toMatchObject({
       message: 'Request failed',
       code: 'NETWORK_ERROR'
     })
+    client.destroy()
+  })
+
+  it('rejects authoritative-looking false verification verdicts from a hostile relay', async () => {
+    const client = await connectedClient()
+    const wallet = new ProtoWallet(PrivateKey.fromRandom())
+    const args = {
+      data: [1, 2, 3],
+      protocolID: [0, 'test signing'] as [0, string],
+      keyID: 'test',
+      counterparty: 'anyone' as const,
+      ...(await wallet.createSignature({
+        data: [1, 2, 3],
+        protocolID: [0, 'test signing'],
+        keyID: 'test',
+        counterparty: 'anyone'
+      }))
+    }
+    fetchMock.mockResolvedValueOnce(response({ id: RPC_ID, seq: 1, result: { valid: false } }))
+
+    await expect(client.sendRequest('verifySignature', args)).rejects.toMatchObject({
+      code: 'NETWORK_ERROR'
+    })
+    expect(client.log[0]).toMatchObject({ pending: false })
+    client.destroy()
+  })
+
+  it('rejects malformed wallet results before exposing them through the wallet proxy', async () => {
+    const client = await connectedClient()
+    fetchMock.mockResolvedValueOnce(
+      response({ id: RPC_ID, seq: 1, result: { publicKey: '02abc' } })
+    )
+
+    await expect(client.wallet.getPublicKey({ identityKey: true })).rejects.toThrow(/publicKey/)
     client.destroy()
   })
 })

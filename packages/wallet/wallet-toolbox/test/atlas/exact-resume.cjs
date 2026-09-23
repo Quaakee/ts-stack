@@ -15,7 +15,7 @@ async function main() {
   const services = new MockServices(chainDb)
   await services.initialize()
   let active = new StorageKnex({
-    chain: 'test',
+    chain: 'mock',
     knex: walletDb,
     commissionSatoshis: 0,
     commissionPubKeyHex: undefined,
@@ -31,7 +31,7 @@ async function main() {
   await manager.makeAvailable()
   const { user } = await active.findOrInsertUser(identityKey)
   let monitor = new Monitor({
-    chain: 'test',
+    chain: 'mock',
     storage: manager,
     services,
     chaintracks: services.tracker,
@@ -45,7 +45,7 @@ async function main() {
   })
   monitor.addDefaultTasks()
   let wallet = new Wallet({
-    chain: 'test',
+    chain: 'mock',
     keyDeriver: new CachedKeyDeriver(root),
     storage: manager,
     services,
@@ -252,7 +252,7 @@ async function main() {
       await active.destroy()
       walletDb = knex({ client: 'better-sqlite3', connection: { filename }, useNullAsDefault: true })
       active = new StorageKnex({
-        chain: 'test',
+        chain: 'mock',
         knex: walletDb,
         commissionSatoshis: 0,
         feeModel: { model: 'sat/kb', value: 1 }
@@ -262,15 +262,21 @@ async function main() {
       manager = new WalletStorageManager(identityKey, active)
       await manager.makeAvailable()
       monitor = new Monitor({
-        chain: 'test',
+        chain: 'mock',
         storage: manager,
         services,
         chaintracks: services.tracker,
+        msecsWaitPerMerkleProofServiceReq: 0,
+        taskRunWaitMsecs: 0,
+        abandonedMsecs: 300000,
+        unprovenAttemptsLimitTest: 100,
+        unprovenAttemptsLimitMain: 144,
+        maxRebroadcastAttempts: 0,
         startupTaskMode: 'none'
       })
       monitor.addDefaultTasks()
       wallet = new Wallet({
-        chain: 'test',
+        chain: 'mock',
         keyDeriver: new CachedKeyDeriver(root),
         storage: manager,
         services,

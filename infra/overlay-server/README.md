@@ -10,6 +10,7 @@ Resource profiles and the custom-lookup safety contract are documented in
 ---
 
 ## Table of Contents
+
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -20,8 +21,9 @@ Resource profiles and the custom-lookup safety contract are documented in
 - [License](#license)
 
 ## Prerequisites
-1. **Node.js >= 20** (the container uses Node 22)  
-2. **npm >= 10** (comes with Node).  
+
+1. **Node.js >= 20** (the container uses Node 22)
+2. **npm >= 10** (comes with Node).
 3. **Docker & Docker Compose** – only required if you want to run the full stack with MySQL and MongoDB from containers.
 
 ## Quick Start
@@ -43,28 +45,33 @@ The service will start on `http://localhost:8080` by default. For production bui
 
 All critical configuration is supplied through environment variables. Create a `.env` file in the project root (or use secrets in your orchestration platform) and define:
 
-| Variable | Example | Description |
-| -------- | ------- | ----------- |
-| `NODE_NAME` | `my-overlay` | One-word, lowercase overlay service node identifier. |
-| `SERVER_PRIVATE_KEY` | required | Dedicated 32-byte hex root private key for the server wallet. Generate and inject it outside source control. |
-| `HOSTING_URL` | `https://my.overlay.network` | Public URL where your node is reachable. |
-| `ADMIN_TOKEN` | `at-least-32-random-characters` | Random token of at least 32 characters required to access the admin API. |
-| `WALLET_STORAGE_URL` | `https://store-us-1.bsvb.tech` | Wallet storage endpoint where advertisement tokens will be kept, and from where funds will be drawn. |
-| `NETWORK` | `main`, `test`, or `ttn` | BSV Blockchain network your node operates on. TTN uses the public TTN Arcade endpoint by default and Arcade-backed ChainTracks. |
-| `ARC_API_KEY` | — | Your ARC key for transaction broadcasting. |
-| `MONGO_URL` | `mongodb://root:example@localhost:27017` | MongoDB connection string. |
-| `KNEX_URL` | `mysql://user:pass@localhost:3306/appdb` | MySQL connection string used by Knex. |
-| `GASP_ENABLED` | `true / false` | Enable Graph Aware Sync Protocol to sync with other overlays on the same topics. |
+| Variable                       | Example                                  | Description                                                                                                                     |
+| ------------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_NAME`                    | `my-overlay`                             | One-word, lowercase overlay service node identifier.                                                                            |
+| `SERVER_PRIVATE_KEY`           | required                                 | Dedicated 32-byte hex root private key for the server wallet. Generate and inject it outside source control.                    |
+| `HOSTING_URL`                  | `https://my.overlay.network`             | Public URL where your node is reachable.                                                                                        |
+| `ADMIN_TOKEN`                  | `at-least-32-random-characters`          | Random token of at least 32 characters required to access the admin API.                                                        |
+| `WALLET_STORAGE_URL`           | `https://store-us-1.bsvb.tech`           | Wallet storage endpoint where advertisement tokens will be kept, and from where funds will be drawn.                            |
+| `NETWORK`                      | `main`, `test`, or `ttn`                 | BSV Blockchain network your node operates on. TTN uses the public TTN Arcade endpoint by default and Arcade-backed ChainTracks. |
+| `ARC_API_KEY`                  | —                                        | Your ARC key for transaction broadcasting.                                                                                      |
+| `ARC_CALLBACK_TOKEN`           | `independent-32-character-random-secret` | Separate random secret of at least 32 characters required to authenticate `/arc-ingest` callbacks.                              |
+| `MONGO_URL`                    | `mongodb://root:example@localhost:27017` | MongoDB connection string.                                                                                                      |
+| `KNEX_URL`                     | `mysql://user:pass@localhost:3306/appdb` | MySQL connection string used by Knex.                                                                                           |
+| `GASP_ENABLED`                 | `true / false`                           | Enable Graph Aware Sync Protocol to sync with other overlays on the same topics.                                                |
+| `MANDALA_ENABLED`              | `false`                                  | Explicitly enable the regulated Mandala topic; disabled by default.                                                             |
+| `MANDALA_VERIFIER_PRIVATE_KEY` | required when enabled                    | Dedicated 32-byte hex linkage-verifier root, distinct from the node and Mandala admin roots.                                    |
+| `MANDALA_ADMIN_PRIVATE_KEY`    | required when enabled                    | Dedicated 32-byte hex Mandala administrative root, distinct from the node and verifier roots.                                   |
+| `MANDALA_STATIC_DENYLIST_JSON` | `[]`                                     | Explicit JSON array of canonical compressed identity keys for reference/local screening.                                        |
 
 A complete example can be found in `docker-compose.yml`.
 
 ## Available NPM Scripts
 
-| Script | Purpose |
-| ------ | -------- |
-| `npm run dev` | Starts the TypeScript source directly using [tsx](https://npm.im/tsx) with hot-reload – perfect for development. |
-| `npm run build` | Compiles TypeScript into the `dist/` folder. |
-| `npm start` | Runs the compiled JavaScript (`dist/index.js`). |
+| Script          | Purpose                                                                                                          |
+| --------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `npm run dev`   | Starts the TypeScript source directly using [tsx](https://npm.im/tsx) with hot-reload – perfect for development. |
+| `npm run build` | Compiles TypeScript into the `dist/` folder.                                                                     |
+| `npm start`     | Runs the compiled JavaScript (`dist/index.js`).                                                                  |
 
 ## Docker Compose
 
@@ -95,7 +102,29 @@ Press `Ctrl + C` to stop or add the `-d` flag to run in detached mode.
 ```
 
 ## Contributing
+
 Pull requests and issues are welcome! Please open an issue to discuss any major changes.
 
 ## License
+
 [Open BSV License Version 6](./LICENSE.txt)
+
+## Mandala state adapter compatibility
+
+The bundled server does not register `tm_mandala` or `ls_mandala` unless
+`MANDALA_ENABLED=true`. Enabling it requires independent node, linkage-verifier,
+and administrative private keys plus an explicit static denylist snapshot. A
+missing, malformed, duplicated, or oversized screening list fails startup.
+The static provider is a reference/local adapter only: a production regulated
+token service must replace it in application code with an authoritative,
+continuously maintained `ScreeningProvider`, custody the verifier and admin
+roots independently in HSM/KMS-backed systems, and define rotation and recovery.
+
+The Mandala manager and lookup share one lazily initialized storage manager.
+The admission adapter verifies admin outpoints against that store's per-asset
+history, including the asset, transaction ID and output index. This wiring uses
+the existing history API so it can compile with the currently locked package
+and consume Overlay Topics 1.8.0's stricter admission contract on upgrade.
+Before a deployed upgrade, follow the [Mandala migration guide](../../packages/overlays/topics/README.md#mandala-admission-and-the-180-upgrade)
+and audit historical admin and owner records. Source publication does not
+upgrade a running overlay or its locked dependencies automatically.

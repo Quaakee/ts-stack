@@ -1,6 +1,6 @@
 {
   "name": "@bsv/lch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BRC-170 Licensed Content Header reference implementation",
   "author": "BSV Association",
   "license": "SEE LICENSE IN LICENSE.txt",

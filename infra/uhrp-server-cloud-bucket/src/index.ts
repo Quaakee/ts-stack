@@ -153,33 +153,19 @@ preAuthRoutes.filter(route => !(route as any).unsecured).forEach((route) => {
       calculateRequestPrice: async (req) => {
 
         if (/^\/chirp\/v1\/uploads\/[^/]+\/commit$/.test(req.path)) {
-          try {
-            return await getChirpCommitPrice(req as any)
-          } catch {
-            return 0
-          }
+          return await getChirpCommitPrice(req as any)
         }
 
-        if (req.url === '/upload') {
+        if (req.path === '/upload') {
           const { fileSize, retentionPeriod } = (req.body as any) || {}
           if (!fileSize || !retentionPeriod) return 0
-          try {
-            const satoshis = await getPriceForFile({ fileSize: +fileSize, retentionPeriod: +retentionPeriod })
-            return satoshis
-          } catch {
-            return 0
-          }
+          return await getPriceForFile({ fileSize: +fileSize, retentionPeriod: +retentionPeriod })
         }
-        if (req.url === '/renew') {
+        if (req.path === '/renew') {
           const { uhrpUrl, additionalMinutes } = (req.body as any) || {}
           if (!uhrpUrl || !additionalMinutes) return 0
-          try {
-            const { size } = await getMetadata(uhrpUrl, (req as any).auth.identityKey)
-            const satoshis = await getPriceForFile({ fileSize: +size, retentionPeriod: +additionalMinutes })
-            return satoshis
-          } catch {
-            return 0
-          }
+          const { size } = await getMetadata(uhrpUrl, (req as any).auth.identityKey)
+          return await getPriceForFile({ fileSize: +size, retentionPeriod: +additionalMinutes })
         }
 
         return 0

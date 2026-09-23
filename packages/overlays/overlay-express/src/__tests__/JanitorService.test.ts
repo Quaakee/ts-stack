@@ -1,9 +1,33 @@
 import { describe, it, expect, jest, beforeEach } from '@jest/globals'
-import { JanitorService } from '../JanitorService.js'
+import {
+  JanitorService as ProductionJanitorService,
+  type JanitorConfig
+} from '../JanitorService.js'
 import { Db } from 'mongodb'
 
 // Mock fetch globally
 global.fetch = jest.fn() as any
+
+const testFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const value: any = await global.fetch(input, init)
+  if (value instanceof Response) return value
+  const status = typeof value?.status === 'number' ? value.status : value?.ok === true ? 200 : 500
+  const headers = new Headers()
+  const declared = value?.headers?.get?.('content-length')
+  if (declared != null) headers.set('Content-Length', String(declared))
+  let body: string | undefined
+  if (value?.ok === true && (declared == null || Number(declared) <= 64 * 1024)) {
+    body = JSON.stringify(await value.json())
+    headers.set('Content-Type', 'application/json')
+  }
+  return new Response(body, { status, headers })
+}
+
+class JanitorService extends ProductionJanitorService {
+  constructor(config: JanitorConfig) {
+    super({ fetchImpl: testFetch as typeof fetch, ...config })
+  }
+}
 
 describe('JanitorService', () => {
   let mockDb: Db
@@ -82,6 +106,34 @@ describe('JanitorService', () => {
           })
       ).toThrow(expectedField)
     })
+
+    it('rejects type-confused mutation and network-authority toggles', () => {
+      expect(
+        () =>
+          new ProductionJanitorService({
+            mongoDb: mockDb,
+            autoBanOnRemoval: 'false' as unknown as boolean
+          })
+      ).toThrow('autoBanOnRemoval')
+      expect(
+        () =>
+          new ProductionJanitorService({
+            mongoDb: mockDb,
+            allowPrivateHosts: 'false' as unknown as boolean
+          })
+      ).toThrow('allowPrivateHosts')
+    })
+
+    it('rejects accessor-backed constructor configuration without invoking it', () => {
+      const getter = jest.fn(() => true)
+      const config: Record<string, unknown> = { mongoDb: mockDb }
+      Object.defineProperty(config, 'allowPrivateHosts', { get: getter, enumerable: true })
+
+      expect(() => new ProductionJanitorService(config as unknown as JanitorConfig)).toThrow(
+        'own data property'
+      )
+      expect(getter).not.toHaveBeenCalled()
+    })
   })
 
   describe('run', () => {
@@ -109,7 +161,7 @@ describe('JanitorService', () => {
         logger: mockLogger
       })
 
-      await janitor.run()
+      await expect(janitor.run()).rejects.toThrow('Database error')
       expect(mockLogger.error).toHaveBeenCalled()
     })
 
@@ -997,6 +1049,42 @@ describe('JanitorService', () => {
         'https://dead-host.com',
         expect.stringContaining('Auto-banned')
       )
+      expect(mockBanService.banOutpoint.mock.invocationCallOrder[0]).toBeLessThan(
+        mockCollection.deleteOne.mock.invocationCallOrder[0]
+      )
+      expect(mockBanService.banDomain.mock.invocationCallOrder[0]).toBeLessThan(
+        mockCollection.deleteOne.mock.invocationCallOrder[0]
+      )
+    })
+
+    it('does not delete an output if its persistent ban cannot be written', async () => {
+      const mockBanService = {
+        banDomain: jest.fn<any>().mockResolvedValue(undefined),
+        banOutpoint: jest.fn<any>().mockRejectedValue(new Error('ban storage unavailable'))
+      }
+      mockCollection.find.mockReturnValue({
+        toArray: jest.fn<any>().mockResolvedValue([
+          {
+            _id: '123',
+            txid: 'abc123',
+            outputIndex: 0,
+            domain: 'https://dead-host.com',
+            down: 2
+          }
+        ])
+      })
+      ;(global.fetch as jest.Mock<any>).mockResolvedValue({ ok: false })
+      const janitor = new JanitorService({
+        mongoDb: mockDb,
+        logger: mockLogger,
+        hostDownRevokeScore: 3,
+        banService: mockBanService as any
+      })
+
+      await janitor.run()
+
+      expect(mockBanService.banOutpoint).toHaveBeenCalled()
+      expect(mockCollection.deleteOne).not.toHaveBeenCalled()
     })
 
     it('should not auto-ban when autoBanOnRemoval is false', async () => {
@@ -1103,7 +1191,7 @@ describe('JanitorService', () => {
       expect(report.summary.banned).toBe(0)
     })
 
-    it('should handle collection errors gracefully and return empty report', async () => {
+    it('should surface collection errors rather than report a false clean run', async () => {
       ;(mockDb as any).collection = jest.fn().mockImplementation(() => {
         throw new Error('Database error')
       })
@@ -1113,11 +1201,7 @@ describe('JanitorService', () => {
         logger: mockLogger
       })
 
-      // checkTopicOutputs catches errors internally, so run() returns an empty report
-      const report = await janitor.run()
-      expect(report.summary.totalChecked).toBe(0)
-      expect(report.shipResults).toEqual([])
-      expect(report.slapResults).toEqual([])
+      await expect(janitor.run()).rejects.toThrow('Database error')
       expect(mockLogger.error).toHaveBeenCalled()
     })
   })

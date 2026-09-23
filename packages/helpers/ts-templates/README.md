@@ -35,6 +35,29 @@ tx.addOutput({
 | [P2MSKH](./src/P2MSKH.ts)               | Spend with an M-of-N public-key threshold            |
 | [R1K1Wallet](./src/R1K1Wallet.ts)       | Use P-256 hardware normally and a K1 recovery key    |
 
+### Signing trust boundary
+
+Signing templates validate the source transaction ID, output index, satoshi
+amount, locking script, sequence, and signature scope before requesting a
+wallet signature. When both a complete source transaction and explicit source
+metadata are supplied, they must agree exactly. Treat validation failures as a
+source-provenance or transaction-construction error; do not retry by discarding
+one of the conflicting values.
+
+`MultiPushDrop` signs only its complete canonical contract shape and supports
+at most 120 distinct compressed locking keys. Its documented trusted-owner
+model still applies: any one owner can spend or destroy the token.
+
+`P2MSKH` signs only when the ordered public-key list hashes to the commitment in
+the source locking script and the wallet-derived signing key belongs to that
+list. Preserve the same ordered list while gathering incremental signatures;
+an address, key list, or partial unlocking script from an untrusted party is
+validated but is not itself proof that the intended payment policy is safe.
+
+`MandalaToken` accepts only positive JavaScript safe-integer token amounts and
+decodes the same exact range. Applications must also check aggregate arithmetic;
+the companion Overlay Topics manager performs checked per-asset conservation.
+
 ### R1-K1 hardware wallet
 
 `R1K1Wallet` commits to `HASH160(compressedR1PublicKey || privateSalt)` and a

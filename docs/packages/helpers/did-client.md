@@ -3,10 +3,10 @@ id: pkg-did-client
 title: '@bsv/did-client'
 kind: package
 domain: helpers
-version: '1.3.1'
+version: '1.3.3'
 source_repo: 'bsv-blockchain/ts-stack'
-last_updated: '2026-08-26'
-last_verified: '2026-08-26'
+last_updated: '2026-09-23'
+last_verified: '2026-09-23'
 review_cadence_days: 30
 npm: 'https://www.npmjs.com/package/@bsv/did-client'
 repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/helpers/did-client'
@@ -16,7 +16,26 @@ tags: [did, identity, helpers]
 
 # @bsv/did-client
 
-> DID (Decentralized Identifier) client for BSV blockchain — creates, revokes, and queries `did:bsv:` tokens stored as PushDrop outputs on-chain, with overlay broadcast and lookup service integration.
+> Client for the legacy BSV DID PushDrop overlay, including bounded creation,
+> revocation, and lookup flows.
+
+The 1.3.3 source candidate fixes the CommonJS build: `require()` consumers no longer fail with `.default is not a constructor` when `DIDClient` constructs SDK objects. The `@bsv/sdk` peer floor is now `^2.8.0`, the first SDK release providing modules this package already required. No API migration is required.
+
+## Trust model and wire limitation
+
+The v1 token wire format contains a serial number and counterparty-derived
+signature, but no issuer or subject identifier. A canonical overlay result
+therefore proves the token/outpoint structure, not an issuer-to-subject identity
+claim. Relying applications must bind the result to an authenticated enrollment
+record, certificate, explicit local trust decision, or another independent
+source. Do not use an uncorroborated lookup result as an identity credential.
+
+Current clients lock newly created tokens to the issuer's derived key, allowing
+that wallet to revoke a token whose named subject is different. Older
+distinct-subject outputs used a subject-owned lock while retaining the
+derivation metadata only in the issuer wallet. The missing public identities
+make those historical outputs impossible to repair locally without a
+coordinated protocol migration.
 
 ## Install
 
@@ -128,14 +147,14 @@ const page1 = await didClient.findDID({
 
 ## Key concepts
 
-- **DID Token** — PushDrop output containing serialNumber, subject, and derivation params
+- **DID Token** — Public PushDrop output containing a serial number and opaque signature; issuer and subject are not wire fields
 - **Serial Number** — Arbitrary Base64-encoded identifier for the DID
-- **Subject** — Public key of the entity the DID represents
+- **Subject** — Public key supplied during creation and retained in authenticated issuer-wallet metadata; applications establish its public association separately
 - **Derivation Prefix/Suffix** — Random values used in PushDrop key derivation; must be preserved to revoke
 - **BEEF** — Complete transaction chain for proof; required for revocation
 - **Overlay Broadcast** — Publish DID tokens to SHIP/SLAP overlay network for discoverability
 - **Lookup Service** — Query indexed overlay for DIDs by serialNumber or outpoint
-- **Revocation** — Spending the DID output burns it (marks as revoked)
+- **Revocation** — Spending the issuer-owned DID output removes it from the overlay
 
 ## When to use this
 
@@ -165,7 +184,7 @@ const page1 = await didClient.findDID({
 - **Derivation params not preserved** — If you don't store derivationPrefix and derivationSuffix, you cannot revoke the DID later
 - **Serial number encoding** — Serial number must be Base64-encoded string; UTF-8 strings won't work
 - **Subject public key format** — Must be valid public key hex; invalid format causes lock script failure
-- **No wallet storage** — DIDs are broadcast to overlay but NOT automatically stored in wallet; create your own tracking
+- **No independent identity proof** — Overlay lookup does not authenticate an issuer or subject; retain an independent trusted binding
 - **Revoke requires BEEF** — To revoke, the output's complete transaction chain is fetched; if wallet doesn't have it, revoke fails
 
 ## Related packages

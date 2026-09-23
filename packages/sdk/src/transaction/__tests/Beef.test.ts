@@ -187,13 +187,16 @@ describe('Beef tests', () => {
     const sameBlockTxids = transactions.slice(0, 4).map(transaction => transaction.id('hex'))
     const entries = transactions.map((transaction, index) => {
       const txid = transaction.id('hex')
-      const merklePath = index < sameBlockTxids.length
-        ? new MerklePath(900_000, [sameBlockTxids.map((hash, offset) => ({
-          offset,
-          hash,
-          txid: offset === index
-        }))])
-        : new MerklePath(900_000 + index, [[{ offset: 0, hash: txid, txid: true }]])
+      const merklePath =
+        index < sameBlockTxids.length
+          ? new MerklePath(900_000, [
+              sameBlockTxids.map((hash, offset) => ({
+                offset,
+                hash,
+                txid: offset === index
+              }))
+            ])
+          : new MerklePath(900_000 + index, [[{ offset: 0, hash: txid, txid: true }]])
       return { rawTx: transaction.toBinary(), merklePath }
     })
     const sequential = new Beef()
@@ -235,11 +238,13 @@ describe('Beef tests', () => {
     }
 
     const batched = new Beef()
-    batched.mergeProvenTxs(transactions.map((transaction, index) => ({
-      rawTx: transaction.toBinary(),
-      merklePath: MerklePath.fromBinary(binaries[index], true, false),
-      merkleRoot
-    })))
+    batched.mergeProvenTxs(
+      transactions.map((transaction, index) => ({
+        rawTx: transaction.toBinary(),
+        merklePath: MerklePath.fromBinary(binaries[index], true, false),
+        merkleRoot
+      }))
+    )
 
     expect(batched.toHex()).toBe(sequential.toHex())
     expect(batched.isValid()).toBe(true)
@@ -248,19 +253,27 @@ describe('Beef tests', () => {
     const conflicting = corrupt[1].path.flat().find(leaf => leaf.txid !== true && leaf.hash != null)
     expect(conflicting).toBeDefined()
     conflicting!.hash = 'ff'.repeat(32)
-    expect(() => new Beef().mergeProvenTxs(transactions.map((transaction, index) => ({
-      rawTx: transaction.toBinary(),
-      merklePath: corrupt[index],
-      merkleRoot
-    })))).toThrow('Mismatched roots')
+    expect(() =>
+      new Beef().mergeProvenTxs(
+        transactions.map((transaction, index) => ({
+          rawTx: transaction.toBinary(),
+          merklePath: corrupt[index],
+          merkleRoot
+        }))
+      )
+    ).toThrow('Mismatched roots')
 
     const mismatchedLength = binaries.map(binary => MerklePath.fromBinary(binary, true, false))
     mismatchedLength[1].path.push([])
-    expect(() => new Beef().mergeProvenTxs(transactions.map((transaction, index) => ({
-      rawTx: transaction.toBinary(),
-      merklePath: mismatchedLength[index],
-      merkleRoot
-    })))).toThrow('Mismatched roots')
+    expect(() =>
+      new Beef().mergeProvenTxs(
+        transactions.map((transaction, index) => ({
+          rawTx: transaction.toBinary(),
+          merklePath: mismatchedLength[index],
+          merkleRoot
+        }))
+      )
+    ).toThrow('Mismatched roots')
   })
 
   test('findTransactionForSigning returns undefined without transaction bytes', () => {
@@ -365,6 +378,16 @@ describe('Beef tests', () => {
       beefB.mergeTxidOnly('d0ae03111611f04a4c6e45a0a93f62f69c5594b64b369c0262289695feb2f991')
       beef.mergeBeef(beefB)
       expect(beef.isValid(true)).toBe(true)
+    }
+    {
+      const incoming = Beef.fromString(beefs[0])
+      const receiver = new Beef()
+      receiver.mergeBeef(incoming)
+      const retained = receiver.toHex()
+      const incomingTransaction = incoming.txs.find(candidate => candidate.tx != null)?.tx
+      if (incomingTransaction == null) throw new Error('fixture transaction is unavailable')
+      incomingTransaction.outputs[0].satoshis += 1
+      expect(receiver.toHex()).toBe(retained)
     }
   })
 
@@ -581,8 +604,10 @@ describe('Beef tests', () => {
     const atomic2 = beef.toUint8ArrayAtomic(tx.id('hex'))
     expect(atomic).toEqual(Array.from(atomic2))
 
+    atomic2[0] ^= 0xff
     const cached = beef.toUint8ArrayAtomic(tx.id('hex'))
-    expect(cached).toBe(atomic2)
+    expect(cached).not.toBe(atomic2)
+    expect(cached).toEqual(Uint8Array.from(atomic))
 
     beef.mergeTxidOnly('11'.repeat(32))
     const afterMutation = beef.toUint8ArrayAtomic(tx.id('hex'))
@@ -659,6 +684,17 @@ describe('Beef tests', () => {
     const b = Beef.fromString(wrongBumpTxid)
     const valid = b.isValid()
     expect(valid).toBe(false)
+  })
+
+  test('rejects a truthy non-boolean chain-root verdict', async () => {
+    const beef = Beef.fromString(beefs[0])
+    beef.mergeTransaction(Transaction.fromHex(txs[0]))
+    const malformedTracker = {
+      ...chainTracker,
+      isValidRootForHeight: async () => 'true' as unknown as boolean
+    }
+
+    await expect(beef.verify(malformedTracker)).resolves.toBe(false)
   })
 
   test('12_bumpIndexEncoding', async () => {

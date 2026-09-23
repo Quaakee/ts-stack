@@ -1,6 +1,6 @@
 import Signature from './Signature.js'
 import BigNumber from './BigNumber.js'
-import * as Hash from './Hash.js'
+import { hash256 } from './Hash.js'
 import { toArray, Writer } from './utils.js'
 import Script from '../script/Script.js'
 import TransactionInput from '../transaction/TransactionInput.js'
@@ -83,7 +83,7 @@ function hashPrevouts(
     }
     writer.writeUInt32LE(input.sourceOutputIndex)
   }
-  return Hash.hash256(writer.toUint8Array())
+  return hash256(writer.toUint8Array())
 }
 
 function hashSequences(
@@ -96,7 +96,7 @@ function hashSequences(
     const input = bip143InputAt(inputs, inputIndex, currentInput, index)
     writer.writeUInt32LE(input.sequence ?? 0xffffffff)
   }
-  return Hash.hash256(writer.toUint8Array())
+  return hash256(writer.toUint8Array())
 }
 
 function writeBip143Output(writer: Writer, output: TransactionOutput): void {
@@ -115,7 +115,7 @@ function hashOutputs(outputs: TransactionOutput[], outputIndex?: number): number
     if (output == null) throw new Error(`Output at index ${outputIndex} does not exist`)
     writeBip143Output(writer, output)
   }
-  return Hash.hash256(writer.toUint8Array())
+  return hash256(writer.toUint8Array())
 }
 
 function bip143PrevoutsHash(
@@ -294,7 +294,7 @@ export default class TransactionSignature extends Signature {
 
     const buf = writer.toUint8Array()
     // const preimage = toHex(buf)
-    // const sighash = toHex(Hash.hash256(buf))
+    // const sighash = toHex(hash256(buf))
     return buf
   }
 
@@ -351,7 +351,7 @@ export default class TransactionSignature extends Signature {
 
     const buf = writer.toUint8Array()
     // const preimage = toHex(buf)
-    // const sighash = toHex(Hash.hash256(buf))
+    // const sighash = toHex(hash256(buf))
     return buf
   }
 

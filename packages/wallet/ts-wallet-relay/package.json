@@ -1,6 +1,6 @@
 {
   "name": "@bsv/wallet-relay",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "sideEffects": false,
   "engines": {
     "node": ">=22"
@@ -73,7 +73,7 @@
     "pack:check": "pnpm build && node ../../../scripts/check-package-artifact.mjs . --allow-source-prefixes template --consumer-dependencies react --exports QRSessionManager,WalletRelayService,WalletRequestHandler,WebSocketRelay,compileOriginMatcher --entry-exports \"./client=WalletPairingSession|WalletRelayClient|WalletRelayError;./react=QRDisplay|QRPairingCode|RequestLog|WalletConnectionModal|useQRPairing|useWalletRelayClient\" --bin wallet-relay --bin-args --help && node ../../../scripts/check-auth-express-consumers.mjs @bsv/wallet-relay",
     "test": "jest --config jest.config.cjs --watchman=false",
     "test:browser": "pnpm build && node ../../../scripts/check-browser-package.mjs .",
-    "test:coverage": "jest --config jest.config.cjs --coverage --watchman=false",
+    "test:coverage": "jest --config jest.config.cjs --coverage --watchman=false && node --test --experimental-test-coverage --test-coverage-include=bin/init.mjs --test-coverage-include=build.mjs --test-reporter=lcov --test-reporter-destination=coverage/scripts.lcov.info tests/scripts.node.test.mjs && node scripts/merge-coverage.mjs",
     "test:property": "jest --config jest.config.cjs --selectProjects node --runInBand --watchman=false --runTestsByPath tests/pairingUri.property.test.ts",
     "prepublishOnly": "pnpm build"
   },
@@ -102,6 +102,7 @@
     }
   },
   "devDependencies": {
+    "@babel/plugin-transform-modules-commonjs": "7.29.7",
     "@bsv/sdk": "workspace:^",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^7.0.0",
@@ -113,6 +114,7 @@
     "@types/react": "^19.2.17",
     "@types/ws": "^8.18.1",
     "@typescript/native": "npm:typescript@7.0.2",
+    "babel-jest": "30.4.1",
     "esbuild": "^0.28.1",
     "express": "^5.2.1",
     "fast-check": "^4.9.0",
@@ -126,6 +128,8 @@
     "typescript": "npm:@typescript/typescript6@6.0.2"
   },
   "dependencies": {
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
     "ws": "^8.21.1"
   },
   "repository": {

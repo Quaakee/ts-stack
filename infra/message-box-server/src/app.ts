@@ -128,7 +128,7 @@ export async function initializeWallet(): Promise<void> {
     storageUrl: WALLET_STORAGE_URL
   })
 
-  bindMessageBoxRuntime({ knex, wallet: _wallet })
+  bindMessageBoxRuntime({ knex, wallet: _wallet, paymentReplayStore })
   _resolveReady()
 }
 
@@ -216,7 +216,11 @@ export async function useRoutes(): Promise<void> {
     throw new Error('Wallet is not initialized for auth middleware')
   }
 
-  registerMessageBoxPreAuthRoutes(app, ROUTING_PREFIX)
+  registerMessageBoxPreAuthRoutes(app, ROUTING_PREFIX, {
+    knex,
+    wallet: _wallet,
+    paymentReplayStore
+  })
 
   app.use(
     createAuthMiddleware({
@@ -233,6 +237,7 @@ export async function useRoutes(): Promise<void> {
   registerMessageBoxPostAuthRoutes(
     app,
     {
+      knex,
       wallet: _wallet,
       calculateRequestPrice: calculateConfiguredRequestPrice,
       paymentReplayStore

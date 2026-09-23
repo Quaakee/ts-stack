@@ -21,7 +21,7 @@
     {
       "id": "scorecard-release-lockfile-refresh",
       "category": "toolchain",
-      "target": "OpenSSF Scorecard PinnedDependenciesID #200 and re-fingerprinted duplicate #221 for npm install --package-lock-only",
+      "target": "OpenSSF Scorecard PinnedDependenciesID #200 and re-fingerprinted duplicates #221/#225 for npm install --package-lock-only",
       "owner": "ts-stack-maintainers",
       "reason": "The command installs no named or ad hoc package: it deterministically refreshes each committed infrastructure package-lock from that directory's committed package.json after first-party version synchronization, with lifecycle scripts disabled. Scorecard interprets the lockfile operation as an unpinned package invocation even though dependency resolution is committed and subsequently audited.",
       "evidence": [
@@ -29,6 +29,7 @@
         "infra/*/package-lock.json",
         "https://github.com/bsv-blockchain/ts-stack/security/code-scanning/200",
         "https://github.com/bsv-blockchain/ts-stack/security/code-scanning/221",
+        "https://github.com/bsv-blockchain/ts-stack/security/code-scanning/225",
         "https://github.com/bsv-blockchain/ts-stack/issues/324"
       ],
       "created": "2026-07-25",
@@ -128,20 +129,22 @@
       "removeWhen": "Remove from each remaining service when its supported cloud client closure natively resolves uuid 11.1.1 or newer and frozen audit, build, test, and Linux image checks remain green without the substitution."
     },
     {
-      "id": "typed-rest-client-qs-override",
+      "id": "qs-advisory-override",
       "category": "override",
-      "target": "pnpm-workspace.yaml override typed-rest-client@2.3.1>qs",
+      "target": "pnpm-workspace.yaml override for qs releases below 6.16.0",
       "owner": "ts-stack-maintainers",
-      "reason": "The workspace uses Stryker 9.6.1, and the current Stryker 10.0.0 release still depends on typed-rest-client ~2.3.0. typed-rest-client 2.3.1 pins vulnerable qs 6.15.1 exactly. GHSA-q8mj-m7cp-5q26 is fixed in qs 6.15.2 and later, so a parent-scoped substitution to 6.15.3 remains the narrowest durable remediation. The previous lock-only selection was lost when an unrelated dependency change regenerated the graph.",
+      "reason": "The frozen graph selected qs 6.15.3 through Express/body-parser and Superagent and would select the exactly pinned 6.15.1 through Stryker's typed-rest-client. qs 6.16.0 is the first release that fixes GHSA-q8mj-m7cp-5q26 together with GHSA-x5fp-wj9c-mxmx and GHSA-4mjr-xmp4-gh2g. A version-bounded substitution fixes every runtime and development path while retaining the supported qs 6 API. The previous lock-only selection was lost when an unrelated dependency change regenerated the graph.",
       "evidence": [
         "pnpm-workspace.yaml#overrides",
         "https://github.com/advisories/GHSA-q8mj-m7cp-5q26",
+        "https://github.com/advisories/GHSA-x5fp-wj9c-mxmx",
+        "https://github.com/advisories/GHSA-4mjr-xmp4-gh2g",
         "https://www.npmjs.com/package/typed-rest-client/v/2.3.1?activeTab=dependencies",
         "https://github.com/bsv-blockchain/ts-stack/issues/324"
       ],
       "created": "2026-07-27",
-      "reviewBy": "2026-09-30",
-      "removeWhen": "Remove when Stryker no longer depends on typed-rest-client 2.3.1 or a supported typed-rest-client release natively depends on qs 6.15.2 or newer, then regenerate the lock and rerun the complete mutation campaign."
+      "reviewBy": "2026-10-16",
+      "removeWhen": "Remove when every supported Express/body-parser, Superagent, and Stryker/typed-rest-client path natively resolves qs 6.16.0 or newer, then regenerate the lock and rerun HTTP boundary tests plus the complete mutation campaign."
     },
     {
       "id": "js-yaml-jest-istanbul-advisory-override",
@@ -191,20 +194,22 @@
       "removeWhen": "Remove when remark-mdx-frontmatter or its supported successor natively resolves TOML 4.2.0 or newer and docs validation, tests, production build, and the frozen high-severity audit remain green."
     },
     {
-      "id": "image-size-unpublished-advisory-patch",
-      "category": "advisory",
-      "target": "image-size 1.2.1 pnpm patch and exact audit exclusions for malformed ICNS, HEIF, and JPEG XL records",
+      "id": "metro-image-size-security-override",
+      "category": "override",
+      "target": "pnpm-workspace.yaml parent-scoped Metro 0.87 image-size 2.0.4 substitution",
       "owner": "ts-stack-maintainers",
-      "reason": "GHSA-w3rx-r6r6-pgpr and GHSA-5p2g-fcmc-qvqq affect every published image-size release and have no patched version. The committed patch rejects zero or undersized records before parser loops can receive a non-progressing offset; a child-process regression test enforces termination. The audit exclusions cover only those independently remediated advisory IDs.",
+      "reason": "Metro 0.87 still declares image-size ^1.0.2, whose complete release line is affected by GHSA-w3rx-r6r6-pgpr and GHSA-5p2g-fcmc-qvqq. image-size 2.0.4 retains the CommonJS default imageSize function used by Metro while moving the development-only graph past the vulnerable <=2.0.2 range. The child-process parser regression and complete Metro/Hermes mobile gate verify the major substitution.",
       "evidence": [
-        "patches/image-size@1.2.1.patch",
-        "scripts/dependency-release-governance.test.mjs",
+        "pnpm-workspace.yaml#overrides",
+        "pnpm-lock.yaml#overrides",
+        "governance/dependency-release-policy.json#overrideRegistry",
+        "packages/wallet/wallet-toolbox/mobile/test/image-size-security.test.ts",
         "https://github.com/advisories/GHSA-w3rx-r6r6-pgpr",
         "https://github.com/advisories/GHSA-5p2g-fcmc-qvqq"
       ],
-      "created": "2026-08-09",
-      "reviewBy": "2026-09-23",
-      "removeWhen": "Replace the patch and exact audit exclusions when Metro supports an image-size release that fixes both advisories, then rerun the frozen audit and mobile platform contract."
+      "created": "2026-09-16",
+      "reviewBy": "2026-10-16",
+      "removeWhen": "Remove when the supported Metro release natively accepts image-size 2.0.4 or newer and the frozen audit plus complete mobile platform contract remain green without the substitution."
     },
     {
       "id": "openapi-typescript-redocly-overrides",
@@ -219,7 +224,8 @@
         "https://github.com/advisories/GHSA-52cp-r559-cp3m",
         "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
         "https://github.com/advisories/GHSA-rgw5-rvv9-x895",
-        "https://github.com/openapi-ts/openapi-typescript/blob/openapi-typescript%407.13.0/packages/openapi-typescript/package.json"
+        "https://github.com/openapi-ts/openapi-typescript/blob/openapi-typescript%407.13.0/packages/openapi-typescript/package.json",
+        "https://github.com/advisories/GHSA-2883-xcg3-v3hh"
       ],
       "created": "2026-07-25",
       "reviewBy": "2026-09-25",
@@ -342,6 +348,20 @@
       "created": "2026-07-28",
       "reviewBy": "2026-10-26",
       "removeWhen": "Remove when the analyzer exempts exhaustive protocol dispatch or a separately reviewed generated opcode table improves auditability and passes every script vector, differential, mutation, fuzz, transaction, browser, and packed-consumer check."
+    },
+    {
+      "id": "codeql-reviewed-validation-and-test-fixtures-20260923",
+      "category": "quality-rule",
+      "target": "Existing CodeQL alerts #242, #250-258 and #261-278, individually reviewed on main 476b1351baf366cee39f39f610975f7fb1a83e4a",
+      "owner": "ts-stack-maintainers",
+      "reason": "The exact reported paths are existing primitive validation/authentication guards, contained metadata writes, exclusive file creation, exact array membership, or isolated test assertions. No security bypass is established. Rewriting safe behavior or removing meaningful tests solely to alter heuristic matches would weaken compatibility or assurance; no production control is waived. Detailed per-alert evidence and trust assumptions are retained for review.",
+      "evidence": [
+        "docs/reference/codeql-review-2026-09-23.md",
+        "https://github.com/bsv-blockchain/ts-stack/actions/runs/35813974981"
+      ],
+      "created": "2026-09-23",
+      "reviewBy": "2026-10-23",
+      "removeWhen": "Remove when improved CodeQL modeling no longer reports these paths. Reopen affected alerts immediately if their documented guards, callers, filesystem trust assumptions or test-only roles change; any genuine unsafe path requires remediation before release."
     }
   ]
 }

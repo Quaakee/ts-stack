@@ -1,4 +1,5 @@
-import { ListOutputsResult, Validation } from '@bsv/sdk'
+import { type ValidListOutputsArgs } from '@bsv/sdk/wallet/validationHelpers'
+import { ListOutputsResult } from '@bsv/sdk'
 import { StorageProvider } from '../StorageProvider'
 import { AuthId } from '../../sdk/WalletStorage.interfaces'
 import { TableOutput } from '../schema/tables/TableOutput'
@@ -10,12 +11,14 @@ import {
 } from '../../sdk/types'
 import { verifyId, verifyInteger, verifyOne } from '../../utility/utilityHelpers'
 import { WERR_INVALID_PARAMETER } from '../../sdk/WERR_errors'
-import { reviewUtxoOutputs } from './reviewUtxoOutputs'
+import { MAX_UTXO_REVIEW_CANDIDATES, reviewUtxoOutputs } from './reviewUtxoOutputs'
 
 export interface ListOutputsSpecOp {
   name: string
   useBasket?: string
   ignoreLimit?: boolean
+  /** Hard ceiling applied even when this operation intentionally ignores caller paging. */
+  maximumCandidateCount?: number
   includeOutputScripts?: boolean
   includeSpent?: boolean
   /**
@@ -27,20 +30,20 @@ export interface ListOutputsSpecOp {
   resultFromTags?: (
     s: StorageProvider,
     auth: AuthId,
-    vargs: Validation.ValidListOutputsArgs,
+    vargs: ValidListOutputsArgs,
     specOpTags: string[]
   ) => Promise<ListOutputsResult>
   resultFromOutputs?: (
     s: StorageProvider,
     auth: AuthId,
-    vargs: Validation.ValidListOutputsArgs,
+    vargs: ValidListOutputsArgs,
     specOpTags: string[],
     outputs: TableOutput[]
   ) => Promise<ListOutputsResult>
   filterOutputs?: (
     s: StorageProvider,
     auth: AuthId,
-    vargs: Validation.ValidListOutputsArgs,
+    vargs: ValidListOutputsArgs,
     specOpTags: string[],
     outputs: TableOutput[]
   ) => Promise<TableOutput[]>
@@ -67,7 +70,7 @@ const getBasketToSpecOp: () => Record<string, ListOutputsSpecOp> = () => {
       resultFromOutputs: async (
         s: StorageProvider,
         auth: AuthId,
-        vargs: Validation.ValidListOutputsArgs,
+        vargs: ValidListOutputsArgs,
         specOpTags: string[],
         outputs: TableOutput[]
       ): Promise<ListOutputsResult> => {
@@ -85,13 +88,14 @@ const getBasketToSpecOp: () => Record<string, ListOutputsSpecOp> = () => {
       name: 'invalidChangeOutputs',
       useBasket: 'default',
       ignoreLimit: true,
+      maximumCandidateCount: MAX_UTXO_REVIEW_CANDIDATES,
       includeOutputScripts: true,
       includeSpent: false,
       tagsToIntercept: ['release', 'all'],
       filterOutputs: async (
         s: StorageProvider,
         auth: AuthId,
-        vargs: Validation.ValidListOutputsArgs,
+        vargs: ValidListOutputsArgs,
         specOpTags: string[],
         outputs: TableOutput[]
       ): Promise<TableOutput[]> => {
@@ -106,7 +110,7 @@ const getBasketToSpecOp: () => Record<string, ListOutputsSpecOp> = () => {
       resultFromTags: async (
         s: StorageProvider,
         auth: AuthId,
-        vargs: Validation.ValidListOutputsArgs,
+        vargs: ValidListOutputsArgs,
         specOpTags: string[]
       ): Promise<ListOutputsResult> => {
         if (specOpTags.length !== 2) {
@@ -139,7 +143,7 @@ const getTagToSpecOp: () => Record<string, ListOutputsSpecOp> = () => {
       resultFromOutputs: async (
         s: StorageProvider,
         auth: AuthId,
-        vargs: Validation.ValidListOutputsArgs,
+        vargs: ValidListOutputsArgs,
         specOpTags: string[],
         outputs: TableOutput[]
       ): Promise<ListOutputsResult> => {

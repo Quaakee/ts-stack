@@ -1,4 +1,9 @@
 import {
+  type ValidCreateActionArgs,
+  type ValidCreateActionInput,
+  type ValidProcessActionArgs
+} from '@bsv/sdk/wallet/validationHelpers'
+import {
   AtomicBEEF,
   Beef,
   CreateActionResult,
@@ -7,8 +12,7 @@ import {
   SignableTransaction,
   TelemetrySpan,
   TXIDHexString,
-  Transaction,
-  Validation
+  Transaction
 } from '@bsv/sdk'
 import { buildSignableTransaction } from './buildSignableTransaction'
 import {
@@ -21,6 +25,7 @@ import { completeSignedTransaction, verifyUnlockScripts } from './completeSigned
 import { PendingSignAction, Wallet } from '../../Wallet'
 import { WERR_INTERNAL } from '../../sdk/WERR_errors'
 import { setResultBeef } from './resultBeef'
+import { exactActionSpendSymbol, type ExactActionSpendCarrier } from '../../utility/exactActionSpend'
 
 export interface CreateActionResultX extends CreateActionResult {
   txid?: TXIDHexString
@@ -34,7 +39,7 @@ export interface CreateActionResultX extends CreateActionResult {
 export async function createAction(
   wallet: Wallet,
   auth: AuthId,
-  vargs: Validation.ValidCreateActionArgs
+  vargs: ValidCreateActionArgs
 ): Promise<CreateActionResultX> {
   if (!wallet.telemetry.enabled) return await createActionCore(wallet, auth, vargs)
   return await wallet.telemetry.withSpan(
@@ -66,7 +71,7 @@ export async function createAction(
 async function createActionCore(
   wallet: Wallet,
   auth: AuthId,
-  vargs: Validation.ValidCreateActionArgs,
+  vargs: ValidCreateActionArgs,
   parent?: TelemetrySpan
 ): Promise<CreateActionResultX> {
   const r: CreateActionResultX = {}
@@ -93,23 +98,18 @@ async function createActionCore(
     logger?.log('completed signed transaction')
 
     r.txid = prior.tx.id('hex')
-    const beef = await traceActionStep(
-      wallet,
-      'wallet.create_action.assemble_result_beef',
-      parent,
-      () => {
-        const result = new Beef()
-        if (prior!.dcr.inputBeef != null) {
-          const inputBeef =
-            prior!.dcr.inputBeef instanceof Uint8Array
-              ? Beef.fromBinaryView(prior!.dcr.inputBeef)
-              : Beef.fromBinary(prior!.dcr.inputBeef)
-          result.mergeBeef(inputBeef)
-        }
-        result.mergeTransaction(prior!.tx)
-        return result
+    const beef = await traceActionStep(wallet, 'wallet.create_action.assemble_result_beef', parent, () => {
+      const result = new Beef()
+      if (prior!.dcr.inputBeef != null) {
+        const inputBeef =
+          prior!.dcr.inputBeef instanceof Uint8Array
+            ? Beef.fromBinaryView(prior!.dcr.inputBeef)
+            : Beef.fromBinaryStrict(prior!.dcr.inputBeef)
+        result.mergeBeef(inputBeef)
       }
-    )
+      result.mergeTransaction(prior!.tx)
+      return result
+    })
     logger?.log('merged beef')
 
     await traceActionStep(
@@ -124,11 +124,8 @@ async function createActionCore(
     beef.atomicTxid = r.txid
     setResultBeef(r, beef)
     if (!vargs.options.returnTXIDOnly) {
-      r.tx = await traceActionStep(
-        wallet,
-        'wallet.create_action.serialize_result_beef',
-        parent,
-        () => beef.toBinaryAtomic(r.txid!)
+      r.tx = await traceActionStep(wallet, 'wallet.create_action.serialize_result_beef', parent, () =>
+        beef.toBinaryAtomic(r.txid!)
       )
     }
   }
@@ -166,7 +163,7 @@ async function traceActionStep<T>(
 
 async function createNewTx(
   wallet: Wallet,
-  vargs: Validation.ValidCreateActionArgs,
+  vargs: ValidCreateActionArgs,
   parent?: TelemetrySpan
 ): Promise<PendingSignAction> {
   const logger = vargs.logger
@@ -196,18 +193,19 @@ async function createNewTx(
 function makeSignableTransactionResult(
   prior: PendingSignAction,
   wallet: Wallet,
-  args: Validation.ValidCreateActionArgs
+  args: ValidCreateActionArgs
 ): CreateActionResult {
   if (prior.dcr.inputBeef == null) throw new WERR_INTERNAL('prior.dcr.inputBeef must be valid')
 
   const txid = prior.tx.id('hex')
 
-  const r: CreateActionResult = {
+  const r: CreateActionResult & ExactActionSpendCarrier = {
     noSendChange: args.isNoSend ? prior.dcr.noSendChangeOutputVouts?.map(vout => `${txid}.${vout}`) : undefined,
     signableTransaction: {
       reference: prior.dcr.reference,
       tx: makeSignableTransactionBeef(prior.tx)
-    }
+    },
+    [exactActionSpendSymbol]: prior.amount
   }
 
   wallet.pendingSignActions[r.signableTransaction!.reference] = prior
@@ -231,13 +229,13 @@ function makeSignableTransactionBeef(tx: Transaction): number[] {
   return beef.toBinaryAtomic(tx.id('hex'))
 }
 
-function removeUnlockScripts(args: Validation.ValidCreateActionArgs) {
+function removeUnlockScripts(args: ValidCreateActionArgs) {
   let storageArgs = args
   if (!storageArgs.inputs.every(i => i.unlockingScript === undefined)) {
     // Never send unlocking scripts to storage, all it needs is the script length.
     storageArgs = { ...args, inputs: [] }
     for (const i of args.inputs) {
-      const di: Validation.ValidCreateActionInput = {
+      const di: ValidCreateActionInput = {
         ...i,
         unlockingScriptLength: i.unlockingScript !== undefined ? i.unlockingScript.length : i.unlockingScriptLength
       }
@@ -252,7 +250,7 @@ export async function processAction(
   prior: PendingSignAction | undefined,
   wallet: Wallet,
   auth: AuthId,
-  vargs: Validation.ValidProcessActionArgs
+  vargs: ValidProcessActionArgs
 ): Promise<StorageProcessActionResults> {
   const batchResult = await wallet.actionBatch.process(prior, vargs)
   if (batchResult != null) return batchResult

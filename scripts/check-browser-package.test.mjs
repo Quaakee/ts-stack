@@ -63,6 +63,9 @@ test('browser bundle budgets validate every compression dimension', () => {
     () => validateBundleBudget(actual, { ...actual, gzip: actual.gzip - 1 }, 'small'),
     /exceeds budget/
   )
+  assert.doesNotThrow(() =>
+    validateBundleBudget(actual, { ...actual, gzip: actual.gzip - 1 }, 'measurement', false)
+  )
 })
 
 test('browser budget metadata is bound to the package and contract', () => {

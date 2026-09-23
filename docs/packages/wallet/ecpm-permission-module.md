@@ -4,7 +4,7 @@ title: '@bsv/ecpm-permission-module'
 kind: package
 domain: wallet
 npm: '@bsv/ecpm-permission-module'
-version: '0.1.0'
+version: '0.1.1'
 last_updated: '2026-08-30'
 last_verified: '2026-08-30'
 review_cadence_days: 30

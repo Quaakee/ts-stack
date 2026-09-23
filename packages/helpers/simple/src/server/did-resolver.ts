@@ -1,13 +1,21 @@
 /**
  * DID Resolution Proxy — server-side did:bsv resolver.
  *
- * 1. Try nChain Universal Resolver first
- * 2. On failure, fall back to WoC chain-following (server-side, no CORS)
+ * 1. Try the configured authoritative universal resolver first
+ * 2. On failure, fall back to the configured authoritative WoC chain view
+ *
+ * The current resolver response contains no cryptographic transaction,
+ * inclusion, or freshness evidence. The service validates shape, requested-DID
+ * binding, and reported output-0 linkage, but callers must not treat a remote
+ * answer as independent proof against a compromised resolver/provider.
  *
  * Core class (DIDResolverService) is framework-agnostic.
  * createDIDResolverHandler() returns Next.js App Router compatible { GET }.
  */
 
+import { createPublicHTTPSFetch } from '@bsv/sdk'
+import { snapshotPlainDataRecord } from '../core/certificate-validation'
+import { validateDIDResolutionResult } from '../core/did-validation'
 import { DIDResolverConfig, DIDResolutionResult } from '../core/types'
 import { processWocSegments, type WocChainState } from '../modules/did-woc'
 import {
@@ -22,6 +30,104 @@ const DEFAULT_RESOLVER_URL = 'https://bsvdid-universal-resolver.nchain.systems'
 const DEFAULT_WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main'
 const BSVDID_MARKER = 'BSVDID'
 const DID_CONTENT_TYPE = 'application/did+ld+json'
+const MAX_RESOLVER_RESPONSE_BYTES = 2 * 1024 * 1024
+
+interface ResolverResponse {
+  status: number
+  body: unknown
+}
+
+type ResolverFetch = (url: string, headers?: Record<string, string>) => Promise<ResolverResponse>
+
+function denseOwnArray(value: unknown, name: string): unknown[] {
+  if (!Array.isArray(value) || value.length > 100_000) throw new TypeError(`Invalid ${name}`)
+  const output: unknown[] = []
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+    if (descriptor == null || Object.getOwnPropertyDescriptor(descriptor, 'value') == null) {
+      throw new TypeError(`Invalid ${name}`)
+    }
+    output.push(descriptor.value)
+  }
+  return output
+}
+
+function snapshotResolverConfig(config?: DIDResolverConfig): DIDResolverConfig {
+  if (config == null) return Object.create(null) as DIDResolverConfig
+  const record = snapshotPlainDataRecord(config)
+  if (record == null) throw new TypeError('Invalid DID resolver configuration')
+  if (record.fetch != null && typeof record.fetch !== 'function') {
+    throw new TypeError('Invalid DID resolver transport')
+  }
+  return Object.assign(Object.create(null) as DIDResolverConfig, {
+    ...(record.resolverUrl === undefined ? {} : { resolverUrl: record.resolverUrl as string }),
+    ...(record.wocBaseUrl === undefined ? {} : { wocBaseUrl: record.wocBaseUrl as string }),
+    ...(record.resolverTimeout === undefined
+      ? {}
+      : { resolverTimeout: record.resolverTimeout as number }),
+    ...(record.maxHops === undefined ? {} : { maxHops: record.maxHops as number }),
+    ...(record.fetch === undefined ? {} : { fetch: record.fetch as typeof fetch })
+  })
+}
+
+function normalizeRemoteBase(value: string, name: string): string {
+  if (
+    typeof value !== 'string' ||
+    value.length < 1 ||
+    value.length > 2048 ||
+    value !== value.trim()
+  ) {
+    throw new TypeError(`Invalid ${name}`)
+  }
+  const url = new URL(value)
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    throw new TypeError(`${name} must be credential-free HTTPS without query or fragment`)
+  }
+  return url.toString().replace(/\/*$/, '')
+}
+
+async function readBoundedResolverJson(response: Response): Promise<unknown> {
+  const declared = response.headers?.get('content-length')
+  if (
+    declared != null &&
+    (!/^(0|[1-9]\d*)$/.test(declared) || Number(declared) > MAX_RESOLVER_RESPONSE_BYTES)
+  ) {
+    throw new Error('DID resolver response exceeds the configured limit')
+  }
+  const reader = response.body?.getReader()
+  let text = ''
+  if (reader == null) {
+    text = await response.text()
+    if (new TextEncoder().encode(text).byteLength > MAX_RESOLVER_RESPONSE_BYTES) {
+      throw new Error('DID resolver response exceeds the configured limit')
+    }
+  } else {
+    const decoder = new TextDecoder('utf-8', { fatal: true })
+    let total = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        total += value.byteLength
+        if (total > MAX_RESOLVER_RESPONSE_BYTES) {
+          await reader.cancel()
+          throw new Error('DID resolver response exceeds the configured limit')
+        }
+        text += decoder.decode(value, { stream: true })
+      }
+      text += decoder.decode()
+    } finally {
+      reader.releaseLock()
+    }
+  }
+  return JSON.parse(text) as unknown
+}
 
 // ============================================================================
 // OP_RETURN parser
@@ -100,10 +206,13 @@ function notFoundResult(): DIDResolutionResult {
   }
 }
 
-function extractBsvdidSegments(vout: any[]): string[] {
-  for (const output of vout) {
-    const hex = output?.scriptPubKey?.hex as string | undefined
-    if (hex == null || hex === '') continue
+function extractBsvdidSegments(vout: unknown[]): string[] {
+  for (const value of vout) {
+    const output = snapshotPlainDataRecord(value)
+    const script = snapshotPlainDataRecord(output?.scriptPubKey)
+    const hex = script?.hex
+    if (typeof hex !== 'string') continue
+    if (hex === '') continue
     const segments = parseOpReturnSegments(hex)
     if (segments.length >= 3 && segments[0] === BSVDID_MARKER) return segments
   }
@@ -112,34 +221,16 @@ function extractBsvdidSegments(vout: any[]): string[] {
 
 async function fetchNextTxidViaSpend(
   wocBaseUrl: string,
-  currentTxid: string
+  currentTxid: string,
+  fetchJson: ResolverFetch
 ): Promise<string | null> {
   try {
-    const response = await fetch(`${wocBaseUrl}/tx/${currentTxid}/out/0/spend`)
-    if (!response.ok || response.status === 404) return null
-    const data: any = await response.json()
-    return data?.txid ?? null
-  } catch {
-    return null
-  }
-}
-
-async function fetchNextTxidViaHistory(
-  wocBaseUrl: string,
-  txData: any,
-  visited: Set<string>
-): Promise<string | null> {
-  const out0Address = txData.vout?.[0]?.scriptPubKey?.addresses?.[0]
-  if (out0Address == null) return null
-
-  try {
-    const response = await fetch(`${wocBaseUrl}/address/${String(out0Address)}/history`)
-    if (!response.ok) return null
-    const history = (await response.json()) as Array<{ tx_hash: string; height: number }>
-    const candidates = history
-      .filter(entry => !visited.has(entry.tx_hash))
-      .sort((left, right) => right.height - left.height)
-    return candidates.length === 0 ? null : candidates[0].tx_hash
+    const response = await fetchJson(`${wocBaseUrl}/tx/${currentTxid}/out/0/spend`)
+    if (response.status !== 200) return null
+    const body = snapshotPlainDataRecord(response.body)
+    if (body == null) return null
+    const txid = body.txid
+    return typeof txid === 'string' && /^[0-9a-f]{64}$/.test(txid) ? txid : null
   } catch {
     return null
   }
@@ -179,63 +270,111 @@ export class DIDResolverService {
   private readonly wocBaseUrl: string
   private readonly resolverTimeout: number
   private readonly maxHops: number
+  private readonly trustedFetch?: typeof fetch
 
   constructor(config?: DIDResolverConfig) {
-    this.resolverUrl = config?.resolverUrl ?? DEFAULT_RESOLVER_URL
-    this.wocBaseUrl = config?.wocBaseUrl ?? DEFAULT_WOC_BASE
-    this.resolverTimeout = config?.resolverTimeout ?? 10_000
-    this.maxHops = config?.maxHops ?? 100
+    const ownedConfig = snapshotResolverConfig(config)
+    this.resolverUrl = normalizeRemoteBase(
+      ownedConfig.resolverUrl ?? DEFAULT_RESOLVER_URL,
+      'DID resolver URL'
+    )
+    this.wocBaseUrl = normalizeRemoteBase(ownedConfig.wocBaseUrl ?? DEFAULT_WOC_BASE, 'WoC URL')
+    this.resolverTimeout = ownedConfig.resolverTimeout ?? 10_000
+    this.maxHops = ownedConfig.maxHops ?? 100
+    this.trustedFetch = ownedConfig.fetch
+    if (
+      !Number.isSafeInteger(this.resolverTimeout) ||
+      this.resolverTimeout < 250 ||
+      this.resolverTimeout > 60_000
+    ) {
+      throw new TypeError('resolverTimeout must be a safe integer between 250 and 60000')
+    }
+    if (!Number.isSafeInteger(this.maxHops) || this.maxHops < 1 || this.maxHops > 100) {
+      throw new TypeError('maxHops must be a safe integer between 1 and 100')
+    }
+  }
+
+  private readonly fetchJson: ResolverFetch = async (url, headers) => {
+    const target = new URL(url)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.resolverTimeout)
+    try {
+      const fetchClient = this.trustedFetch ?? createPublicHTTPSFetch(target.origin)
+      const response = await fetchClient(target.toString(), {
+        ...(headers == null ? {} : { headers }),
+        redirect: 'error',
+        signal: controller.signal
+      })
+      return { status: response.status, body: await readBoundedResolverJson(response) }
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
   async resolve(did: string): Promise<DIDResolutionResult> {
-    const txidMatch = /^did:bsv:([0-9a-f]{64})$/i.exec(did)
+    const txidMatch = /^did:bsv:([0-9a-f]{64})$/.exec(did)
+    if (txidMatch == null) return notFoundResult()
 
     // Try nChain Universal Resolver
     try {
-      const response = await fetch(
+      const response = await this.fetchJson(
         `${this.resolverUrl}/1.0/identifiers/${encodeURIComponent(did)}`,
-        {
-          headers: { Accept: 'application/did+ld+json' },
-          signal: AbortSignal.timeout(this.resolverTimeout)
-        }
+        { Accept: 'application/did+ld+json' }
       )
 
-      if (response.ok) {
-        const data: any = await response.json()
-        return {
-          didDocument: data.didDocument ?? data,
-          didDocumentMetadata: data.didDocumentMetadata ?? {},
-          didResolutionMetadata: {
-            contentType: 'application/did+ld+json',
-            ...data.didResolutionMetadata
-          }
-        }
+      if (response.status === 200) {
+        const data = snapshotPlainDataRecord(response.body)
+        if (data == null) throw new TypeError('Invalid DID resolver response')
+        const hasEnvelope = Object.getOwnPropertyDescriptor(data, 'didDocument') != null
+        const envelope = hasEnvelope
+          ? data
+          : { didDocument: data, didDocumentMetadata: {}, didResolutionMetadata: {} }
+        const metadata =
+          snapshotPlainDataRecord(envelope.didResolutionMetadata) ?? Object.create(null)
+        return validateDIDResolutionResult(
+          {
+            ...envelope,
+            didResolutionMetadata: {
+              contentType: DID_CONTENT_TYPE,
+              ...metadata
+            }
+          },
+          did
+        )
       }
 
       if (response.status === 410) {
-        const data: any = await response.json().catch(() => ({}))
-        return {
-          didDocument: data.didDocument ?? null,
-          didDocumentMetadata: { deactivated: true, ...data.didDocumentMetadata },
-          didResolutionMetadata: {
-            contentType: 'application/did+ld+json',
-            ...data.didResolutionMetadata
-          }
-        }
+        const data = snapshotPlainDataRecord(response.body)
+        const documentMetadata = snapshotPlainDataRecord(data?.didDocumentMetadata)
+        const resolutionMetadata = snapshotPlainDataRecord(data?.didResolutionMetadata)
+        return validateDIDResolutionResult(
+          {
+            didDocument: data?.didDocument ?? null,
+            didDocumentMetadata: { ...documentMetadata, deactivated: true },
+            didResolutionMetadata: {
+              ...resolutionMetadata,
+              contentType: DID_CONTENT_TYPE
+            }
+          },
+          did
+        )
       }
     } catch {
       // nChain timeout/error — fall through to WoC
     }
 
     // WoC chain-following fallback
-    if (txidMatch != null) {
-      return await this.resolveViaWoC(txidMatch[1].toLowerCase())
-    }
-
-    return {
-      didDocument: null,
-      didDocumentMetadata: {},
-      didResolutionMetadata: { error: 'notFound', message: 'DID could not be resolved' }
+    try {
+      return await this.resolveViaWoC(txidMatch[1])
+    } catch {
+      return {
+        didDocument: null,
+        didDocumentMetadata: {},
+        didResolutionMetadata: {
+          error: 'internalError',
+          message: 'DID resolution failed'
+        }
+      }
     }
   }
 
@@ -243,6 +382,8 @@ export class DIDResolverService {
     let currentTxid = txid
     const visited = new Set<string>()
     const state: WocChainState = {
+      did: `did:bsv:${txid}`,
+      identityCode: undefined,
       lastDocument: null,
       lastDocTxid: undefined,
       created: undefined,
@@ -254,18 +395,34 @@ export class DIDResolverService {
       if (visited.has(currentTxid)) break
       visited.add(currentTxid)
 
-      const txResp = await fetch(`${this.wocBaseUrl}/tx/${currentTxid}`)
-      if (!txResp.ok) return notFoundResult()
-      const txData: any = await txResp.json()
+      const txResp = await this.fetchJson(`${this.wocBaseUrl}/tx/${currentTxid}`)
+      if (txResp.status !== 200) return notFoundResult()
+      const txData = snapshotPlainDataRecord(txResp.body)
+      if (txData == null || txData.txid !== currentTxid) return notFoundResult()
+      const vout = denseOwnArray(txData.vout, 'WoC transaction outputs')
+      if (hop > 0) {
+        const previousTxid = [...visited][visited.size - 2]
+        const vin = denseOwnArray(txData.vin, 'WoC transaction inputs')
+        if (
+          !vin.some(value => {
+            const input = snapshotPlainDataRecord(value)
+            return input?.txid === previousTxid && input.vout === 0
+          })
+        ) {
+          return notFoundResult()
+        }
+      }
 
-      state.created ??= txData.time == null ? undefined : new Date(txData.time * 1000).toISOString()
+      state.created ??=
+        typeof txData.time === 'number' && Number.isFinite(txData.time)
+          ? new Date(txData.time * 1000).toISOString()
+          : undefined
 
-      const segments = extractBsvdidSegments((txData.vout as any[] | null) ?? [])
+      const segments = extractBsvdidSegments(vout)
       const earlyExit = processWocSegments(segments, txData, currentTxid, state)
       if (earlyExit != null) return earlyExit
 
-      let nextTxid = await fetchNextTxidViaSpend(this.wocBaseUrl, currentTxid)
-      nextTxid ??= await fetchNextTxidViaHistory(this.wocBaseUrl, txData, visited)
+      const nextTxid = await fetchNextTxidViaSpend(this.wocBaseUrl, currentTxid, this.fetchJson)
       if (nextTxid == null) break
       currentTxid = nextTxid
     }
@@ -301,14 +458,14 @@ export function createDIDResolverHandler(
           status = 502
         }
         return jsonResponse(result, status)
-      } catch (error) {
+      } catch {
         return jsonResponse(
           {
             didDocument: null,
             didDocumentMetadata: {},
             didResolutionMetadata: {
               error: 'internalError',
-              message: `Resolution failed: ${(error as Error).message}`
+              message: 'DID resolution failed'
             }
           },
           502

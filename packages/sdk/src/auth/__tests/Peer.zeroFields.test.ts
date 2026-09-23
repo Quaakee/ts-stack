@@ -54,7 +54,7 @@ class SerializedSessionStore implements AsyncSessionManager {
 
   private copy(session: PeerSession): PeerSession {
     const stored: PeerSession = JSON.parse(JSON.stringify(session))
-    if (this.dropSnapshot) delete stored.requestedCertificates
+    if (this.dropSnapshot) delete stored.certificatePolicy
     return stored
   }
 
@@ -77,6 +77,14 @@ class SerializedSessionStore implements AsyncSessionManager {
 
   async hasSession(identifier: string): Promise<boolean> {
     return this.sessions.hasSession(identifier)
+  }
+
+  async claimMessageNonce(sessionNonce: string, messageNonce: string): Promise<boolean> {
+    return this.sessions.claimMessageNonce(sessionNonce, messageNonce)
+  }
+
+  async claimInitialRequestNonce(identityKey: string, initialNonce: string): Promise<boolean> {
+    return this.sessions.claimInitialRequestNonce(identityKey, initialNonce)
   }
 }
 
@@ -213,7 +221,7 @@ describe('Peer zero-field certificate exchange', () => {
     expect(f.decrypt).not.toHaveBeenCalled()
   })
 
-  it('captures custom JSON serialization once and validates the exact transmitted request', async () => {
+  it('transmits and validates the construction-time snapshot, ignoring later custom serialization', async () => {
     const f = await peers()
     const toJSON = jest.fn(() => ({
       certifiers: [f.master.certifier],
@@ -221,19 +229,24 @@ describe('Peer zero-field certificate exchange', () => {
     }))
     Reflect.set(f.requested, 'toJSON', toJSON)
     const handshake = f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
-    await f.holderTransport.deliver(await f.verifierTransport.next())
+    const request = await f.verifierTransport.next()
+    expect(request.requestedCertificates).toEqual({
+      certifiers: [f.master.certifier],
+      types: { [f.master.type]: [] }
+    })
+    await f.holderTransport.deliver(request)
     await f.verifierTransport.deliver(await f.holderTransport.next())
     await expect(handshake).resolves.toMatchObject({ certificatesValidated: true })
-    expect(toJSON).toHaveBeenCalledTimes(1)
+    expect(toJSON).not.toHaveBeenCalled()
     expect(f.proveCertificate).toHaveBeenCalledWith(
       {
         certificate: f.master,
-        fieldsToReveal: ['name'],
+        fieldsToReveal: [],
         verifier: f.verifierIdentity
       },
       undefined
     )
-    expect(f.decrypt).toHaveBeenCalledTimes(1)
+    expect(f.decrypt).not.toHaveBeenCalled()
   })
 
   it('preserves the request snapshot through an asynchronous serialized session store', async () => {
@@ -243,7 +256,7 @@ describe('Peer zero-field certificate exchange', () => {
     await f.verifierTransport.deliver(await f.holderTransport.next())
     await expect(handshake).resolves.toMatchObject({
       certificatesValidated: true,
-      requestedCertificates: f.requested
+      certificatePolicy: f.requested
     })
     expect(f.certificatesReceived).toHaveBeenCalledTimes(1)
     expect(f.decrypt).not.toHaveBeenCalled()
@@ -270,7 +283,7 @@ describe('Peer zero-field certificate exchange', () => {
     const response = await f.holderTransport.next()
     const session = f.verifierPeer.sessionManager.getSession(response.yourNonce ?? '')
     if (session === undefined) throw new Error('Expected a session')
-    delete session.requestedCertificates
+    delete session.certificatePolicy
     await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
     expect(f.certificatesReceived).not.toHaveBeenCalled()
   })
@@ -347,7 +360,7 @@ describe('Peer zero-field certificate exchange', () => {
     })
     response.signature = signature
     await expect(f.verifierTransport.deliver(response)).rejects.toThrow(
-      'Wrong peer'
+      'does not match the requested peer identity'
     )
     expect(f.certificatesReceived).not.toHaveBeenCalled()
     expect(f.decrypt).not.toHaveBeenCalled()
@@ -364,6 +377,10 @@ describe('Peer zero-field certificate exchange', () => {
       f.certificatesReceived.mockClear()
       // A new nonempty request cannot be downgraded by the holder's unsigned
       // requestedCertificates member on a separately signed certificateResponse.
+      // The holder handles the signed request itself, which authenticates the
+      // responder-side session, so the standalone response under test is exactly
+      // the zero-field proof rather than an automatic nonempty disclosure.
+      f.holderPeer.listenForCertificatesRequested(jest.fn())
       await f.verifierPeer.requestCertificates(
         {
           certifiers: [f.master.certifier],
@@ -371,15 +388,20 @@ describe('Peer zero-field certificate exchange', () => {
         },
         f.holderIdentity
       )
-      await f.verifierTransport.next()
+      await f.holderTransport.deliver(await f.verifierTransport.next())
       await f.holderPeer.sendCertificateResponse(f.verifierIdentity, [
         VerifiableCertificate.fromCertificate(f.master, {})
       ])
       const response = await f.holderTransport.next()
       if (senderAuthority) response.requestedCertificates = f.requested
-      await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
-      // Replaying the same standalone response cannot reach the new acceptance path.
-      await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
+      await expect(f.verifierTransport.deliver(response)).rejects.toThrow(
+        'do not match a locally requested set'
+      )
+      // Replaying the same standalone response is refused as a consumed nonce and
+      // cannot reach any acceptance path.
+      await expect(f.verifierTransport.deliver(response)).rejects.toThrow(
+        'Replayed certificateResponse'
+      )
       expect(f.certificatesReceived).not.toHaveBeenCalled()
       expect(f.decrypt).not.toHaveBeenCalled()
     }

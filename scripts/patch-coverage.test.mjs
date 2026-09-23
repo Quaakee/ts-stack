@@ -5,7 +5,10 @@ import {
   changedLinesFromDiff,
   evaluatePatchCoverage,
   hasRuntimeChange,
-  mergeLcov
+  isStaticMarkdownModule,
+  omitStaticMarkdownModules,
+  mergeLcov,
+  runtimeComparisonAvailable
 } from './patch-coverage.mjs'
 
 test('patch coverage intersects changed production lines with merged LCOV line and branch data', () => {
@@ -99,6 +102,9 @@ diff --git a/packages/helpers/example/vitest.config.ts b/packages/helpers/exampl
 diff --git a/packages/sdk/benchmarks/example.js b/packages/sdk/benchmarks/example.js
 +++ b/packages/sdk/benchmarks/example.js
 @@ -0,0 +1,12 @@
+diff --git a/packages/verifast/bench/crypto-benchmark.ts b/packages/verifast/bench/crypto-benchmark.ts
++++ b/packages/verifast/bench/crypto-benchmark.ts
+@@ -0,0 +1,12 @@
 diff --git a/packages/sdk/scripts/run-benchmarks.js b/packages/sdk/scripts/run-benchmarks.js
 +++ b/packages/sdk/scripts/run-benchmarks.js
 @@ -0,0 +1,12 @@
@@ -169,32 +175,78 @@ diff --git a/packages/overlays/topics/src/index.ts b/packages/overlays/topics/sr
 diff --git a/packages/overlays/topics/src/uoradpp/types.ts b/packages/overlays/topics/src/uoradpp/types.ts
 +++ b/packages/overlays/topics/src/uoradpp/types.ts
 @@ -0,0 +1,58 @@
+diff --git a/packages/helpers/example/src/executable.md.ts b/packages/helpers/example/src/executable.md.ts
++++ b/packages/helpers/example/src/executable.md.ts
+@@ -0,0 +1,2 @@
 diff --git a/packages/helpers/create-bsv-app/src/index.ts b/packages/helpers/create-bsv-app/src/index.ts
 +++ b/packages/helpers/create-bsv-app/src/index.ts
 @@ -0,0 +1,40 @@
 `)
 
-  // The last one is the point of this test. `create-bsv-app`'s entry point is a
-  // CLI that reads `process.argv` and branches on it, so excluding barrels by
-  // the name `index.ts` rather than by path would drop real code out of this
-  // gate without anybody noticing.
-  assert.deepEqual([...changed.keys()], ['packages/helpers/create-bsv-app/src/index.ts'])
+  omitStaticMarkdownModules(changed, file => {
+    if (file.endsWith('UoraDppTopicDocs.md.ts')) {
+      return '/** Static documentation. */\nexport default `Topic documentation`\n'
+    }
+    if (file.endsWith('generalGuide.md.ts')) return 'export default `General guide`\n'
+    return 'export default `${runExecutableCode()}`\n'
+  })
+
+  // The last two are the point of this test. A new `*.md.ts` module can contain
+  // executable code, and `create-bsv-app`'s entry point is a CLI that reads
+  // `process.argv` and branches on it. Broad name-based exemptions would drop
+  // real code out of this gate without anybody noticing.
+  assert.deepEqual(
+    [...changed.keys()],
+    [
+      'packages/helpers/example/src/executable.md.ts',
+      'packages/helpers/create-bsv-app/src/index.ts'
+    ]
+  )
+})
+
+test('static Markdown detection fails closed on imports, interpolation, and extra statements', () => {
+  assert.equal(
+    isStaticMarkdownModule('/** Documentation. */\nexport default `Static \\`Markdown\\``\n'),
+    true
+  )
+  assert.equal(isStaticMarkdownModule('import "./side-effect.js"\nexport default `Docs`'), false)
+  assert.equal(isStaticMarkdownModule('export default `Value: ${runtimeValue}`'), false)
+  assert.equal(isStaticMarkdownModule('export default `Docs`\nstartService()'), false)
+  assert.equal(isStaticMarkdownModule('export const docs = `Docs`'), false)
 })
 
 test('patch coverage compares emitted code for type-only edits without hiding runtime changes', () => {
+  // The pre-install repository health job has no esbuild installed, so the
+  // comparison fails closed there and these type-only edits report as
+  // runtime changes (true) instead of being recognized as type-only (false).
+  const typeOnlyEdit = !runtimeComparisonAvailable()
   assert.equal(
     hasRuntimeChange(
       "export { Relay } from './Relay.js'; export type { First } from './types.js'",
       "export { Relay } from './Relay.js'; export type { First, Second } from './types.js'"
     ),
-    false
+    typeOnlyEdit
   )
   assert.equal(
     hasRuntimeChange(
       'interface Options { first: string }; export {}',
       'interface Options { first: string; second?: number }; export {}'
     ),
-    false
+    typeOnlyEdit
+  )
+  assert.equal(
+    hasRuntimeChange(
+      "import { Value } from './types.js'; interface Options { value: Value }; export {}",
+      "import type { Value } from './types.js'; interface Options { value: Value }; export {}"
+    ),
+    typeOnlyEdit
+  )
+  assert.equal(
+    hasRuntimeChange(
+      '/** Before. */ interface Options { first: string }; export {}',
+      '/** After. */ interface Options { first: string }; export {}'
+    ),
+    typeOnlyEdit
   )
   assert.equal(hasRuntimeChange("export const value = 'a b'", "export const value = 'ab'"), true)
   assert.equal(

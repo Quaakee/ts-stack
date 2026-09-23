@@ -3,8 +3,8 @@ id: service-operations
 title: 'Service Operations Contract'
 kind: reference
 version: '2.0.0'
-last_updated: '2026-08-12'
-last_verified: '2026-08-12'
+last_updated: '2026-09-21'
+last_verified: '2026-09-21'
 review_cadence_days: 30
 status: stable
 tags: [reference, infrastructure, operations, observability, slo, recovery]
@@ -42,13 +42,13 @@ critical-journey monitoring.
 
 ## Observability contract
 
-Each standalone service retains a self-contained bootstrap because infrastructure build contexts cannot safely depend on an unpublished shared runtime package. CI enforces one behavioral and dependency contract across those bootstraps.
+Each standalone service retains a self-contained bootstrap because infrastructure build contexts cannot safely depend on an unpublished shared runtime package. CI enforces one behavioral and dependency contract across those bootstraps. Without a collector endpoint, telemetry is disabled by default; OTEL_CONSOLE_EXPORTERS=true explicitly enables local diagnostics. Application logging remains active, and console calls are bridged only in OTLP mode.
 
-Every service preloads telemetry before application imports and emits
+Every service preloads telemetry before application imports and supports
 traces, metrics, logs, runtime-metrics. Structured logs use
 `service`, `env`, `operation`, `outcome`, `duration_ms`, `err` and correlate through
 `trace_id`, `span_id`. Every environment
-example documents `DEPLOY_ENV`, `LOG_LEVEL`, `OTEL_DIAG`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`;
+example documents `DEPLOY_ENV`, `LOG_LEVEL`, `OTEL_CONSOLE_EXPORTERS`, `OTEL_DIAG`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`;
 `OTEL_EXPORTER_OTLP_HEADERS` is secret-bearing.
 
 | Dependency                                    | Aligned direct range |
@@ -153,12 +153,12 @@ Incident handling follows this evidence-preserving sequence:
 - authenticated WebSocket handshakes or delivery failures spike
 - database serialization retries are sustained or exhaust their bounded retry budget
 - wallet storage, database, or Firebase dependency failures consume error budget
-- State: Knex database plus optional Firebase device registrations.
-- Migration/startup: Migrations complete before listen; back up and verify the target schema first.
-- Backup/restore: Use the selected database engine's consistent snapshot and restore procedure.
-- RPO starting point: 15 minutes for messages and permissions; device registrations follow the same backup boundary when enabled.
-- RTO starting point: 4 hours from a verified database backup and wallet configuration.
-- Restore validation: Verify migration state, authenticated list/send/acknowledge, duplicate handling, and optional push delivery.
+- State: Knex database including message, permission, replay-claim, resource-lock, and exact-request payment-intent state, plus optional Firebase device registrations.
+- Migration/startup: Migrations complete before listen; back up and verify the target schema first. The 2026-09-21 payment-intent migration changes the paid-send recovery contract and must be present before the new code accepts legacy server-delivery payments. Do not run mixed-version replicas or perform an image-only rollback after paid-send traffic; prefer roll-forward. Payment-intent rows are durable idempotency and recovery evidence and must not be pruned independently of the corresponding payment replay and message retention records.
+- Backup/restore: Use consistent database snapshots plus continuous point-in-time/binlog retention and independently retained wallet transaction and audit evidence spanning each snapshot through the present. A snapshot alone is insufficient once a paid-send wallet mutation may have occurred.
+- RPO starting point: 15 minutes for ordinary messages, permissions, and optional device registrations. Paid-send replay claims and payment intents require zero silent loss: reconstruct every post-snapshot row from point-in-time database logs and independent wallet/audit evidence, or keep paid sends disabled while the unresolved recovery window is reconciled.
+- RTO starting point: 4 hours from verified database and wallet evidence, after paid-send reconciliation is complete or paid sends remain disabled.
+- Restore validation: Before enabling paid sends, reconstruct and reconcile every post-snapshot wallet action, replay claim, and prepared, wallet_accepted, or completed intent; prove exact-request recovery without repeat wallet mutation. Then verify migration state, authenticated list/send/acknowledge, duplicate handling, and optional push delivery.
 - Lifecycle status: **implemented** — SIGTERM/SIGINT disconnect authenticated WebSockets, drain HTTP, close Knex, and flush telemetry. The standalone compatibility adapter uses only the published AuthSocket public socket surface and automatically delegates to AuthSocketServer.close() when that API is available.
 - Scaling: Multiple replicas require shared BRC-103 sessions, database-backed rate limits, and a verified WebSocket routing strategy.
 - Disruption: Preserve at least one ready replica only after shared session and WebSocket behavior is proven.
@@ -185,11 +185,11 @@ Incident handling follows this evidence-preserving sequence:
 - unproven rows age beyond policy or maintenance repeatedly fails
 - BASM tip, reorg stream, or GASP synchronization becomes stale
 - State: Knex transaction state and MongoDB lookup-service state.
-- Migration/startup: Overlay migrations complete before listen; preserve both stores as one release boundary.
-- Backup/restore: Take coordinated MySQL and MongoDB backups before schema or image changes.
-- RPO starting point: 15 minutes across a coordinated SQL and MongoDB backup boundary.
+- Migration/startup: Stop writes and complete every Overlay migration before listen. Before the 2026-09-17 topical-uniqueness migration, preflight exact duplicate output keys (txid, outputIndex, topic) and applied-transaction keys (txid, topic); reconcile each duplicate from transaction, topic, and lookup evidence rather than auto-deleting security state. Apply that migration before the additive 2026-09-20 spentBy migration, then verify the constraints and column before restoring writes. Preserve both stores and the spent/spentBy relationship as one release boundary. Prefer roll-forward: an old image does not know these migration names, so a bare prior-digest rollback can fail migration-list validation. To restore an old image, stop writes and either use the new migration source to reverse spentBy and topical uniqueness in reverse order after exporting and reconciling all spend evidence, or restore coordinated pre-migration MySQL and MongoDB backups.
+- Backup/restore: Take a coordinated, restorable MySQL and MongoDB backup before schema or image changes, with point-in-time logs or equivalent evidence spanning the maintenance window. Retain output spent and spentBy values together so recovery or rollback cannot erase which transaction consumed an output.
+- RPO starting point: 15 minutes across a coordinated SQL and MongoDB backup boundary, provided output spent/spentBy evidence remains mutually consistent; keep writes disabled while any recovery gap is reconciled.
 - RTO starting point: 4 hours from mutually consistent backups and verified provider configuration.
-- Restore validation: Verify schema versions, topic and lookup counts, submit/lookup, provider callbacks, GASP/BASM anchors, and readiness.
+- Restore validation: Verify schema versions, the topical unique constraints, absence of exact duplicate output and applied-transaction keys, and consistent spent/spentBy evidence before enabling writes. Then verify topic and lookup counts, submit/lookup, provider callbacks, GASP/BASM anchors, and readiness.
 - Lifecycle status: **implemented** — SIGTERM/SIGINT idempotently stop synchronization and maintenance work, drain HTTP, close Knex and MongoDB, and flush telemetry. The standalone compatibility adapter delegates to OverlayExpress.close() when available without requiring an unpublished dependency.
 - Scaling: Background GASP/BASM/maintenance ownership and BRC-103 sessions must be coordinated before adding replicas.
 - Disruption: Operate as a singleton unless leader election and shared sessions are proven; record a maintenance window for voluntary disruption.
@@ -281,11 +281,11 @@ Incident handling follows this evidence-preserving sequence:
 - share encryption, retrieval, or deletion failures repeat
 - database migration or pool failures consume error budget
 - State: Authentication, identity-link, pending-registration, UMP-pin, phone-change authorization/history, share, deletion-intent, and faucet database tables.
-- Migration/startup: Migrations complete before listen. The pending-registration column and presentation-key vault columns are additive. Roll out the new registration routes before relying on interrupted-signup recovery; use legacy then dual-write vault mode and perform an explicit encrypted cutover only after old replicas are drained and reconciliation succeeds.
-- Backup/restore: Take an encrypted database snapshot, retain the presentation-key vault key separately, and test identity/share and presentation-key recovery without logging secrets.
-- RPO starting point: 15 minutes for authentication and encrypted share state.
+- Migration/startup: Migrations complete before listen. The pending-registration column and presentation-key vault columns are additive. Roll out the new registration routes before relying on interrupted-signup recovery; use legacy then dual-write vault mode and perform an explicit encrypted cutover only after old replicas are drained and reconciliation succeeds. The faucet-claim backfill is not mixed-version compatible: block traffic, drain and stop every old replica, take a restorable backup, apply the migration with one new replica, then deploy only the new image before restoring traffic. Never run an old image against the migrated database; roll forward or restore the old image and pre-migration database together while stopped.
+- Backup/restore: Take an encrypted database snapshot, retain the presentation-key vault key separately, and retain point-in-time database logs plus wallet/audit evidence sufficient to reconstruct every faucet claim and payment after the snapshot without logging secrets.
+- RPO starting point: 15 minutes for authentication and encrypted share state; zero silent loss for faucet claims and payments, because every post-snapshot wallet action must be replayed from point-in-time logs or reconciled before faucet traffic resumes.
 - RTO starting point: 4 hours from a verified encrypted backup and independently retained encryption keys.
-- Restore validation: Verify migration and vault reconciliation state, legacy-client authentication completion, interrupted registration resumption/finalization, UMP pin fallback, phone takeover/restore, share round-trip, identity links, deletion, rate limits, and audit-safe logs.
+- Restore validation: Keep faucet traffic disabled while verifying migration and vault reconciliation state. Correlate every wallet action after the restored snapshot with its payment row and authentication identities, reconstruct the payment and receivedFaucet markers, or conservatively mark every plausible identity before re-enabling the faucet. Then verify legacy-client authentication completion, interrupted registration resumption/finalization, UMP pin fallback, phone takeover/restore, share round-trip, identity links, deletion, rate limits, and audit-safe logs.
 - Lifecycle status: **implemented** — SIGTERM/SIGINT drain HTTP, close Knex, and flush telemetry.
 - Scaling: Multiple replicas require shared rate limits and any authentication challenge/session state to remain database-backed.
 - Disruption: Preserve at least one ready replica after shared abuse-control state is verified.

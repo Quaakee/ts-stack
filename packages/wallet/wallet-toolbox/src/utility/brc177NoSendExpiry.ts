@@ -1,4 +1,4 @@
-import { Validation } from '@bsv/sdk'
+import { type ValidCreateActionArgs } from '@bsv/sdk/wallet/validationHelpers'
 import { WERR_INVALID_PARAMETER } from '../sdk/WERR_errors'
 
 export const BRC177_NO_SEND_EXPIRY_PREFIX = 'p nosend expiry '
@@ -74,7 +74,7 @@ export interface Brc177ProtectedCreateActionMetadata {
 
 export type Brc177CreateActionMetadata = Brc177FundingCreateActionMetadata | Brc177ProtectedCreateActionMetadata
 
-export type Brc177ValidCreateActionArgs = Validation.ValidCreateActionArgs & {
+export type Brc177ValidCreateActionArgs = ValidCreateActionArgs & {
   brc177?: Brc177CreateActionMetadata
 }
 

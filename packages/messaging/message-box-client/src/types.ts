@@ -1,4 +1,6 @@
-import {
+import type LockingScript from '@bsv/sdk/script/LockingScript'
+import type { LookupNetworkPreset } from '@bsv/sdk/overlay-tools/LookupResolver'
+import type {
   AtomicBEEF,
   Base64String,
   BasketStringUnder300Bytes,
@@ -7,13 +9,11 @@ import {
   DescriptionString5to50Bytes,
   HexString,
   LabelStringUnder300Bytes,
-  LockingScript,
   OutputTagStringUnder300Bytes,
   PositiveIntegerOrZero,
   PubKeyHex,
-  WalletInterface,
-  type LookupNetworkPreset
-} from '@bsv/sdk'
+  WalletInterface
+} from '@bsv/sdk/wallet/Wallet.interfaces'
 import type { AuthSocketClientOptions } from '@bsv/authsocket-client'
 
 /**
@@ -54,6 +54,15 @@ export interface MessageBoxClientOptions {
    * @default 'https://message-box-us-1.bsvb.tech' for mainnet and testnet
    */
   host?: string
+
+  /**
+   * Optional BRC-103 server identity pins keyed by Message Box base URL.
+   * Keys are normalized to their URL origin, so route-prefixed URLs on the
+   * same origin must name the same identity. When omitted, the first mutually
+   * authenticated identity observed for each origin is authoritative for this
+   * client instance; later identity changes fail closed.
+   */
+  serverIdentityKeysByHost?: Readonly<Record<string, PubKeyHex>>
 
   /**
    * If true, enables detailed logging to the console.
@@ -121,6 +130,8 @@ export interface SendMessageParams {
   skipEncryption?: boolean
   /** Optional: Enable permission and fee checking (default: false for backwards compatibility) */
   checkPermissions?: boolean
+  /** Optional caller-enforced ceiling for an automatically created permission payment. */
+  maximumPayment?: PositiveIntegerOrZero
 }
 
 /**
@@ -131,6 +142,8 @@ export interface SendMessageParams {
 export interface SendMessageResponse {
   status: string
   messageId: string
+  /** Optional bounded informational message returned by the server. */
+  message?: string
 }
 
 /**
@@ -155,6 +168,8 @@ export interface AcknowledgeMessageParams {
 export interface ListMessagesParams {
   messageBox: string
   host?: string
+  /** Optional exact message identifier for a bounded indexed lookup. */
+  messageId?: string
   acceptPayments?: boolean
   /** Starting message offset. `skip` is an equivalent compatibility alias. */
   offset?: number
@@ -299,6 +314,10 @@ export type PaymentRequestMessage = PaymentRequestNew | PaymentRequestCancellati
  * Carried in the 'payment_request_responses' message box.
  */
 export interface PaymentRequestResponse {
+  /** Authenticated envelope message ID. Present on list/live receive results, absent on send bodies. */
+  messageId?: string
+  /** Authenticated envelope sender. Present on list/live receive results, absent on send bodies. */
+  sender?: string
   /** The requestId of the original PaymentRequestMessage this responds to. */
   requestId: string
   /** Status of the response. */

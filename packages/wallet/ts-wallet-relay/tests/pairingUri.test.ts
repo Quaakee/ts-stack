@@ -103,6 +103,15 @@ describe('parsePairingUri validation', () => {
     expect(result.error).toBeTruthy()
   })
 
+  it('rejects duplicate security fields and non-pair deep-link routes', () => {
+    const base = buildPairingUri(VALID_BUILD_PARAMS)
+    expect(parsePairingUri(`${base}&origin=https%3A%2F%2Fevil.example`).error).toMatch(/duplicate/)
+    expect(parsePairingUri(base.replace('://pair?', '://other/pair?')).error).toMatch(
+      /exact wallet.*route/
+    )
+    expect(parsePairingUri(`${base}#fragment`).error).toMatch(/exact wallet.*route/)
+  })
+
   it('rejects an expired QR code', () => {
     const p = new URLSearchParams({
       topic: 'x',
@@ -140,7 +149,12 @@ describe('parsePairingUri validation', () => {
   })
 
   it('rejects remote HTTP origins but allows loopback development origins', () => {
-    const remote = buildPairingUri({ ...VALID_BUILD_PARAMS, origin: 'http://app.example.com' })
+    expect(() =>
+      buildPairingUri({ ...VALID_BUILD_PARAMS, origin: 'http://app.example.com' })
+    ).toThrow(/HTTPS/)
+    const remoteUrl = new URL(buildPairingUri(VALID_BUILD_PARAMS))
+    remoteUrl.searchParams.set('origin', 'http://app.example.com')
+    const remote = remoteUrl.toString()
     expect(parsePairingUri(remote).error).toMatch(/HTTPS/)
 
     for (const origin of ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000']) {

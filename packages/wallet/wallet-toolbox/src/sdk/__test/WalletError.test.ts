@@ -63,6 +63,61 @@ describe('WalletError tests', () => {
     }
   })
 
+  test('snapshots bounded review results without invoking accessors', () => {
+    const source = {
+      name: 'WERR_REVIEW_ACTIONS',
+      reviewActionResults: [
+        {
+          txid: 'txid123',
+          status: 'doubleSpend',
+          competingTxs: ['txid456'],
+          competingBeef: [0, 1, 2]
+        }
+      ],
+      sendWithResults: [{ txid: 'txid123', status: 'failed' }],
+      tx: [3, 4],
+      noSendChange: ['00'.repeat(32) + '.0']
+    }
+    const recovered = WalletErrorFromJson(source) as WERR_REVIEW_ACTIONS
+
+    source.reviewActionResults[0].competingTxs[0] = 'substituted'
+    source.reviewActionResults[0].competingBeef[0] = 255
+    source.sendWithResults[0].status = 'sending'
+    source.tx[0] = 255
+    source.noSendChange[0] = 'substituted.0'
+
+    expect(recovered.reviewActionResults).toEqual([
+      {
+        txid: 'txid123',
+        status: 'doubleSpend',
+        competingTxs: ['txid456'],
+        competingBeef: [0, 1, 2]
+      }
+    ])
+    expect(recovered.sendWithResults).toEqual([{ txid: 'txid123', status: 'failed' }])
+    expect(recovered.tx).toEqual([3, 4])
+    expect(recovered.noSendChange).toEqual(['00'.repeat(32) + '.0'])
+
+    const accessor = Object.defineProperty({}, 'name', {
+      enumerable: true,
+      get: () => {
+        throw new Error('accessor invoked')
+      }
+    })
+    expect(() => WalletErrorFromJson(accessor)).toThrow('Invalid remote wallet error envelope')
+
+    expect(() =>
+      WalletErrorFromJson({
+        name: 'WERR_REVIEW_ACTIONS',
+        reviewActionResults: Array.from({ length: 1002 }, () => ({
+          txid: 'txid123',
+          status: 'success'
+        })),
+        sendWithResults: []
+      })
+    ).toThrow('Invalid remote wallet error reviewActionResults')
+  })
+
   test('action batch lifecycle state survives JSON transport', () => {
     const werr = new WERR_ACTION_BATCH_STATE('expired', 'batch-123')
     const recovered = WalletErrorFromJson(JSON.parse(WalletError.unknownToJson(werr)))

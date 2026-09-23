@@ -15,7 +15,10 @@ describe('MandalaStorageManager', () => {
     await client.connect()
     db = client.db('mandala_test')
   })
-  afterAll(async () => { await client.close(); await mongo.stop() })
+  afterAll(async () => {
+    await client.close()
+    await mongo.stop()
+  })
   beforeEach(async () => {
     await db.dropDatabase()
     store = new MandalaStorageManager(db)
@@ -23,7 +26,14 @@ describe('MandalaStorageManager', () => {
 
   it('stores and finds tokens by assetId and outpoint', async () => {
     const now = new Date()
-    await store.storeToken({ txid: 'aa', outputIndex: 0, assetId: 'x.0', amount: 5, identityKey: '02cc', createdAt: now })
+    await store.storeToken({
+      txid: 'aa',
+      outputIndex: 0,
+      assetId: 'x.0',
+      amount: 5,
+      identityKey: '02cc',
+      createdAt: now
+    })
     expect(await store.findByAssetId('x.0')).toEqual([{ txid: 'aa', outputIndex: 0 }])
     expect(await store.findByOutpoint('aa', 0)).toEqual([{ txid: 'aa', outputIndex: 0 }])
     expect(await store.findByAssetId('y.0')).toEqual([])
@@ -33,15 +43,62 @@ describe('MandalaStorageManager', () => {
     await store.adjustBalance('02cc', 5)
     await store.adjustBalance('02cc', -2)
     expect(await store.getBalance('02cc')).toBe(3)
-    await store.storeToken({ txid: 'aa', outputIndex: 0, assetId: 'x.0', amount: 5, identityKey: '02cc', createdAt: new Date() })
+    await store.storeToken({
+      txid: 'aa',
+      outputIndex: 0,
+      assetId: 'x.0',
+      amount: 5,
+      identityKey: '02cc',
+      createdAt: new Date()
+    })
     await store.deleteToken('aa', 0)
     expect(await store.findByOutpoint('aa', 0)).toEqual([])
   })
 
+  it('stores a token once and rejects conflicting replay metadata', async () => {
+    const record = {
+      txid: 'aa',
+      outputIndex: 0,
+      assetId: 'x.0',
+      amount: 5,
+      identityKey: '02cc',
+      createdAt: new Date()
+    }
+    await expect(store.storeTokenIfAbsent(record)).resolves.toBe(true)
+    await expect(store.storeTokenIfAbsent({ ...record, createdAt: new Date() })).resolves.toBe(
+      false
+    )
+    await expect(store.storeTokenIfAbsent({ ...record, amount: 6 })).rejects.toThrow('Conflicting')
+  })
+
+  it('filters legacy uppercase eviction records case-insensitively', async () => {
+    await store.storeToken({
+      txid: 'aa',
+      outputIndex: 0,
+      assetId: 'x.0',
+      amount: 5,
+      identityKey: '02cc',
+      createdAt: new Date()
+    })
+    await store.putAssetState({ ...defaultAssetState('x.0'), evictedOutpoints: ['AA.0'] })
+    expect(await store.findByAssetId('x.0')).toEqual([])
+  })
+
   it('retains linkage records (no TTL index on linkageRecords)', async () => {
     await store.storeLinkage({
-      txid: 'aa', outputIndex: 0, identityKey: '02cc',
-      linkage: { prover: '02aa', verifier: '02bb', counterparty: '02cc', protocolID: [2, 'mandala token'], keyID: 'k', encryptedLinkage: [1], encryptedLinkageProof: [0], proofType: 0 },
+      txid: 'aa',
+      outputIndex: 0,
+      identityKey: '02cc',
+      linkage: {
+        prover: '02aa',
+        verifier: '02bb',
+        counterparty: '02cc',
+        protocolID: [2, 'mandala token'],
+        keyID: 'k',
+        encryptedLinkage: [1],
+        encryptedLinkageProof: [0],
+        proofType: 0
+      },
       createdAt: new Date()
     })
     const indexes = await db.collection('mandalaLinkageRecords').indexes()
@@ -60,8 +117,13 @@ describe('MandalaStorageManager admin state + history', () => {
     await client.connect()
     db = client.db('mandala_admin_test')
   })
-  afterAll(async () => { await client.close(); await mongo.stop() })
-  beforeEach(async () => { await db.dropDatabase() })
+  afterAll(async () => {
+    await client.close()
+    await mongo.stop()
+  })
+  beforeEach(async () => {
+    await db.dropDatabase()
+  })
 
   it('getAssetState returns defaults when absent, then round-trips putAssetState', async () => {
     const mgr = new MandalaStorageManager(db) // db from the existing harness
@@ -69,6 +131,33 @@ describe('MandalaStorageManager admin state + history', () => {
     const next = { ...defaultAssetState('x.0'), isPaused: true, blockedIdentities: ['02aa'] }
     await mgr.putAssetState(next)
     expect(await mgr.getAssetState('x.0')).toEqual(next)
+  })
+
+  it('confirms only the exact asset and admin-history outpoint', async () => {
+    const mgr = new MandalaStorageManager(db)
+    await mgr.appendAdminHistory({
+      assetId: 'a.0',
+      txid: 'admin',
+      outputIndex: 1,
+      actionDetails: { kind: 'pause', assetId: 'a.0' },
+      height: 1,
+      offset: 0,
+      admitSeq: 1,
+      createdAt: new Date()
+    })
+    expect(await mgr.isAdminOutpoint('a.0', 'admin', 1)).toBe(true)
+    expect(await mgr.isAdminOutpoint('b.0', 'admin', 1)).toBe(false)
+    expect(await mgr.isAdminOutpoint('a.0', 'other', 1)).toBe(false)
+    expect(await mgr.isAdminOutpoint('a.0', 'admin', 0)).toBe(false)
+    await mgr.storeToken({
+      txid: 'token',
+      outputIndex: 0,
+      assetId: 'a.0',
+      amount: 1,
+      identityKey: 'owner',
+      createdAt: new Date()
+    })
+    expect(await mgr.isAdminOutpoint('a.0', 'token', 0)).toBe(false)
   })
 
   it('nextAdmitSeq is monotonic', async () => {
@@ -80,10 +169,21 @@ describe('MandalaStorageManager admin state + history', () => {
 
   it('admin history is returned ordered by (height, offset, admitSeq)', async () => {
     const mgr = new MandalaStorageManager(db)
-    const base = { assetId: 'a.0', outputIndex: 1, actionDetails: { kind: 'pause' as const, assetId: 'a.0' }, createdAt: new Date() }
+    const base = {
+      assetId: 'a.0',
+      outputIndex: 1,
+      actionDetails: { kind: 'pause' as const, assetId: 'a.0' },
+      createdAt: new Date()
+    }
     await mgr.appendAdminHistory({ ...base, txid: 't3', height: 100, offset: 2, admitSeq: 5 })
     await mgr.appendAdminHistory({ ...base, txid: 't1', height: 100, offset: 1, admitSeq: 9 })
-    await mgr.appendAdminHistory({ ...base, txid: 't4', height: Number.MAX_SAFE_INTEGER, offset: 0, admitSeq: 3 })
+    await mgr.appendAdminHistory({
+      ...base,
+      txid: 't4',
+      height: Number.MAX_SAFE_INTEGER,
+      offset: 0,
+      admitSeq: 3
+    })
     await mgr.appendAdminHistory({ ...base, txid: 't2', height: 99, offset: 9, admitSeq: 1 })
     const got = (await mgr.findAdminHistoryByAssetId('a.0')).map(e => e.txid)
     expect(got).toEqual(['t2', 't1', 't3', 't4'])

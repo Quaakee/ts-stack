@@ -123,11 +123,38 @@ function registrationKey(entry) {
   return `${entry.source}\0${entry.selector}\0${stableValue(entry.value)}`
 }
 
+// Keep this early policy check dependency-free: CI runs it before installation.
+// The repository uses block lists for exclude-paths; GitHub rejects any pattern
+// containing '..', including otherwise valid parent-relative filesystem paths.
+export function validateDependabotExclusions(source) {
+  const errors = []
+  let blockIndent = null
+  for (const [index, line] of source.split('\n').entries()) {
+    const content = line.trimStart().split('#', 1)[0].trimEnd()
+    if (content.length === 0) continue
+    const indent = line.length - line.trimStart().length
+    if (content === 'exclude-paths:') {
+      blockIndent = indent
+      continue
+    }
+    if (blockIndent === null) continue
+    if (indent <= blockIndent) {
+      blockIndent = null
+      continue
+    }
+    if (content.startsWith('- ') && content.includes('..')) {
+      errors.push(`Dependabot exclude-paths line ${index + 1} must not contain '..'`)
+    }
+  }
+  return errors
+}
+
 function validateRoutinePolicy(policy, errors) {
   const dependabot = fs.readFileSync(
     path.join(ROOT, policy.routineUpdates.dependabotConfig),
     'utf8'
   )
+  errors.push(...validateDependabotExclusions(dependabot))
   const group = policy.routineUpdates.multiEcosystemGroup
   if (!dependabot.includes(`${group}:`)) errors.push(`Dependabot does not define ${group}`)
   if (!/interval:\s*monthly/.test(dependabot)) {

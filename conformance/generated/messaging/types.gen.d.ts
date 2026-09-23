@@ -60,6 +60,10 @@ export interface paths {
          *     - If a recipient has `recipientFee === -1` (blocked) the entire request
          *       fails with 403 before any DB writes.
          *
+         *     Recipients must be unique after public-key canonicalization. Duplicate
+         *     compressed/uncompressed representations are rejected before fee or
+         *     message-ID allocation.
+         *
          *     **Deduplication**  Messages with a duplicate `messageId` are silently
          *     ignored (ON CONFLICT IGNORE). If the database raises a hard duplicate-key
          *     error, a 400 is returned.
@@ -260,6 +264,10 @@ export interface paths {
          *     `blockedRecipients` fields. Blocked recipients are still returned in
          *     the list; the caller decides whether to abort or proceed with the
          *     non-blocked subset.
+         *
+         *     Persisted recipient fees are safe integers from -1 through 2147483647;
+         *     server delivery fees are safe integers from 0 through 2147483647.
+         *     Invalid persisted values fail the quote closed.
          */
         get: operations["getQuote"];
         put?: never;
@@ -345,7 +353,7 @@ export interface components {
              *     back-compat but must not be used simultaneously.
              */
             recipient?: components["schemas"]["PubKeyHex"] | components["schemas"]["PubKeyHex"][];
-            /** @description Preferred plural form. Takes precedence over `recipient` when both are present. */
+            /** @description Preferred plural form. Takes precedence over `recipient` when both are present. Compressed and uncompressed encodings of the same key count as one recipient and must not be repeated. */
             recipients?: components["schemas"]["PubKeyHex"][];
             /**
              * @description Named message box (e.g. `payment_inbox`, `notifications`).
@@ -399,8 +407,9 @@ export interface components {
         Payment: {
             tx: components["schemas"]["AtomicBEEF"];
             /**
-             * @description Output list. When a server delivery fee applies, output[0] must be the
-             *     server's delivery fee output. Subsequent outputs are recipient-side.
+             * @description Output list. When a server delivery fee applies, output[0] must pay
+             *     the per-recipient delivery fee multiplied by the number of recipients.
+             *     Subsequent outputs are recipient-side.
              */
             outputs: components["schemas"]["PaymentOutput"][];
             /** @description Human-readable description for wallet internalization. */

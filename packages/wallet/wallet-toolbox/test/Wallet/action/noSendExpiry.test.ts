@@ -1159,7 +1159,7 @@ describe('BRC-177 noSend expiry reference implementation', () => {
     await expectArmFailure((_ctx, args) => {
       const rawTx = [...asArray(args.reclaimRawTx), 0]
       return { ...args, reclaimRawTx: rawTx, reclaimTxid: Transaction.fromBinary(rawTx).id('hex') }
-    }, 'valid signature for the revocation anchor')
+    }, 'Serialized transaction contains trailing data')
     await expectArmFailure((_ctx, args) => ({ ...args, reclaimTxid: '00'.repeat(32) }), 'hash of reclaimRawTx')
     await expectArmFailure(
       (_ctx, args) => ({ ...args, reclaimSatoshis: args.reclaimSatoshis - 1 }),

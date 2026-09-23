@@ -118,7 +118,7 @@ describe('DIDClient', () => {
     await expect(
       client.findDID(
         {
-          serialNumber: 'serial',
+          serialNumber: 'c2VyaWFs',
           limit: 10,
           skip: 20,
           sortOrder: 'desc',
@@ -132,7 +132,7 @@ describe('DIDClient', () => {
     expect(query).toHaveBeenCalledWith({
       service: 'lookup_did',
       query: {
-        serialNumber: 'serial',
+        serialNumber: 'c2VyaWFs',
         limit: 10,
         skip: 20,
         sortOrder: 'desc',

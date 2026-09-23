@@ -1,9 +1,16 @@
 import { WebSocketServer, WebSocket } from 'ws'
 import type { IncomingMessage, Server } from 'node:http'
 import type { Duplex } from 'node:stream'
-import type { WireEnvelope } from '../types.js'
-import { stringifyBRC100 } from '@bsv/sdk'
+import { DESKTOP_TOKEN_PROTOCOL_PREFIX, DESKTOP_WS_PROTOCOL, type WireEnvelope } from '../types.js'
+import { stringifyBRC100 } from '@bsv/sdk/wallet/BRC100ByteEncoding'
 import { compileOriginMatcher, type AllowedOrigins } from '../shared/originMatcher.js'
+import {
+  DEFAULT_MAX_SESSIONS,
+  encodedWireSize,
+  MAX_CONFIGURED_SESSIONS,
+  MAX_WIRE_PAYLOAD_BYTES,
+  parseWireEnvelope
+} from '../shared/validation.js'
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000
 const MAX_HEARTBEAT_INTERVAL_MS = 2_147_483_647
@@ -99,6 +106,8 @@ export interface WebSocketRelayOptions {
    * resets the counter: a peer that is sending us data is alive whatever its pong timing.
    */
   maxMissedHeartbeats?: number
+  /** Maximum live/buffered topics. Default 1,000. */
+  maxTopics?: number
 }
 
 /**
@@ -131,6 +140,8 @@ export class WebSocketRelay {
   private readonly heartbeatTimer: ReturnType<typeof setInterval>
   private readonly server: Server
   private readonly path: string
+  private readonly maxTopics: number
+  private closed = false
   private readonly upgradeListener:
     ((req: IncomingMessage, socket: Duplex, head: Buffer) => void) | null = null
 
@@ -142,6 +153,14 @@ export class WebSocketRelay {
       throw new RangeError(`maxMissedHeartbeats must be an integer >= 1, got ${maxMissed}`)
     }
     this.maxMissedHeartbeats = maxMissed
+    this.maxTopics = options?.maxTopics ?? DEFAULT_MAX_SESSIONS
+    if (
+      !Number.isSafeInteger(this.maxTopics) ||
+      this.maxTopics < 1 ||
+      this.maxTopics > MAX_CONFIGURED_SESSIONS
+    ) {
+      throw new RangeError(`maxTopics must be an integer from 1 to ${MAX_CONFIGURED_SESSIONS}`)
+    }
     const interval = options?.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
     if (!Number.isInteger(interval) || interval < 1 || interval > MAX_HEARTBEAT_INTERVAL_MS) {
       throw new RangeError(
@@ -150,7 +169,19 @@ export class WebSocketRelay {
     }
     this.server = server
     this.path = options?.path ?? '/ws'
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 })
+    this.wss = new WebSocketServer({
+      noServer: true,
+      maxPayload: 64 * 1024,
+      handleProtocols: protocols => {
+        // Never echo the bearer-bearing protocol. Select the stable protocol
+        // name when offered, while preserving legacy arbitrary subprotocols.
+        if (protocols.has(DESKTOP_WS_PROTOCOL)) return DESKTOP_WS_PROTOCOL
+        if ([...protocols].some(protocol => protocol.startsWith(DESKTOP_TOKEN_PROTOCOL_PREFIX))) {
+          return false
+        }
+        return protocols.values().next().value ?? false
+      }
+    })
     this.wss.on('connection', (ws, req) => this.handleConnection(ws, req))
 
     // Default mode: claim our path only, ignore everything else so other
@@ -173,6 +204,10 @@ export class WebSocketRelay {
    * set. Does not re-check the path — the caller has already routed by path.
    */
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    if (this.closed) {
+      socket.destroy()
+      return
+    }
     this.wss.handleUpgrade(req, socket, head, ws => this.wss.emit('connection', ws, req))
   }
 
@@ -229,34 +264,70 @@ export class WebSocketRelay {
     }
   }
 
-  /** Remove a topic entry — call when its session is garbage-collected. */
+  /** Revoke a topic, close both role sockets, and discard buffered traffic. */
   removeTopic(topic: string): void {
+    const entry = this.topics.get(topic)
+    if (entry) {
+      const sockets = [entry.desktop, entry.mobile]
+      entry.desktop = null
+      entry.mobile = null
+      entry.buffer = []
+      for (const ws of sockets) {
+        if (!ws) continue
+        const state = this.socketState.get(ws)
+        if (state) state.closeCause = 'server'
+        ws.close(1008, 'Session expired')
+      }
+    }
     this.topics.delete(topic)
   }
 
   /** Push an envelope to the mobile socket (or buffer if disconnected). */
   sendToMobile(topic: string, envelope: WireEnvelope): void {
+    if (this.closed) throw new Error('WebSocket relay is closed')
+    const normalized = parseWireEnvelope(envelope, topic)
+    if (encodedWireSize(normalized) > MAX_WIRE_PAYLOAD_BYTES) {
+      throw new RangeError('Wire envelope exceeds 64 KiB')
+    }
     const entry = this.topics.get(topic)
     if (entry?.mobile?.readyState === WebSocket.OPEN) {
-      entry.mobile.send(stringifyBRC100(envelope))
+      entry.mobile.send(stringifyBRC100(normalized))
     } else {
-      this.buffer(topic, envelope)
+      this.buffer(topic, normalized)
     }
   }
 
   /** Push an envelope to the desktop socket (or buffer if disconnected). */
   sendToDesktop(topic: string, envelope: WireEnvelope): void {
+    if (this.closed) throw new Error('WebSocket relay is closed')
+    const normalized = parseWireEnvelope(envelope, topic)
+    if (encodedWireSize(normalized) > MAX_WIRE_PAYLOAD_BYTES) {
+      throw new RangeError('Wire envelope exceeds 64 KiB')
+    }
     const entry = this.topics.get(topic)
     if (entry?.desktop?.readyState === WebSocket.OPEN) {
-      entry.desktop.send(stringifyBRC100(envelope))
+      entry.desktop.send(stringifyBRC100(normalized))
     } else {
-      this.buffer(topic, envelope)
+      this.buffer(topic, normalized)
     }
   }
 
   close(): void {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    if (this.closed) return
+    this.closed = true
+    clearInterval(this.heartbeatTimer)
     if (this.upgradeListener) this.server.removeListener('upgrade', this.upgradeListener)
+    for (const entry of this.topics.values()) {
+      entry.desktop = null
+      entry.mobile = null
+      entry.buffer = []
+    }
+    this.topics.clear()
+    for (const ws of this.wss.clients) {
+      const state = this.socketState.get(ws)
+      if (state) state.closeCause = 'server'
+      ws.terminate()
+    }
     this.wss.close()
   }
 
@@ -276,7 +347,23 @@ export class WebSocketRelay {
     const url = new URL(req.url ?? '', 'http://localhost')
     const topic = url.searchParams.get('topic')
     const role = url.searchParams.get('role') as Role | null
-    const token = url.searchParams.get('token')
+    const queryToken = url.searchParams.get('token')
+    const offeredProtocols = (req.headers['sec-websocket-protocol'] ?? '')
+      .split(',')
+      .map(protocol => protocol.trim())
+      .filter(Boolean)
+    const protocolTokens = offeredProtocols
+      .filter(protocol => protocol.startsWith(DESKTOP_TOKEN_PROTOCOL_PREFIX))
+      .map(protocol => protocol.slice(DESKTOP_TOKEN_PROTOCOL_PREFIX.length))
+    const protocolToken =
+      offeredProtocols.includes(DESKTOP_WS_PROTOCOL) && protocolTokens.length === 1
+        ? protocolTokens[0]!
+        : null
+    if (protocolToken !== null && queryToken !== null && protocolToken !== queryToken) {
+      ws.close(1008, 'Conflicting desktop tokens')
+      return
+    }
+    const token = protocolToken ?? queryToken
 
     if (!topic || !role || (role !== 'desktop' && role !== 'mobile')) {
       ws.close(1008, 'Missing or invalid topic/role')
@@ -295,7 +382,7 @@ export class WebSocketRelay {
       }
     }
 
-    if (this.validateTopic && !this.validateTopic(topic)) {
+    if (!this.isTopicValid(topic)) {
       ws.close(1008, 'Unknown or expired session')
       return
     }
@@ -305,16 +392,40 @@ export class WebSocketRelay {
     if (
       role === 'desktop' &&
       this.validateDesktopToken &&
-      !this.validateDesktopToken(topic, token)
+      !this.isDesktopTokenValid(topic, token)
     ) {
       ws.close(1008, 'Invalid or missing desktop token')
       return
     }
 
-    const entry = this.getOrCreateTopic(topic)
+    let entry: TopicEntry
+    try {
+      entry = this.getOrCreateTopic(topic)
+    } catch {
+      ws.close(1013, 'Relay topic limit reached')
+      return
+    }
+    const existing = entry[role]
+    if (existing?.readyState === WebSocket.OPEN) {
+      if (role === 'mobile') {
+        ws.close(1008, 'A mobile connection is already active')
+        return
+      }
+      const existingState = this.socketState.get(existing)
+      if (existingState) existingState.closeCause = 'server'
+      existing.close(1008, 'Replaced by a newer authenticated desktop connection')
+    }
     entry[role] = ws
 
-    if (role === 'mobile') this.onMobileConnectCb?.(topic)
+    if (role === 'mobile') {
+      try {
+        this.onMobileConnectCb?.(topic)
+      } catch {
+        entry.mobile = null
+        ws.close(1011, 'Mobile connection setup failed')
+        return
+      }
+    }
 
     // Flush any messages buffered while this side was disconnected
     const now = Date.now()
@@ -339,8 +450,15 @@ export class WebSocketRelay {
     ws.on('message', data => {
       state.missedPongs = 0
       try {
-        const envelope = JSON.parse(`${data}`) as WireEnvelope
-        if (!envelope.topic || !envelope.ciphertext) return
+        // A replaced or revoked socket must lose forwarding authority
+        // immediately, without waiting for its close handshake to finish.
+        if (entry[role] !== ws) return
+        if (!this.isTopicValid(topic)) {
+          state.closeCause = 'server'
+          ws.close(1008, 'Unknown or expired session')
+          return
+        }
+        const envelope = parseWireEnvelope(JSON.parse(`${data}`), topic)
 
         // Route to the other side
         const other = role === 'mobile' ? entry.desktop : entry.mobile
@@ -374,16 +492,43 @@ export class WebSocketRelay {
       this.reportSocketClose(info)
       if (entry[role] === ws) {
         entry[role] = null
-        this.onDisconnectCb?.(topic, role, info)
+        try {
+          this.onDisconnectCb?.(topic, role, info)
+        } catch {
+          // Application callbacks must not escape the WebSocket close event.
+        }
+      }
+      if (entry.desktop === null && entry.mobile === null && entry.buffer.length === 0) {
+        this.topics.delete(topic)
       }
     })
   }
 
   private getOrCreateTopic(topic: string): TopicEntry {
+    if (this.closed) throw new Error('WebSocket relay is closed')
     if (!this.topics.has(topic)) {
+      if (this.topics.size >= this.maxTopics) throw new Error('Relay topic limit reached')
       this.topics.set(topic, { desktop: null, mobile: null, buffer: [] })
     }
     return this.topics.get(topic)!
+  }
+
+  private isTopicValid(topic: string): boolean {
+    if (!this.validateTopic) return true
+    try {
+      return this.validateTopic(topic) === true
+    } catch {
+      return false
+    }
+  }
+
+  private isDesktopTokenValid(topic: string, token: string | null): boolean {
+    if (!this.validateDesktopToken) return true
+    try {
+      return this.validateDesktopToken(topic, token) === true
+    } catch {
+      return false
+    }
   }
 
   private buffer(topic: string, envelope: WireEnvelope): void {
@@ -407,6 +552,13 @@ export class WebSocketRelay {
       }
       state.missedPongs += 1
       ws.ping()
+    }
+    const now = Date.now()
+    for (const [topic, entry] of this.topics) {
+      entry.buffer = entry.buffer.filter(message => message.expiresAt > now)
+      if (entry.desktop === null && entry.mobile === null && entry.buffer.length === 0) {
+        this.topics.delete(topic)
+      }
     }
   }
 }

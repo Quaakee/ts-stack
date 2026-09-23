@@ -93,11 +93,21 @@ async function createSessionHandler(req: AuthenticatedRequest, res: Response): P
   ) {
     return error(res, 400, 'ERR_CHIRP_SESSION', 'Invalid CHIRP retentionSeconds or logicalLength.')
   }
-  const session = await getChirpStore().createSession(identityKey, retentionSeconds, logicalLength)
-  return res.status(201).json({
-    uploadId: session.uploadId,
-    stagingExpiresAt: String(session.stagingExpiresAt)
-  })
+  try {
+    const session = await getChirpStore().createSession(identityKey, retentionSeconds, logicalLength)
+    return res.status(201).json({
+      uploadId: session.uploadId,
+      stagingExpiresAt: String(session.stagingExpiresAt)
+    })
+  } catch (cause) {
+    if (cause instanceof CHIRPError && cause.code === 'ERR_CHIRP_SESSION_QUOTA') {
+      return error(res, 429, cause.code, 'Active CHIRP upload-session limit reached.')
+    }
+    if (cause instanceof CHIRPError && cause.code === 'ERR_CHIRP_SESSION_BUSY') {
+      return error(res, 409, cause.code, 'CHIRP session allocation is busy.')
+    }
+    throw cause
+  }
 }
 
 async function headStagedObjectHandler(
@@ -153,6 +163,12 @@ async function putStagedObjectHandler(req: AuthenticatedRequest, res: Response):
     return error(res, 413, 'ERR_CHIRP_OBJECT_SIZE', 'CHIRP object exceeds the upload limit.')
   if (outcome === 'size_mismatch')
     return error(res, 400, 'ERR_CHIRP_LENGTH', 'Object length differs from Content-Length.')
+  if (outcome === 'quota_exceeded')
+    return error(res, 429, 'ERR_CHIRP_OBJECT_QUOTA', 'Upload session object limit reached.')
+  if (outcome === 'insufficient_storage')
+    return error(res, 507, 'ERR_CHIRP_STORAGE', 'Host storage reserve would be exhausted.')
+  if (outcome === 'busy')
+    return error(res, 409, 'ERR_CHIRP_UPLOAD_BUSY', 'Another object upload is in progress.')
   return error(res, 400, 'ERR_CHIRP_OBJECT_HASH', 'Object bytes do not match objectIdentifier.')
 }
 
@@ -166,7 +182,7 @@ async function commitHandler(req: AuthenticatedRequest, res: Response): Promise<
   if (uploadId == null) return error(res, 400, 'ERR_CHIRP_SESSION', 'Invalid upload session.')
   const store = getChirpStore()
   try {
-    return await store.withCommitLock(uploadId, async () => {
+    return await store.withCommitLock(uploadId, rootIdentifier, async () => {
       const session = await store.getSession(uploadId, identityKey)
       if (session == null)
         return error(res, 404, 'ERR_CHIRP_SESSION', 'Unknown or expired CHIRP upload session.')

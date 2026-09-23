@@ -2,9 +2,9 @@
 id: repository-health
 title: 'Repository Health Controls'
 kind: reference
-version: '1.4.1'
-last_updated: '2026-09-15'
-last_verified: '2026-09-15'
+version: '1.4.2'
+last_updated: '2026-09-21'
+last_verified: '2026-09-21'
 review_cadence_days: 30
 status: stable
 tags: [reference, governance, quality, security, releases]
@@ -210,7 +210,10 @@ consumer to its exact entry, byte budget, and reviewed optional-adapter
 splitting disposition. CI retains normalized Vite/esbuild module and package
 composition reports for 30 days. A budget increase is a versioned source
 change requiring composition evidence and explicit review; it cannot be hidden
-in routine dependency maintenance.
+in routine dependency maintenance. An approved increase normally leaves at
+least 10% headroom in every measured byte dimension, rounded to a stable
+one-thousand-byte or five-thousand-byte boundary; any different margin needs an
+explicit composition rationale.
 
 The workspace typecheck runs after the shared build so cross-package
 declarations resolve exactly as downstream consumers see them. It catches
