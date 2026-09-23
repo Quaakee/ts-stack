@@ -3,10 +3,10 @@ id: pkg-message-box-client
 title: '@bsv/message-box-client'
 kind: package
 domain: messaging
-version: '2.5.2'
+version: '2.5.3'
 source_repo: 'bsv-blockchain/ts-stack'
-last_updated: '2026-09-18'
-last_verified: '2026-09-18'
+last_updated: '2026-09-23'
+last_verified: '2026-09-23'
 review_cadence_days: 30
 npm: 'https://www.npmjs.com/package/@bsv/message-box-client'
 repo: 'https://github.com/bsv-blockchain/ts-stack/tree/main/packages/messaging/message-box-client'
@@ -20,6 +20,8 @@ tags: [messaging, message-box, brc-103, brc-29]
 > live WebSockets, peer payments, token settlement, permissions, quotes, and
 > push-device registration.
 
+The 2.5.3 source candidate fixes the CommonJS build (`new MessageBoxClient()` failed with `LookupResolver.default is not a constructor` under `require()`). `sendMessage()` HTTP failures now append the server's well-formed failure code, for example `Message Box send failed with HTTP 400 (ERR_DUPLICATE_MESSAGE).`; free-text server descriptions are never copied into errors. The `@bsv/sdk` peer floor is now `^2.8.0`, the first SDK release providing modules this package already required.
+
 ## Install
 
 ```bash
@@ -27,7 +29,8 @@ npm install @bsv/message-box-client @bsv/sdk
 ```
 
 `@bsv/sdk` is a required peer. Node.js 22 or newer is supported.
-Use SDK 2.4.1 or newer so BRC-29 sends accept both historical `number[]` and
+Use SDK 2.8.0 or newer; the package imports SDK validation modules first
+shipped in 2.8.0. BRC-29 sends accept both historical `number[]` and
 binary Wallet Wire `Uint8Array` transaction results. Payment receipt also
 recovers pending typed-array tokens serialized through JSON as numeric-key
 objects.
