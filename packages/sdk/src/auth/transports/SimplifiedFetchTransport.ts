@@ -310,8 +310,14 @@ export class SimplifiedFetchTransport implements Transport {
       writer.writeVarIntNum(valueBytes.length)
       writer.write(valueBytes)
     }
-    writer.writeVarIntNum(body.length)
-    if (body.length > 0) writer.write(body)
+    // BRC-104 sections 6.7.3 and 6.9 use -1 for absent or empty response
+    // bodies. Zero would not reproduce a conforming server's signed preimage.
+    if (body.length === 0) {
+      writer.writeVarIntNum(-1)
+    } else {
+      writer.writeVarIntNum(body.length)
+      writer.write(body)
+    }
     return writer.toArray()
   }
 

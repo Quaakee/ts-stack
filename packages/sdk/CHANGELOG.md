@@ -216,6 +216,11 @@ All notable changes to this project will be documented in this file. The format 
 
 ### 2.8.0 candidate — authenticated boundaries and additive secure TOTP APIs
 
+- Correct empty authenticated HTTP response preimages to use the BRC-104 `-1`
+  length sentinel. Public transport byte vectors and real AuthFetch/Express
+  signature tests cover 204 and empty 401/403/404 responses and status tampering.
+  Non-empty responses and conforming servers require no migration.
+
 - Add `TOTP.generateSecure()` and `TOTP.validateSecure()` for conventional
   six-digit, zero-padded codes while retaining the published two-digit,
   unpadded `generate()` and `validate()` behavior for wire compatibility.

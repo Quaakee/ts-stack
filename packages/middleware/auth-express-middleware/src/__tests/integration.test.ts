@@ -58,6 +58,32 @@ describe('AuthFetch and AuthExpress Integration Tests', () => {
   // Main Tests
   // --------------------------------------------------------------------------
 
+  test.each([204, 401, 403, 404])('verifies a signed bodyless HTTP %i response', async status => {
+    const authFetch = new AuthFetch(new MockWallet(privKey))
+    const result = await authFetch.fetch(`${origin}/empty-${status}`)
+    expect(result.status).toBe(status)
+    expect(await result.text()).toBe('')
+    expect(result.headers.get('x-bsv-auth-identity-key')).toBeTruthy()
+  })
+
+  test('rejects a bodyless response whose signed HTTP status was changed in transit', async () => {
+    const tamper: typeof fetch = async (url, init) => {
+      const response = await fetch(url, init)
+      if (!String(url).endsWith('/empty-404')) return response
+      await response.arrayBuffer()
+      return new Response(null, { status: 204, headers: response.headers })
+    }
+    const authFetch = new AuthFetch(
+      new MockWallet(privKey),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      tamper
+    )
+    await expect(authFetch.fetch(`${origin}/empty-404`)).rejects.toThrow(/signature/i)
+  })
+
   test('Test 1: Simple POST request with JSON', async () => {
     const walletWithRequests = new MockWallet(privKey)
     const authFetch = new AuthFetch(walletWithRequests)

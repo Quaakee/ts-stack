@@ -203,7 +203,8 @@ components:
           description: |
             For `general` messages: the signed application payload.
             Encoding: `requestId(32) || VarInt(statusCode) || VarInt(nHeaders)
-            || [header pairs] || VarInt(bodyLength) || body`.
+            || [header pairs] || VarInt(bodyLength) || body` (bodyLength is -1
+            with no body bytes when the body is empty).
             Absent from SDK initialRequest and initialResponse messages.
         signature:
           type: array

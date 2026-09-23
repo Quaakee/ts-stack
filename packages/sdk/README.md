@@ -16,6 +16,11 @@ emits a portable `number[]` settlement artifact so HTTP, WebSocket, Message Box,
 and JSON transports preserve identical transaction bytes. The same boundary
 protects overlay lookup queries and JSON BEEF responses.
 
+The unpublished 2.8.0 candidate verifies bodyless authenticated HTTP responses
+using the BRC-104 `-1` body-length sentinel. Conforming 204 and empty error
+responses now verify; non-empty response encoding is unchanged. Servers that
+sign a zero body length for an empty response must adopt the specified sentinel.
+
 AuthFetch stops pending certificate dispatch and session recovery after its
 request deadline. An already dispatched request may still complete on the
 server; callers must resolve its outcome before retrying a non-idempotent write.
