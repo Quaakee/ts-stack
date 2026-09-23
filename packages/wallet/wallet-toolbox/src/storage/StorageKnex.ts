@@ -203,7 +203,7 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
       )
       if (reqRawTx != null) {
         r.rawTx = Array.from(reqRawTx.rawTx)
-        r.inputBEEF = Array.from(reqRawTx.inputBEEF)
+        r.inputBEEF = reqRawTx.inputBEEF == null ? undefined : Array.from(reqRawTx.inputBEEF)
       }
     }
     return r
@@ -440,8 +440,8 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
     await this.preparedBeefCoordinator.stop()
   }
 
-  private rawTxSliceExpression(offset: number, length: number): Knex.Raw<Buffer> {
-    const sql = this.dbtype === 'MySQL' ? 'substring(?? from ? for ?)' : 'substr(??, ?, ?)'
+  private rawTxSliceExpression(offset: number, length: number, dbtype: DBType): Knex.Raw<Buffer> {
+    const sql = dbtype === 'MySQL' ? 'substring(?? from ? for ?)' : 'substr(??, ?, ?)'
     return this.knex.raw(sql, ['rawTx', offset + 1, length])
   }
 
@@ -449,10 +449,11 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
     txid: string,
     offset: number,
     length: number,
+    dbtype: DBType,
     trx?: TrxToken
   ): Promise<number[] | undefined> {
     const k = this.toDb(trx)
-    const slice = this.rawTxSliceExpression(offset, length)
+    const slice = this.rawTxSliceExpression(offset, length, dbtype)
     const proven = verifyOneOrNone(await k('proven_txs').select({ rawTx: slice }).where({ txid })) as
       { rawTx: Buffer | null } | undefined
     if (proven?.rawTx != null) return Array.from(proven.rawTx)
@@ -491,9 +492,16 @@ export class StorageKnex extends StorageProvider implements WalletStorageProvide
         'a hexadecimal transaction id and non-negative safe slice integers with a safe sum'
       )
     }
-    if (!this.isAvailable()) await this.makeAvailable()
+    // A cold caller may already own SQLite's only connection. Read settings
+    // through that transaction without caching uncommitted state or starting
+    // the background backfill before the caller commits.
+    const settings = this.isAvailable()
+      ? this.getSettings()
+      : trx != null
+        ? await this.readSettings(trx)
+        : await this.makeAvailable()
     if (hasOffset) {
-      return await this.getRawTxSlice(txid, offset as number, length as number, trx)
+      return await this.getRawTxSlice(txid, offset as number, length as number, settings.dbtype, trx)
     }
     const r = await this.getProvenOrRawTx(txid, trx)
     return r.proven != null ? r.proven.rawTx : r.rawTx

@@ -6,6 +6,13 @@ attention to changes that materially alter behavior or extend functionality.
 
 ## wallet-toolbox (unreleased)
 
+- Keep cold raw-transaction reads on the caller's transaction, including SQLite
+  with one connection; do not cache uncommitted settings or start background
+  work. Accept missing optional inputBEEF when returning stored raw bytes.
+- Reject unresolved output-basket mappings before sync writes. Apply valid newer
+  basket assignments/removals, preserving equal/older local relinquishment and
+  transaction rollback/retry. Included in unpublished 2.13.2; no schema migration.
+
 - Implement `BHServiceClient.findChainTipHash()` by delegating to its existing
   `findChainTipHeader()` call against `/api/v1/chain/tip/longest`, instead of
   throwing `Not implemented`. `ChaintracksChainTracker.getVerificationContextToken()`
