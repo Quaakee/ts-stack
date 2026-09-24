@@ -228,7 +228,9 @@ All notable changes to this project will be documented in this file. The format 
   session whose store dropped `certificatePolicy` is never written back as
   that snapshot, so such a session keeps legacy nonempty-disclosure and
   no-certificate behaviour while zero-field validation fails closed on every
-  `initialResponse`. No wire-format change or npm publication.
+  `initialResponse`. The package-root `validateCertificates` export keeps
+  refusing `fields=[]` with an empty keyring unless `allowZeroFields=true`
+  is passed explicitly. No wire-format change or npm publication.
 
 ### 2.8.2 candidate — wallet discovery timeout lifecycle
 

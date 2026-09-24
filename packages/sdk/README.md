@@ -67,7 +67,10 @@ certificate type with `fields=[]`. Validation checks the subject and the
 issuer-signed encrypted core, then accepts an empty or nullish keyring without
 calling `decryptFields` or the verifier wallet's `decrypt`. Any keyring entry
 is refused for that zero-field request. Existing nonempty-field decryption and
-the upstream disclosed-field checks are unchanged.
+the upstream disclosed-field checks are unchanged. The package-root
+`validateCertificates` export refuses a `fields=[]` request with an empty
+keyring unless its caller passes `allowZeroFields=true` explicitly; only the
+`initialResponse` path does so, and only with a retained snapshot.
 
 The holder still calls `proveCertificate` with the exact verifier, certificate
 and empty field list; wallet permission denial propagates. The SDK tests use

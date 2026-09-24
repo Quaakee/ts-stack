@@ -49,7 +49,9 @@ function assertRequestedDisclosedFields(
  *
  * @private
  * @param {AuthMessage} message - The message containing the certificates to validate.
- * @param {boolean} allowZeroFields - Whether the caller has retained a trusted request for zero-field validation.
+ * @param {boolean} [allowZeroFields=false] - Set only by a caller that authenticated the message and
+ *   retained the exact zero-field request it answers. By default a fields=[] request with an empty
+ *   keyring is refused, matching upstream's behaviour for this package-root export.
  * @returns {Promise<void>}
  * @throws Will throw an error if certificate validation or field decryption fails.
  *
@@ -70,7 +72,7 @@ export const validateCertificates = async (
   message: AuthMessage,
   certificatesRequested?: RequestedCertificateSet,
   originator?: OriginatorDomainNameStringUnder250Bytes,
-  allowZeroFields: boolean = true
+  allowZeroFields: boolean = false
 ): Promise<void> => {
   message = snapshotBoundedAuthData(message)
   certificatesRequested =

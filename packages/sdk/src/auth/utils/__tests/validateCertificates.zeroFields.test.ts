@@ -61,7 +61,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
       if (form === 'null') Reflect.set(f.certificate, 'keyring', null)
       const decryptFields = jest.spyOn(VerifiableCertificate.prototype, 'decryptFields')
       await expect(
-        validateCertificates(f.verifier, f.message, f.requested)
+        validateCertificates(f.verifier, f.message, f.requested, undefined, true)
       ).resolves.toBeUndefined()
       expect(decryptFields).not.toHaveBeenCalled()
       expect(f.decrypt).not.toHaveBeenCalled()
@@ -70,17 +70,32 @@ describe('validateCertificates with an explicit zero-field request and real sign
     }
   )
 
+  it('refuses a fields=[] request with an empty keyring unless allowZeroFields is passed explicitly', async () => {
+    const f = await fixture()
+    const decryptFields = jest.spyOn(VerifiableCertificate.prototype, 'decryptFields')
+    // The package-root export defaults to refusal, as upstream 2.8.2 does; only a caller that
+    // authenticated the message and retained the exact request opts in.
+    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow(
+      'A keyring is required'
+    )
+    await expect(
+      validateCertificates(f.verifier, f.message, f.requested, undefined, false)
+    ).rejects.toThrow('A keyring is required')
+    expect(decryptFields).toHaveBeenCalledTimes(2)
+    expect(f.decrypt).not.toHaveBeenCalled()
+  })
+
   it.each([[], '', 0, false])('rejects a malformed zero-field keyring: %p', async keyring => {
     const f = await fixture()
     Reflect.set(f.certificate, 'keyring', keyring)
-    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow()
+    await expect(validateCertificates(f.verifier, f.message, f.requested, undefined, true)).rejects.toThrow()
     expect(f.decrypt).not.toHaveBeenCalled()
   })
 
   it('requires an actual empty field array, not an empty string', async () => {
     const f = await fixture()
     Reflect.set(f.requested.types, f.master.type, '')
-    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow()
+    await expect(validateCertificates(f.verifier, f.message, f.requested, undefined, true)).rejects.toThrow()
     expect(f.decrypt).not.toHaveBeenCalled()
   })
 
@@ -111,7 +126,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
     }
     if (failure === 'missing signature') f.certificate.signature = undefined
     const decryptFields = jest.spyOn(VerifiableCertificate.prototype, 'decryptFields')
-    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow()
+    await expect(validateCertificates(f.verifier, f.message, f.requested, undefined, true)).rejects.toThrow()
     expect(decryptFields).not.toHaveBeenCalled()
     expect(f.decrypt).not.toHaveBeenCalled()
   })
@@ -127,7 +142,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
       f.master.masterKeyring,
       f.master.serialNumber
     )
-    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow(
+    await expect(validateCertificates(f.verifier, f.message, f.requested, undefined, true)).rejects.toThrow(
       'Unexpected keyring'
     )
     expect(f.decrypt).not.toHaveBeenCalled()
@@ -145,7 +160,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
       }
       if (mode === 'unmatched request')
         requested = { certifiers: f.requested.certifiers, types: {} }
-      await expect(validateCertificates(f.verifier, f.message, requested)).rejects.toThrow()
+      await expect(validateCertificates(f.verifier, f.message, requested, undefined, true)).rejects.toThrow()
       expect(f.decrypt).not.toHaveBeenCalled()
     }
   )
@@ -165,7 +180,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
         f.master.serialNumber
       )
       await expect(
-        validateCertificates(f.verifier, f.message, hasRequest ? f.requested : undefined)
+        validateCertificates(f.verifier, f.message, hasRequest ? f.requested : undefined, undefined, true)
       ).resolves.toBeUndefined()
       expect(f.decrypt).toHaveBeenCalledTimes(1)
       await expect(f.certificate.decryptFields(f.verifier)).resolves.toEqual({
@@ -179,7 +194,7 @@ describe('validateCertificates with an explicit zero-field request and real sign
     const invalid = VerifiableCertificate.fromCertificate(f.master, {})
     invalid.fields = { ...invalid.fields, name: Utils.toBase64([1]) }
     f.message.certificates?.push(invalid)
-    await expect(validateCertificates(f.verifier, f.message, f.requested)).rejects.toThrow()
+    await expect(validateCertificates(f.verifier, f.message, f.requested, undefined, true)).rejects.toThrow()
     expect(f.decrypt).not.toHaveBeenCalled()
   })
 })

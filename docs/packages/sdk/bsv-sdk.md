@@ -65,7 +65,9 @@ comes only from the `certificatePolicy` snapshot captured at
 drops it keeps nonempty-disclosure and no-certificate behaviour against a
 configured default that is never written back, so zero-field validation fails
 closed on every initial response for that session. Standalone and mid-session
-metadata-only responses remain unsupported. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-atlas-maintained-fork)
+metadata-only responses remain unsupported, and the package-root
+`validateCertificates` export refuses zero-field proofs unless
+`allowZeroFields=true` is passed explicitly. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-atlas-maintained-fork)
 for the precise limitations. Source preparation is not publication.
 
 ## Install
