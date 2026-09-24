@@ -75,10 +75,13 @@ real cryptography with fixture certificate storage and permission decisions;
 they do not prove wallet-toolbox or DCAP integration.
 
 Custom `AsyncSessionManager` implementations must preserve the optional
-`PeerSession.certificatePolicy` snapshot, as upstream already requires. A store
-that drops it keeps nonempty-disclosure and no-certificate behaviour, but
-zero-field validation fails closed: the configured default is never zero-field
-authority. A response from a different explicitly requested identity is
+`PeerSession.certificatePolicy` snapshot, as upstream already requires.
+Zero-field authority comes only from the snapshot captured at
+`initiateHandshake` and retained by the store. A store that drops it keeps
+nonempty-disclosure and no-certificate behaviour against the configured
+default, which is never written back as the retained snapshot, so zero-field
+validation fails closed on every `initialResponse` for that session, not only
+the first. A response from a different explicitly requested identity is
 refused.
 
 Standalone `certificateResponse` messages with an empty or nullish keyring

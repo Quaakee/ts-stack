@@ -59,11 +59,13 @@ The ATLAS maintained fork supports zero-field certificate proofs only in
 initial responses, after checking the locally retained handshake
 `certificatePolicy` snapshot and the expected peer identity. It validates the
 signed encrypted core without revealing or decrypting field values. Holder
-`proveCertificate` permission checks remain mandatory. Custom session stores
-must preserve `PeerSession.certificatePolicy`; stores that drop it keep
-nonempty-disclosure and no-certificate behaviour while zero-field validation
-fails closed. Standalone and mid-session metadata-only responses remain
-unsupported. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-atlas-maintained-fork)
+`proveCertificate` permission checks remain mandatory. Zero-field authority
+comes only from the `certificatePolicy` snapshot captured at
+`initiateHandshake`; custom session stores must preserve it, and a store that
+drops it keeps nonempty-disclosure and no-certificate behaviour against a
+configured default that is never written back, so zero-field validation fails
+closed on every initial response for that session. Standalone and mid-session
+metadata-only responses remain unsupported. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-atlas-maintained-fork)
 for the precise limitations. Source preparation is not publication.
 
 ## Install

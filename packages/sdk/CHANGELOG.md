@@ -223,9 +223,12 @@ All notable changes to this project will be documented in this file. The format 
   any keyring entry is refused for that request. The holder still calls
   `proveCertificate` for the exact verifier and empty field list, so wallet
   permission denial propagates. Standalone `certificateResponse` messages with
-  an empty keyring remain refused. Session stores that drop `certificatePolicy`
-  keep legacy nonempty-disclosure and no-certificate behaviour, but zero-field
-  validation fails closed. No wire-format change or npm publication.
+  an empty keyring remain refused. Zero-field authority comes only from the
+  snapshot captured at `initiateHandshake`; the configured default used for a
+  session whose store dropped `certificatePolicy` is never written back as
+  that snapshot, so such a session keeps legacy nonempty-disclosure and
+  no-certificate behaviour while zero-field validation fails closed on every
+  `initialResponse`. No wire-format change or npm publication.
 
 ### 2.8.2 candidate — wallet discovery timeout lifecycle
 

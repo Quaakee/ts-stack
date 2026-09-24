@@ -919,12 +919,15 @@ export class Peer {
     peerSession.peerIdentityKey = message.identityKey
     peerSession.isAuthenticated = true
 
-    // Only the handshake policy the session store actually retained can authorize a
-    // zero-field (BRC-52 metadata-only) proof. The configured default refilled below
-    // keeps legacy nonempty-disclosure behaviour but is never zero-field authority.
+    // Zero-field (BRC-52 metadata-only) authority comes only from the policy captured at
+    // initiateHandshake and retained by the session store. A store that lost it validates
+    // ordinary disclosures against the configured default, which is never written back as
+    // the retained policy: a refilled default must not become zero-field authority on this
+    // or any later initialResponse for the session.
     const retainedCertificatePolicy = peerSession.certificatePolicy
-    peerSession.certificatePolicy ??= this.#snapshotCertificatePolicy(this.certificatesToRequest)
-    peerSession.certificatesRequired = peerSession.certificatePolicy.certifiers.length > 0
+    const certificatePolicy =
+      retainedCertificatePolicy ?? this.#snapshotCertificatePolicy(this.certificatesToRequest)
+    peerSession.certificatesRequired = certificatePolicy.certifiers.length > 0
 
     // IMPORTANT: validation defaults to false if certs are required
     peerSession.certificatesValidated = !peerSession.certificatesRequired
