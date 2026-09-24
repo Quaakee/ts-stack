@@ -196,8 +196,10 @@ describe('Peer zero-field certificate exchange', () => {
     const f = await peers()
     const handshake = f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
     const request = await f.verifierTransport.next()
-    f.requested.certifiers.length = 0
-    f.requested.types[f.master.type].push('name')
+    // The live, public configuration is mutated in flight. The constructor already
+    // copied the caller's object, so mutating that copy's source would exercise nothing.
+    f.verifierPeer.certificatesToRequest.certifiers.length = 0
+    f.verifierPeer.certificatesToRequest.types[f.master.type].push('name')
     await f.holderTransport.deliver(request)
     await f.verifierTransport.deliver(await f.holderTransport.next())
     await expect(handshake).resolves.toMatchObject({ certificatesValidated: true })
@@ -221,15 +223,17 @@ describe('Peer zero-field certificate exchange', () => {
     expect(f.decrypt).not.toHaveBeenCalled()
   })
 
-  it('transmits and validates the construction-time snapshot, ignoring later custom serialization', async () => {
+  it('validates the retained handshake snapshot, ignoring later custom serialization of the live configuration', async () => {
     const f = await peers()
     const toJSON = jest.fn(() => ({
       certifiers: [f.master.certifier],
       types: { [f.master.type]: ['name'] }
     }))
-    Reflect.set(f.requested, 'toJSON', toJSON)
     const handshake = f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
     const request = await f.verifierTransport.next()
+    // Custom serialization added to the live configuration after the request left
+    // must not reach validation: the retained handshake snapshot is what is validated.
+    Reflect.set(f.verifierPeer.certificatesToRequest, 'toJSON', toJSON)
     expect(request.requestedCertificates).toEqual({
       certifiers: [f.master.certifier],
       types: { [f.master.type]: [] }
@@ -267,8 +271,8 @@ describe('Peer zero-field certificate exchange', () => {
     void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
     await f.holderTransport.deliver(await f.verifierTransport.next())
     const response = await f.holderTransport.next()
-    f.requested.types[f.master.type].length = 0
-    response.requestedCertificates = f.requested
+    f.verifierPeer.certificatesToRequest.types[f.master.type].length = 0
+    response.requestedCertificates = f.verifierPeer.certificatesToRequest
     if (response.certificates === undefined) throw new Error('Expected a certificate')
     response.certificates[0].keyring = {}
     await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
@@ -425,5 +429,29 @@ describe('Peer zero-field certificate exchange', () => {
     await f.verifierTransport.deliver(await f.holderTransport.next())
     expect(f.certificatesReceived).toHaveBeenCalledTimes(1)
     expect(f.decrypt).toHaveBeenCalledTimes(1)
+  })
+
+  it('in-flight mutation of the live peer.certificatesToRequest does not change the handshake snapshot', async () => {
+    const f = await peers()
+    const handshake = f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+    const request = await f.verifierTransport.next()
+    f.verifierPeer.certificatesToRequest.certifiers.length = 0
+    f.verifierPeer.certificatesToRequest.types[f.master.type].push('name')
+    await f.holderTransport.deliver(request)
+    await f.verifierTransport.deliver(await f.holderTransport.next())
+    await expect(handshake).resolves.toMatchObject({ certificatesValidated: true })
+    expect(f.decrypt).not.toHaveBeenCalled()
+  })
+
+  it('live config downgraded to fields=[] after a nonempty request cannot accept a zero-field proof', async () => {
+    const f = await peers(['name'])
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
+    await f.holderTransport.deliver(await f.verifierTransport.next())
+    const response = await f.holderTransport.next()
+    f.verifierPeer.certificatesToRequest.types[f.master.type].length = 0
+    if (response.certificates === undefined) throw new Error('Expected a certificate')
+    response.certificates[0].keyring = {}
+    await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
+    expect(f.certificatesReceived).not.toHaveBeenCalled()
   })
 })
