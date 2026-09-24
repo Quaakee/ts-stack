@@ -144,7 +144,17 @@ async function processActionCore (
     }
   }
 
-  await resumeFailedSendWith(storage, userId, args.sendWith)
+  // #59 F1: an exact retry joins the atomic sendWith set only when every other member can
+  // be sent with it, judged by the same classification shareReqsWithWorld applies below.
+  // An incomplete set commits no retry state, so the monitor cannot broadcast it alone.
+  await resumeFailedSendWith(storage, userId, args.sendWith, async candidates => {
+    const preview = args.isDelayed
+      ? await getReqDetailsForDelayedShare(storage, txidsOfReqsToShareWithWorld)
+      : await storage.getReqsAndBeefToShareWithWorld(txidsOfReqsToShareWithWorld, [])
+    return preview.details.every(
+      detail => detail.status === 'alreadySent' || detail.status === 'readyToSend' || candidates.has(detail.txid)
+    )
+  })
 
   const { swr, ndr } = await traceProcessStep(
     storage,

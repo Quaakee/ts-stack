@@ -283,6 +283,37 @@ async function main() {
         monitor
       })
     }
+    if (scenario === 'incomplete-set') {
+      // #59 F1: a sendWith set that cannot be sent together commits no exact-retry state, in
+      // both immediate and delayed modes, so the monitor later finds nothing to broadcast.
+      const missing = 'ab'.repeat(32)
+      const { TaskSendWaiting } = require('../../src/monitor/tasks/TaskSendWaiting.ts')
+      for (const acceptDelayedBroadcast of [false, true]) {
+        const outcome = await wallet
+          .createAction({
+            description: 'resume with incomplete set',
+            options: { sendWith: [txid, missing], acceptDelayedBroadcast }
+          })
+          .catch(error => error)
+        const reported = outcome.sendWithResults?.find(result => result.txid === txid)?.status
+        assert.ok(reported === undefined || reported === 'failed', JSON.stringify(outcome.sendWithResults))
+        assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
+        assert.equal((await active.findTransactions({ partial: { transactionId: txId } }))[0].status, 'failed')
+        const input = (await active.findOutputs({ partial: { outputId: inputId } }))[0]
+        assert.ok(input.spentBy == null, `input reserved by ${input.spentBy}`)
+        assert.equal(input.spendable, true)
+        assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'unknown')
+        await new TaskSendWaiting(monitor, 0, 0).runTask()
+        assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'unknown')
+        assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
+      }
+      // The same retry inside a complete set still resumes and broadcasts.
+      const result = await resume()
+      assert.equal(result.sendWithResults[0].status, 'unproven', JSON.stringify(result))
+      assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'known')
+      console.log('PASS incomplete-set: no retry state committed, nothing broadcast alone, complete set still resumes')
+      return
+    }
     if (scenario === 'delayed-race') {
       const find = active.findProvenTxReqs.bind(active)
       let changed = false
