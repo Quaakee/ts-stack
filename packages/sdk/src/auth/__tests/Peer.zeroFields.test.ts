@@ -234,7 +234,7 @@ describe('Peer zero-field certificate exchange', () => {
         message.requestedCertificates.types[f.master.type].length = 0
       }
     }
-    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
     await f.holderTransport.deliver(await f.verifierTransport.next())
     await expect(f.verifierTransport.deliver(await f.holderTransport.next())).rejects.toThrow(
       'A keyring is required'
@@ -288,7 +288,7 @@ describe('Peer zero-field certificate exchange', () => {
 
   it('refuses a same-type nonempty-to-empty downgrade despite mutated config and sender request', async () => {
     const f = await peers(['name'])
-    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
     await f.holderTransport.deliver(await f.verifierTransport.next())
     const response = await f.holderTransport.next()
     f.verifierPeer.certificatesToRequest.types[f.master.type].length = 0
@@ -302,7 +302,7 @@ describe('Peer zero-field certificate exchange', () => {
 
   it('fails closed if an external session store loses the local request snapshot', async () => {
     const f = await peers()
-    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
     await f.holderTransport.deliver(await f.verifierTransport.next())
     const response = await f.holderTransport.next()
     const session = f.verifierPeer.sessionManager.getSession(response.yourNonce ?? '')
@@ -322,6 +322,8 @@ describe('Peer zero-field certificate exchange', () => {
     await f.holderTransport.deliver(await f.verifierTransport.next())
     const response = await f.holderTransport.next()
     if (required && fields.length === 0) {
+      // The refused handshake only settles at the initial-response timeout.
+      void handshake.catch(() => {})
       await expect(f.verifierTransport.deliver(response)).rejects.toThrow('A keyring is required')
       expect(f.certificatesReceived).not.toHaveBeenCalled()
       expect(f.decrypt).not.toHaveBeenCalled()
@@ -341,7 +343,7 @@ describe('Peer zero-field certificate exchange', () => {
     'rejects an altered initial-response %s',
     async field => {
       const f = await peers()
-      void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+      void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
       await f.holderTransport.deliver(await f.verifierTransport.next())
       const response = await f.holderTransport.next()
       if (field === 'nonce')
@@ -355,7 +357,7 @@ describe('Peer zero-field certificate exchange', () => {
 
   it('rejects a correctly signed response relabeled to another holder identity', async () => {
     const f = await peers()
-    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity)
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
     const request = await f.verifierTransport.next()
     await f.holderTransport.deliver(request)
     const response = await f.holderTransport.next()
