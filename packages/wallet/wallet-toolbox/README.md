@@ -32,7 +32,8 @@ Timing compares successive candidates, not a controlled comparison against upstr
 The `2.10.2-atlas.520.1` artifact adds safe exact signed-action retry through
 existing `sendWith`; see [compatibility and limitations](docs/atlas-exact-resume.md).
 It does not authorize creating replacement actions after uncertain broadcasts.
-The maintained fork carries the same exact-retry source on the 2.14.0 base.
+The maintained fork carries that exact-retry source on the 2.14.0 base, plus the
+sendWith-set atomicity repair (#59) described in the same document.
 
 ### SQLite migration recovery
 
