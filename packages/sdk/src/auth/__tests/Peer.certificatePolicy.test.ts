@@ -403,6 +403,29 @@ test('uses configured policy for older sessions, and leaves empty responses unva
   expect(backing.getSession('session')?.certificatesValidated).toBe(true)
 })
 
+test('a lost snapshot is refilled at initialResponse, so later responses keep that policy', async () => {
+  const { peer, backing } = await setup()
+  delete backing.getSession('session')!.certificatePolicy
+  backing.getSession('session')!.isAuthenticated = false
+  await (peer as any).authenticateInitialResponse({
+    version: '0.1',
+    messageType: 'initialResponse',
+    identityKey: REMOTE,
+    initialNonce: 'remote-initial-nonce',
+    yourNonce: 'session',
+    signature: [1]
+  })
+  // As upstream, the policy configured at initialResponse time is persisted for the session.
+  expect(backing.getSession('session')?.certificatePolicy).toEqual(policy('initial', 'initial'))
+  // A default reconfigured for future peers does not reach this session.
+  peer.certificatesToRequest = policy('different', 'different')
+  await expect(
+    (peer as any).processCertificateResponse(response([cert('different', 'different')]))
+  ).rejects.toThrow('locally requested set')
+  expect(validate).not.toHaveBeenCalled()
+  expect(backing.getSession('session')?.certificatesValidated).toBe(false)
+})
+
 test('initial-response observers also observe committed validation', async () => {
   const { peer, backing } = await setup()
   peer.listenForCertificatesReceived(() => {

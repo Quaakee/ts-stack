@@ -217,18 +217,20 @@ All notable changes to this project will be documented in this file. The format 
 ### ATLAS maintained fork — zero-field initial certificate proofs
 
 - Accept BRC-52 zero-field proofs in the `initialResponse` handshake path only
-  against the handshake `PeerSession.certificatePolicy` snapshot that the
-  session store actually retained. An empty or omitted keyring must match an
-  exact issuer/type request with `fields=[]`; no field decryption occurs and
-  any keyring entry is refused for that request. The holder still calls
-  `proveCertificate` for the exact verifier and empty field list, so wallet
-  permission denial propagates. Standalone `certificateResponse` messages with
-  an empty keyring remain refused. Zero-field authority comes only from the
-  snapshot captured at `initiateHandshake`; the configured default used for a
-  session whose store dropped `certificatePolicy` is never written back as
-  that snapshot, so such a session keeps legacy nonempty-disclosure and
-  no-certificate behaviour while zero-field validation fails closed on every
-  `initialResponse`. The package-root `validateCertificates` export keeps
+  when the verifying `Peer` instance itself sent the answered `initialRequest`.
+  It keeps the exact policy it sent in memory, keyed by session nonce, until
+  that handshake settles; the first authenticated `initialResponse` consumes
+  it, and the store's `PeerSession.certificatePolicy` snapshot must still equal
+  it. An empty or omitted keyring must match an exact issuer/type request with
+  `fields=[]`; no field decryption occurs and any keyring entry is refused for
+  that request. The holder still calls `proveCertificate` for the exact
+  verifier and empty field list, so wallet permission denial propagates.
+  Standalone `certificateResponse` messages with an empty keyring remain
+  refused. Responder-created sessions, stores that dropped or changed the
+  snapshot, a restarted `Peer` and later `initialResponse` messages for a
+  session fail closed for zero-field and keep upstream's nonempty-disclosure
+  and no-certificate behaviour, including its refill of a dropped snapshot from
+  the configured default. The package-root `validateCertificates` export keeps
   refusing `fields=[]` with an empty keyring unless `allowZeroFields=true`
   is passed explicitly. No wire-format change or npm publication.
 

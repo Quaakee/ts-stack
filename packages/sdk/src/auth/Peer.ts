@@ -78,6 +78,11 @@ export class Peer {
     { callback: (sessionNonce: string) => void; sessionNonce: string }
   > = new Map()
   readonly #initialResponseTimeouts = new Map<number, ReturnType<typeof setTimeout>>()
+  // Zero-field (BRC-52 metadata-only) authority: the policy this Peer instance itself sent in
+  // each initialRequest, keyed by session nonce. In memory only, so a responder-created session
+  // or a Peer restarted over an external store never has one. An entry lives only while its
+  // initiateHandshake awaits the response, and the first authenticated initialResponse consumes it.
+  readonly #initiatedCertificatePolicies = new Map<string, RequestedCertificateSet>()
 
   // Promise-based mechanism for waiting on certificate validation
   private readonly certificateValidationPromises: Map<
@@ -626,6 +631,10 @@ export class Peer {
     // Register before sending: an in-memory or otherwise synchronous transport
     // can deliver the response before send() resolves.
     const initialResponse = this.waitForInitialResponse(sessionNonce)
+    this.#initiatedCertificatePolicies.set(
+      sessionNonce,
+      this.#snapshotCertificatePolicy(certificatePolicy)
+    )
     try {
       await this.#transport.send(snapshotBoundedAuthData(initialRequest))
       return await initialResponse
@@ -634,6 +643,8 @@ export class Peer {
       const failedSession = await this.sessionManager.getSession(sessionNonce)
       if (failedSession != null) await this.sessionManager.removeSession(failedSession)
       throw error
+    } finally {
+      this.#initiatedCertificatePolicies.delete(sessionNonce)
     }
   }
 
@@ -859,7 +870,7 @@ export class Peer {
    */
   private async authenticateInitialResponse(
     message: AuthMessage
-  ): Promise<{ peerSession: PeerSession; retainedCertificatePolicy?: RequestedCertificateSet }> {
+  ): Promise<{ peerSession: PeerSession; zeroFieldPolicy?: RequestedCertificateSet }> {
     const validNonce = await verifyNonce(
       message.yourNonce as string,
       this.#wallet,
@@ -919,28 +930,53 @@ export class Peer {
     peerSession.peerIdentityKey = message.identityKey
     peerSession.isAuthenticated = true
 
-    // Zero-field (BRC-52 metadata-only) authority comes only from the policy captured at
-    // initiateHandshake and retained by the session store. A store that lost it validates
-    // ordinary disclosures against the configured default, which is never written back as
-    // the retained policy: a refilled default must not become zero-field authority on this
-    // or any later initialResponse for the session.
-    const retainedCertificatePolicy = peerSession.certificatePolicy
-    const certificatePolicy =
-      retainedCertificatePolicy ?? this.#snapshotCertificatePolicy(this.certificatesToRequest)
-    peerSession.certificatesRequired = certificatePolicy.certifiers.length > 0
+    // Taken before the refill below, which a store that lost the snapshot must never turn
+    // into zero-field authority.
+    const zeroFieldPolicy = this.#takeZeroFieldPolicy(peerSession)
+
+    peerSession.certificatePolicy ??= this.#snapshotCertificatePolicy(this.certificatesToRequest)
+    peerSession.certificatesRequired = peerSession.certificatePolicy.certifiers.length > 0
 
     // IMPORTANT: validation defaults to false if certs are required
     peerSession.certificatesValidated = !peerSession.certificatesRequired
 
     peerSession.lastUpdate = Date.now()
     await this.sessionManager.updateSession(peerSession)
-    return { peerSession, retainedCertificatePolicy }
+    return { peerSession, zeroFieldPolicy }
+  }
+
+  /**
+   * Zero-field (BRC-52 metadata-only) authority for an authenticated initialResponse: the policy
+   * this Peer instance sent in the initialRequest the session answers, and only while the session
+   * store still holds that same snapshot. It is consumed here, so it serves one initialResponse.
+   * A responder-created session, a lost or refilled snapshot and a restarted Peer have none.
+   */
+  #takeZeroFieldPolicy(peerSession: PeerSession): RequestedCertificateSet | undefined {
+    const sessionNonce = peerSession.sessionNonce as string
+    const sent = this.#initiatedCertificatePolicies.get(sessionNonce)
+    this.#initiatedCertificatePolicies.delete(sessionNonce)
+    const stored = peerSession.certificatePolicy
+    if (sent == null || stored == null) return undefined
+    const canonical = (policy: RequestedCertificateSet): string => {
+      const snapshot = this.#snapshotCertificatePolicy(policy)
+      return JSON.stringify([
+        [...snapshot.certifiers].sort(),
+        Object.keys(snapshot.types)
+          .sort()
+          .map(type => [type, [...snapshot.types[type]].sort()])
+      ])
+    }
+    try {
+      return canonical(stored) === canonical(sent) ? sent : undefined
+    } catch {
+      return undefined
+    }
   }
 
   private async validateInitialResponseCertificates(
     message: AuthMessage,
     peerSession: PeerSession,
-    retainedCertificatePolicy?: RequestedCertificateSet
+    zeroFieldPolicy?: RequestedCertificateSet
   ): Promise<void> {
     if (
       !peerSession.certificatesRequired ||
@@ -951,14 +987,13 @@ export class Peer {
     }
     const sessionNonce = peerSession.sessionNonce as string
     await this.updateCertificateSession(sessionNonce, async session => {
-      // A zero-field proof is accepted only against the locally retained handshake
-      // snapshot; a store that lost it keeps the nonempty path and fails closed.
+      // Without this Peer's own initiateHandshake record, zero-field proofs stay refused.
       await validateCertificates(
         this.#wallet,
         message,
-        retainedCertificatePolicy ?? session.certificatePolicy ?? this.certificatesToRequest,
+        zeroFieldPolicy ?? session.certificatePolicy ?? this.certificatesToRequest,
         this.#originator,
-        retainedCertificatePolicy != null
+        zeroFieldPolicy != null
       )
       session.certificatesValidated = true
       session.lastUpdate = Date.now()
@@ -1014,9 +1049,8 @@ export class Peer {
   }
 
   async #processInitialResponse(message: AuthMessage): Promise<void> {
-    const { peerSession, retainedCertificatePolicy } =
-      await this.authenticateInitialResponse(message)
-    await this.validateInitialResponseCertificates(message, peerSession, retainedCertificatePolicy)
+    const { peerSession, zeroFieldPolicy } = await this.authenticateInitialResponse(message)
+    await this.validateInitialResponseCertificates(message, peerSession, zeroFieldPolicy)
     this.lastInteractedWithPeer = message.identityKey
     this.#releaseInitialResponseWaiters(peerSession)
     await this.#answerInitialCertificateRequest(message)

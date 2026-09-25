@@ -55,16 +55,17 @@ direct source transaction. Deferred `signableTransaction` results may remain
 partial for compatibility, but the final result must be complete. Duplicate
 input outpoints and zero-input transactions that create value fail validation.
 
-The ATLAS maintained fork supports zero-field certificate proofs only in
-initial responses, after checking the locally retained handshake
-`certificatePolicy` snapshot and the expected peer identity. It validates the
-signed encrypted core without revealing or decrypting field values. Holder
-`proveCertificate` permission checks remain mandatory. Zero-field authority
-comes only from the `certificatePolicy` snapshot captured at
-`initiateHandshake`; custom session stores must preserve it, and a store that
-drops it keeps nonempty-disclosure and no-certificate behaviour against a
-configured default that is never written back, so zero-field validation fails
-closed on every initial response for that session. Standalone and mid-session
+The ATLAS maintained fork supports zero-field certificate proofs only in the
+first authenticated initial response to a handshake that the verifying `Peer`
+instance itself initiated, against the exact policy it sent and holds in memory
+until that handshake settles, while the session store's `certificatePolicy`
+snapshot still matches it, and after checking the expected peer identity. It
+validates the signed encrypted core without revealing or decrypting field
+values. Holder `proveCertificate` permission checks remain mandatory. Custom
+session stores must preserve the snapshot. Responder-created sessions, stores
+that drop or change it, a restarted `Peer` and any later initial response for
+the session fail closed for zero-field and keep upstream's nonempty-disclosure
+and no-certificate behaviour. Standalone and mid-session
 metadata-only responses remain unsupported, and the package-root
 `validateCertificates` export refuses zero-field proofs unless
 `allowZeroFields=true` is passed explicitly. See the [SDK README](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/sdk#zero-field-certificate-proofs-atlas-maintained-fork)

@@ -63,8 +63,8 @@ export interface PeerSession {
   certificatesValidated?: boolean
   /**
    * Local handshake policy snapshot. Session stores must retain this field; never sent on the
-   * wire. A zero-field (BRC-52 metadata-only) proof is accepted only against this retained
-   * snapshot, never against a configured default.
+   * wire. It is never zero-field (BRC-52 metadata-only) authority by itself: that also requires
+   * the in-memory record of the policy this Peer instance sent from initiateHandshake to match it.
    */
   certificatePolicy?: RequestedCertificateSet
   /** Locally issued standalone requests, keyed by their nonce. Not a wire correlation field. */

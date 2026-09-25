@@ -61,16 +61,17 @@ until the protected npm release workflow completes.
 ## Zero-field certificate proofs (ATLAS maintained fork)
 
 This maintained fork of 2.8.2 supports BRC-52 zero-field proofs in the
-`initialResponse` handshake path. The locally retained handshake
-`PeerSession.certificatePolicy` snapshot must name the exact issuer and
-certificate type with `fields=[]`. Validation checks the subject and the
+`initialResponse` handshake path. The policy that the verifying `Peer` sent in
+its own `initialRequest` must name the exact issuer and certificate type with
+`fields=[]`. Validation checks the subject and the
 issuer-signed encrypted core, then accepts an empty or nullish keyring without
 calling `decryptFields` or the verifier wallet's `decrypt`. Any keyring entry
 is refused for that zero-field request. Existing nonempty-field decryption and
 the upstream disclosed-field checks are unchanged. The package-root
 `validateCertificates` export refuses a `fields=[]` request with an empty
 keyring unless its caller passes `allowZeroFields=true` explicitly; only the
-`initialResponse` path does so, and only with a retained snapshot.
+`initialResponse` path does so, and only with the in-memory authority described
+below.
 
 The holder still calls `proveCertificate` with the exact verifier, certificate
 and empty field list; wallet permission denial propagates. The SDK tests use
@@ -79,13 +80,17 @@ they do not prove wallet-toolbox or DCAP integration.
 
 Custom `AsyncSessionManager` implementations must preserve the optional
 `PeerSession.certificatePolicy` snapshot, as upstream already requires.
-Zero-field authority comes only from the snapshot captured at
-`initiateHandshake` and retained by the store. A store that drops it keeps
-nonempty-disclosure and no-certificate behaviour against the configured
-default, which is never written back as the retained snapshot, so zero-field
-validation fails closed on every `initialResponse` for that session, not only
-the first. A response from a different explicitly requested identity is
-refused.
+Zero-field authority comes only from an in-memory record, keyed by session
+nonce, of the policy a `Peer` instance sent from `initiateHandshake`. The record
+lasts only while that handshake awaits its response, the first authenticated
+`initialResponse` consumes it, and it counts only while the store still holds
+the same snapshot. A responder-created session, a store that dropped or changed
+the snapshot, a `Peer` restarted over an external store and any later
+`initialResponse` for the session have no such authority: zero-field
+validation fails closed, while nonempty-disclosure and no-certificate
+behaviour stay as upstream, including its refill of a dropped snapshot from the
+configured default. A response from a different explicitly requested identity
+is refused.
 
 Standalone `certificateResponse` messages with an empty or nullish keyring
 remain unsupported, including responses to mid-session zero-field requests;

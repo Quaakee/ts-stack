@@ -154,7 +154,8 @@ async function peers(
     certificatesReceived,
     decrypt,
     issuer,
-    holder
+    holder,
+    verifier
   }
 }
 
@@ -496,10 +497,10 @@ describe('Peer zero-field certificate exchange', () => {
     await expect(
       f.verifierTransport.deliver({ ...response, certificates: [zero] })
     ).rejects.toThrow('A keyring is required')
-    // The configured default was used for ordinary validation but not written back.
+    // As upstream, the configured default refills the lost snapshot; that is not authority.
     expect(
       f.verifierPeer.sessionManager.getSession(response.yourNonce ?? '')?.certificatePolicy
-    ).toBeUndefined()
+    ).toEqual({ certifiers: [f.master.certifier], types: { [f.master.type]: [] } })
     const second = await secondInitialResponse(f, response, [zero])
     await expect(f.verifierTransport.deliver(second)).rejects.toThrow('A keyring is required')
     expect(
@@ -524,6 +525,96 @@ describe('Peer zero-field certificate exchange', () => {
       response.certificates as VerifiableCertificate[]
     )
     await expect(f.verifierTransport.deliver(second)).rejects.toThrow('A keyring is required')
+    expect(f.certificatesReceived).not.toHaveBeenCalled()
+    expect(f.decrypt).not.toHaveBeenCalled()
+  })
+
+  it('a responder-created session grants no zero-field authority to a reflected initialResponse', async () => {
+    const f = await peers()
+    // The holder initiates, so the verifier's session with its policy is responder-created.
+    void f.holderPeer.getAuthenticatedSession(f.verifierIdentity).catch(() => {})
+    await f.verifierTransport.deliver(await f.holderTransport.next())
+    const verifierResponse = await f.verifierTransport.next()
+    expect(verifierResponse.messageType).toBe('initialResponse')
+    const responderNonce = verifierResponse.initialNonce ?? ''
+    expect(f.verifierPeer.sessionManager.getSession(responderNonce)?.certificatePolicy).toEqual(
+      f.requested
+    )
+    const initialNonce = Utils.toBase64(Array.from({ length: 48 }, () => 9))
+    const { signature } = await f.holder.createSignature({
+      data: [...Utils.toArray(responderNonce, 'base64'), ...Utils.toArray(initialNonce, 'base64')],
+      protocolID: [2, 'auth message signature'],
+      keyID: `${responderNonce} ${initialNonce}`,
+      counterparty: f.verifierIdentity
+    })
+    const zero: VerifiableCertificate = JSON.parse(
+      JSON.stringify(VerifiableCertificate.fromCertificate(f.master, {}))
+    )
+    await expect(
+      f.verifierTransport.deliver({
+        version: '0.1',
+        messageType: 'initialResponse',
+        identityKey: f.holderIdentity,
+        initialNonce,
+        yourNonce: responderNonce,
+        certificates: [zero],
+        signature
+      })
+    ).rejects.toThrow('A keyring is required')
+    expect(f.verifierPeer.sessionManager.getSession(responderNonce)?.certificatesValidated).toBe(
+      false
+    )
+    expect(f.certificatesReceived).not.toHaveBeenCalled()
+    expect(f.decrypt).not.toHaveBeenCalled()
+  })
+
+  it('a Peer restarted over an external store has no zero-field authority', async () => {
+    const f = await peers([], 'async')
+    void f.verifierPeer.getAuthenticatedSession(f.holderIdentity).catch(() => {})
+    await f.holderTransport.deliver(await f.verifierTransport.next())
+    const response = await f.holderTransport.next()
+    // Same wallet and store, new instance: the store kept the snapshot, the memory did not.
+    const store = f.verifierPeer.sessionManager as unknown as AsyncSessionManager
+    expect((await store.getSession(response.yourNonce ?? ''))?.certificatePolicy).toEqual(
+      f.requested
+    )
+    const restartedTransport = new QueuedTransport()
+    const restarted = new Peer(f.verifier, restartedTransport, f.requested, store)
+    await restarted.ready
+    const received = jest.fn()
+    restarted.listenForCertificatesReceived(received)
+    await expect(restartedTransport.deliver(response)).rejects.toThrow('A keyring is required')
+    expect(received).not.toHaveBeenCalled()
+    expect(f.decrypt).not.toHaveBeenCalled()
+  })
+
+  it('a handshake that fails releases its zero-field authority', async () => {
+    const f = await peers()
+    let request: AuthMessage | undefined
+    f.verifierTransport.send = async message => {
+      request = JSON.parse(JSON.stringify(message))
+      throw new Error('transport down')
+    }
+    await expect(f.verifierPeer.getAuthenticatedSession(f.holderIdentity)).rejects.toThrow(
+      'transport down'
+    )
+    if (request === undefined) throw new Error('Expected the initial request')
+    const sessionNonce = request.initialNonce ?? ''
+    expect(f.verifierPeer.sessionManager.getSession(sessionNonce)).toBeUndefined()
+    // A store that kept the session anyway, and a late response to it, still grant nothing.
+    f.verifierPeer.sessionManager.addSession({
+      isAuthenticated: false,
+      sessionNonce,
+      peerIdentityKey: f.holderIdentity,
+      lastUpdate: Date.now(),
+      certificatePolicy: f.requested,
+      certificatesRequired: true,
+      certificatesValidated: false
+    })
+    await f.holderTransport.deliver(request)
+    await expect(f.verifierTransport.deliver(await f.holderTransport.next())).rejects.toThrow(
+      'A keyring is required'
+    )
     expect(f.certificatesReceived).not.toHaveBeenCalled()
     expect(f.decrypt).not.toHaveBeenCalled()
   })
