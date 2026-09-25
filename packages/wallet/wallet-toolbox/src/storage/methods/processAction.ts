@@ -7,7 +7,14 @@ import {
   WalletLoggerInterface,
   TelemetrySpan
 } from '@bsv/sdk'
-import { isExactResume, lockExactResumeBinding, resumeFailedSendWith } from './resumeFailedSendWith'
+import {
+  admitExactResumes,
+  commitExactResumes,
+  ExactResumeCandidate,
+  isExactResume,
+  lockExactResumeBinding,
+  planExactResumes
+} from './resumeFailedSendWith'
 import { aggregateActionResults } from '../../utility/aggregateResults'
 import { StorageProvider } from '../StorageProvider'
 import {
@@ -144,24 +151,24 @@ async function processActionCore (
     }
   }
 
-  // #59 F1: an exact retry joins the atomic sendWith set only when every other member can
-  // be sent with it, judged by the same classification shareReqsWithWorld applies below.
-  // An incomplete set commits no retry state, so the monitor cannot broadcast it alone.
-  await resumeFailedSendWith(storage, userId, args.sendWith, async candidates => {
-    const preview = args.isDelayed
-      ? await getReqDetailsForDelayedShare(storage, txidsOfReqsToShareWithWorld)
-      : await storage.getReqsAndBeefToShareWithWorld(txidsOfReqsToShareWithWorld, [])
-    return preview.details.every(
-      detail => detail.status === 'alreadySent' || detail.status === 'readyToSend' || candidates.has(detail.txid)
-    )
-  })
+  // #59: exact retries are only planned (read-only) here. The share admits them from its one
+  // lookup and commits them, all in one transaction, only when the whole set is sendable.
+  const exactResumes = await planExactResumes(storage, userId, args.sendWith)
 
   const { swr, ndr } = await traceProcessStep(
     storage,
     'wallet.storage.process_action.share',
     parent,
     async () =>
-      await shareReqsWithWorld(storage, userId, txidsOfReqsToShareWithWorld, args.isDelayed, undefined, logger)
+      await shareSendWithSet(
+        storage,
+        userId,
+        txidsOfReqsToShareWithWorld,
+        args.isDelayed,
+        undefined,
+        logger,
+        exactResumes
+      )
   )
 
   r.sendWithResults = swr
@@ -319,6 +326,44 @@ export async function shareReqsWithWorld (
   r?: GetReqsAndBeefResult,
   logger?: WalletLoggerInterface
 ): Promise<{ swr: SendWithResult[], ndr: ReviewActionResult[] | undefined }> {
+  return await shareSendWithSet(storage, userId, txids, isDelayed, r, logger, [])
+}
+
+/**
+ * #59 R2-1: each admitted retry's request, as committed or as another caller left it, replaces
+ * the planned failed one only while it keeps the set's decision true: sendable, or already sent.
+ * Anything else throws inside the commit transaction, which then commits no retry at all.
+ */
+function reconcileCommittedResumes (
+  committed: EntityProvenTxReq[],
+  readyToSendReqs: EntityProvenTxReq[],
+  swr: SendWithResult[]
+): void {
+  for (const req of committed) {
+    const detail: GetReqsAndBeefDetail = { txid: req.txid, status: 'unknown' }
+    classifyReqStatus(detail, req.toApi())
+    const index = readyToSendReqs.findIndex(ready => ready.txid === req.txid)
+    if (index < 0) throw new WERR_INTERNAL('An admitted exact retry is missing from its set.')
+    if (detail.status === 'readyToSend') {
+      readyToSendReqs[index] = req
+    } else if (detail.status === 'alreadySent') {
+      readyToSendReqs.splice(index, 1)
+      swr.find(result => result.txid === req.txid)!.status = 'unproven'
+    } else {
+      throw new WERR_INVALID_OPERATION('Exact retry state changed before it could be committed.')
+    }
+  }
+}
+
+async function shareSendWithSet (
+  storage: StorageProvider,
+  userId: number,
+  txids: string[],
+  isDelayed: boolean,
+  r: GetReqsAndBeefResult | undefined,
+  logger: WalletLoggerInterface | undefined,
+  exactResumes: ExactResumeCandidate[]
+): Promise<{ swr: SendWithResult[], ndr: ReviewActionResult[] | undefined }> {
   txids = normalizePostTxids(txids, 'txids', true)
   const swr: SendWithResult[] = []
   const ndr: ReviewActionResult[] | undefined = undefined
@@ -331,17 +376,27 @@ export async function shareReqsWithWorld (
 
   normalizePostTxids(r.details.map(detail => detail.txid), 'details', true)
 
+  // #59 R2-1: this one lookup is the set's only completeness decision. A planned retry counts
+  // as sendable only when every other member already is; it is committed below, after this
+  // gate and before anything is scheduled or posted, so the two can never disagree.
+  const admitted = await admitExactResumes(storage, r, exactResumes, isDelayed)
+
   const readyToSendReqs: EntityProvenTxReq[] = []
   if (!classifyReqDetails(r.details, swr, readyToSendReqs)) return { swr, ndr }
-
-  const readyToSendReqIds = readyToSendReqs.map(r => r.id)
 
   const batch = txids.length > 1 ? randomBytesBase64(16) : undefined
   if (isDelayed) {
     // Delayed sends rebuild BEEF when the monitor sends the req. Do not fail a committed
     // transaction here because the current aggregate BEEF is only a scheduling artifact.
-    if (readyToSendReqIds.length > 0) {
+    if (readyToSendReqs.length > 0) {
       await storage.transaction(async trx => {
+        // #59 R2-1: retries commit in the same transaction that schedules their set.
+        if (admitted.length > 0)
+          reconcileCommittedResumes(
+            await commitExactResumes(storage, userId, admitted, trx),
+            readyToSendReqs,
+            swr
+          )
         const ordinary = readyToSendReqs.filter(req => !isExactResume(req))
         if (ordinary.length > 0) {
           await storage.updateProvenTxReq(
@@ -371,15 +426,25 @@ export async function shareReqsWithWorld (
     return { swr, ndr }
   }
 
-  if (readyToSendReqIds.length < 1) return { swr, ndr }
+  if (readyToSendReqs.length < 1) return { swr, ndr }
+
+  if (admitted.length > 0) {
+    // #59 R2-1: verify first, so a set whose merged BEEF is refused commits no retry.
+    await verifyMergedBeef(storage, r, readyToSendReqs, logger)
+    await storage.transaction(async trx => {
+      reconcileCommittedResumes(await commitExactResumes(storage, userId, admitted, trx), readyToSendReqs, swr)
+    })
+    if (readyToSendReqs.length < 1) return { swr, ndr }
+  }
 
   for (const req of readyToSendReqs.filter(isExactResume))
     await storage.transaction(async trx => {
       await lockExactResumeBinding(storage, req, trx, userId)
     })
 
-  await verifyMergedBeef(storage, r, readyToSendReqs, logger)
+  if (admitted.length === 0) await verifyMergedBeef(storage, r, readyToSendReqs, logger)
 
+  const readyToSendReqIds = readyToSendReqs.map(r => r.id)
   if (batch) {
     for (const req of readyToSendReqs) req.batch = batch
     await storage.updateProvenTxReq(readyToSendReqIds, { batch })

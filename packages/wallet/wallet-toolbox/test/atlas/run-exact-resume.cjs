@@ -26,7 +26,10 @@ const scenarios = [
   'delayed',
   'delayed-race',
   'proof',
-  'incomplete-set'
+  'incomplete-set',
+  'poc2-multi',
+  'poc2-transient',
+  'poc2-transient-delayed'
 ]
 const [launcher, fixture] = process.argv.slice(2)
 if (!launcher || !fixture) throw new Error('Usage: node run-exact-resume.cjs <node-or-tsx> <fixture-path>')
