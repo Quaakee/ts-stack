@@ -316,18 +316,28 @@ async function main() {
     }
     const { TaskSendWaiting } = require('../../src/monitor/tasks/TaskSendWaiting.ts')
     const networkStatus = async id => (await services.getStatusForTxids([id])).results[0].status
-    // #59 R2-1: a refused or incomplete set leaves no exact-retry state, so the monitor has nothing to send.
-    const assertNoRetryState = async others => {
-      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
-      assert.equal((await active.findTransactions({ partial: { transactionId: txId } }))[0].status, 'failed')
-      const input = (await active.findOutputs({ partial: { outputId: inputId } }))[0]
-      assert.ok(input.spentBy == null, `input reserved by ${input.spentBy}`)
-      assert.equal(input.spendable, true)
-      for (const output of await active.findOutputs({ partial: { transactionId: txId } }))
-        assert.equal(output.spendable, false)
+    // SendWaiting only sends requests updated strictly before its run (agedMsecs 0), so let the
+    // clock pass whatever was just queued; otherwise "sends nothing" could pass vacuously.
+    const sendWaiting = async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
       await new TaskSendWaiting(monitor, 0, 0).runTask()
-      for (const id of [txid, ...others]) assert.equal(await networkStatus(id), 'unknown', `${id} was broadcast`)
-      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
+    }
+    // #59 R2-1: a refused or incomplete set leaves no exact-retry state, so the monitor has nothing to send.
+    const assertNoRetryState = async (others, mode) => {
+      const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(req.status, 'invalid', `${mode}: retry request committed`)
+      const [action] = await active.findTransactions({ partial: { transactionId: txId } })
+      assert.equal(action.status, 'failed', `${mode}: retry action committed`)
+      const input = (await active.findOutputs({ partial: { outputId: inputId } }))[0]
+      assert.ok(input.spentBy == null, `${mode}: input reserved by ${input.spentBy}`)
+      assert.equal(input.spendable, true, `${mode}: input reserved`)
+      for (const output of await active.findOutputs({ partial: { transactionId: txId } }))
+        assert.equal(output.spendable, false, `${mode}: retry outputs released`)
+      await sendWaiting()
+      for (const id of [txid, ...others])
+        assert.equal(await networkStatus(id), 'unknown', `${mode}: ${id} was broadcast`)
+      const [after] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(after.status, 'invalid', `${mode}: monitor advanced the retry`)
     }
     if (scenario === 'poc2-multi') {
       // B spends A:0 as a chained atomic pair; B passes read-only planning but fails the commit's
@@ -380,8 +390,9 @@ async function main() {
           }),
           /Exact retry requires one owned failed outgoing action/
         )
-        assert.equal((await active.findProvenTxReqs({ partial: { txid: txidB } }))[0].status, 'invalid')
-        await assertNoRetryState([txidB])
+        const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
+        assert.equal((await active.findProvenTxReqs({ partial: { txid: txidB } }))[0].status, 'invalid', mode)
+        await assertNoRetryState([txidB], mode)
       }
       // Nothing was left half-committed: A alone still resumes and broadcasts.
       const result = await resume()
@@ -501,14 +512,14 @@ async function main() {
         JSON.stringify(refused)
       )
       assert.equal((await active.findProvenTxReqs({ partial: { txid: txidB } }))[0].status, 'nosend')
-      await assertNoRetryState([txidB])
+      await assertNoRetryState([txidB], `${delayed ? 'delayed' : 'immediate'} decision-lookup fault`)
       // 2. A fault on any later lookup (the reviewer's injection) never fires: the set is decided
       // once, so the retry and B are sent together and the caller is told so.
       inject(n => n > decision)
       const sent = await share()
       const lookupsMade = lookups
       restore()
-      assert.equal(lookupsMade, decision, `share lookups after planning: ${lookupsMade}`)
+      assert.equal(lookupsMade, decision, `later-lookup fault: ${lookupsMade} lookups, the share re-looked-up`)
       if (delayed) {
         assert.deepEqual(sent.sendWithResults.map(result => result.status), ['sending', 'sending'], JSON.stringify(sent))
         const [reqA] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
@@ -517,7 +528,7 @@ async function main() {
         assert.equal(reqB.status, 'unsent')
         assert.ok(reqA.batch != null && reqA.batch === reqB.batch, `batches ${reqA.batch} / ${reqB.batch}`)
         assert.equal(await networkStatus(txid), 'unknown')
-        await new TaskSendWaiting(monitor, 0, 0).runTask()
+        await sendWaiting()
       } else {
         assert.deepEqual(sent.sendWithResults.map(result => result.status), ['unproven', 'unproven'], JSON.stringify(sent))
       }
