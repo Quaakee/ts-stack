@@ -7,7 +7,14 @@ import {
   WalletLoggerInterface,
   TelemetrySpan
 } from '@bsv/sdk'
-import { isExactResume, lockExactResumeBinding, resumeFailedSendWith } from './resumeFailedSendWith'
+import {
+  admitExactResumes,
+  commitExactResumes,
+  ExactResumeCandidate,
+  isExactResume,
+  lockExactResumeBinding,
+  planExactResumes
+} from './resumeFailedSendWith'
 import { aggregateActionResults } from '../../utility/aggregateResults'
 import { StorageProvider } from '../StorageProvider'
 import {
@@ -105,14 +112,24 @@ async function processActionCore(
     }
   }
 
-  await resumeFailedSendWith(storage, userId, args.sendWith)
+  // #589: exact retries are only planned (read-only) here. The share admits them from its one
+  // lookup and commits them, all in one transaction, before anything is scheduled or posted.
+  const exactResumes = await planExactResumes(storage, userId, args.sendWith)
 
   const { swr, ndr } = await traceProcessStep(
     storage,
     'wallet.storage.process_action.share',
     parent,
     async () =>
-      await shareReqsWithWorld(storage, userId, txidsOfReqsToShareWithWorld, args.isDelayed, undefined, logger)
+      await shareSendWithSet(
+        storage,
+        userId,
+        txidsOfReqsToShareWithWorld,
+        args.isDelayed,
+        undefined,
+        logger,
+        exactResumes
+      )
   )
 
   r.sendWithResults = swr
@@ -254,6 +271,44 @@ export async function shareReqsWithWorld(
   r?: GetReqsAndBeefResult,
   logger?: WalletLoggerInterface
 ): Promise<{ swr: SendWithResult[]; ndr: ReviewActionResult[] | undefined }> {
+  return await shareSendWithSet(storage, userId, txids, isDelayed, r, logger, [])
+}
+
+/**
+ * #589: each admitted retry's request, as committed or as another caller left it, replaces the
+ * planned failed one only while it stays sendable, or is marked unproven when already sent.
+ * Anything else throws inside the commit transaction, which then commits no retry at all.
+ */
+function reconcileCommittedResumes(
+  committed: EntityProvenTxReq[],
+  readyToSendReqs: EntityProvenTxReq[],
+  swr: SendWithResult[]
+): void {
+  for (const req of committed) {
+    const detail: GetReqsAndBeefDetail = { txid: req.txid, status: 'unknown' }
+    classifyReqStatus(detail, req.toApi())
+    const index = readyToSendReqs.findIndex(ready => ready.txid === req.txid)
+    if (index < 0) throw new WERR_INTERNAL('An admitted exact retry is missing from its set.')
+    if (detail.status === 'readyToSend') {
+      readyToSendReqs[index] = req
+    } else if (detail.status === 'alreadySent') {
+      readyToSendReqs.splice(index, 1)
+      swr.find(result => result.txid === req.txid)!.status = 'unproven'
+    } else {
+      throw new WERR_INVALID_OPERATION('Exact retry state changed before it could be committed.')
+    }
+  }
+}
+
+async function shareSendWithSet(
+  storage: StorageProvider,
+  userId: number,
+  txids: string[],
+  isDelayed: boolean,
+  r: GetReqsAndBeefResult | undefined,
+  logger: WalletLoggerInterface | undefined,
+  exactResumes: ExactResumeCandidate[]
+): Promise<{ swr: SendWithResult[]; ndr: ReviewActionResult[] | undefined }> {
   const swr: SendWithResult[] = []
   const ndr: ReviewActionResult[] | undefined = undefined
 
@@ -262,6 +317,12 @@ export async function shareReqsWithWorld(
   r ??= isDelayed
     ? await getReqDetailsForDelayedShare(storage, txids)
     : await storage.getReqsAndBeefToShareWithWorld(txids, [])
+
+  // #589: this one lookup is the only decision for the set. A planned retry is sendable only while
+  // the lookup still shows its planned failed request and every other member already is sendable;
+  // it is committed below, before anything is scheduled or posted, so the results reported here
+  // and the persisted state cannot disagree.
+  const admitted = admitExactResumes(r, exactResumes, isDelayed)
 
   const readyToSendReqs: EntityProvenTxReq[] = []
   classifyReqDetails(r.details, swr, readyToSendReqs)
@@ -274,6 +335,9 @@ export async function shareReqsWithWorld(
     // transaction here because the current aggregate BEEF is only a scheduling artifact.
     if (readyToSendReqIds.length > 0) {
       await storage.transaction(async trx => {
+        // #589: retries commit in the same transaction that schedules their set.
+        if (admitted.length > 0)
+          reconcileCommittedResumes(await commitExactResumes(storage, userId, admitted, trx), readyToSendReqs, swr)
         const ordinary = readyToSendReqs.filter(req => !isExactResume(req))
         if (ordinary.length > 0) {
           await storage.updateProvenTxReq(
@@ -312,9 +376,26 @@ export async function shareReqsWithWorld(
 
   await verifyMergedBeef(storage, r, readyToSendReqs, logger)
 
+  if (admitted.length > 0) {
+    // #589: admitted retries commit only after every check above, and in the same transaction
+    // as every exact binding's revalidation and the set's batch, so nothing between this commit
+    // and the post below can refuse the set.
+    await storage.transaction(async trx => {
+      reconcileCommittedResumes(await commitExactResumes(storage, userId, admitted, trx), readyToSendReqs, swr)
+      for (const req of readyToSendReqs.filter(isExactResume)) await lockExactResumeBinding(storage, req, trx, userId)
+      if (batch && readyToSendReqs.length > 0)
+        await storage.updateProvenTxReq(
+          readyToSendReqs.map(req => req.id),
+          { batch },
+          trx
+        )
+    })
+    if (readyToSendReqs.length < 1) return { swr, ndr }
+  }
+
   if (batch) {
     for (const req of readyToSendReqs) req.batch = batch
-    await storage.updateProvenTxReq(readyToSendReqIds, { batch })
+    if (admitted.length === 0) await storage.updateProvenTxReq(readyToSendReqIds, { batch })
   }
 
   const prtn = await storage.attemptToPostReqsToNetwork(readyToSendReqs, undefined, logger)

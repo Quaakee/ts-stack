@@ -277,12 +277,356 @@ async function main() {
         monitor
       })
     }
+    const { TaskSendWaiting } = require('../../src/monitor/tasks/TaskSendWaiting.ts')
+    const networkStatus = async id => (await services.getStatusForTxids([id])).results[0].status
+    // SendWaiting only sends requests updated strictly before its run (agedMsecs 0), so let the
+    // clock pass whatever was just queued; otherwise "sends nothing" could pass vacuously.
+    const sendWaiting = async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      await new TaskSendWaiting(monitor, 0, 0).runTask()
+    }
+    // #589: a refused set, or a retry the share did not admit, leaves no exact-retry state, so the
+    // monitor has nothing to send on its own.
+    const assertNoRetryState = async (others, mode) => {
+      const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(req.status, 'invalid', `${mode}: retry request committed`)
+      const [action] = await active.findTransactions({ partial: { transactionId: txId } })
+      assert.equal(action.status, 'failed', `${mode}: retry action committed`)
+      const input = (await active.findOutputs({ partial: { outputId: inputId } }))[0]
+      assert.ok(input.spentBy == null, `${mode}: input reserved by ${input.spentBy}`)
+      assert.equal(input.spendable, true, `${mode}: input reserved`)
+      for (const output of await active.findOutputs({ partial: { transactionId: txId } }))
+        assert.equal(output.spendable, false, `${mode}: retry outputs released`)
+      await sendWaiting()
+      for (const id of [txid, ...others])
+        assert.equal(await networkStatus(id), 'unknown', `${mode}: ${id} was broadcast`)
+      const [after] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(after.status, 'invalid', `${mode}: monitor advanced the retry`)
+    }
+    // An independent, ordinary nosend action spending the coinbase mined at `height`.
+    const insertNosend = async (height, label) => {
+      const [cb] = await services.storage
+        .knex('mockchain_utxos')
+        .where({ isCoinbase: true, blockHeight: height, spentByTxid: null })
+      const ib = await services.getBeefForTxid(cb.txid)
+      const tx = new Transaction()
+      tx.addInput({
+        sourceTXID: cb.txid,
+        sourceOutputIndex: cb.vout,
+        unlockingScript: Script.fromHex(''),
+        sequence: 0xffffffff
+      })
+      tx.addOutput({ satoshis: Number(cb.satoshis) - 1, lockingScript: Script.fromHex('51') })
+      const id = tx.id('hex')
+      const transactionId = await active.insertTransaction({
+        created_at: now,
+        updated_at: now,
+        transactionId: 0,
+        userId: user.userId,
+        status: 'nosend',
+        reference: Buffer.from(label).toString('base64'),
+        isOutgoing: true,
+        satoshis: -1,
+        description: label,
+        txid: id
+      })
+      const provenTxReqId = await active.insertProvenTxReq({
+        created_at: now,
+        updated_at: now,
+        provenTxReqId: 0,
+        status: 'nosend',
+        attempts: 1,
+        notified: false,
+        txid: id,
+        history: JSON.stringify({ notes: [] }),
+        notify: JSON.stringify({ transactionIds: [transactionId] }),
+        rawTx: [...tx.toBinary()],
+        inputBEEF: ib.toBinary()
+      })
+      const fund = await active.insertTransaction({
+        created_at: now,
+        updated_at: now,
+        transactionId: 0,
+        userId: user.userId,
+        status: 'completed',
+        reference: Buffer.from(`${label} source`).toString('base64'),
+        isOutgoing: false,
+        satoshis: Number(cb.satoshis),
+        description: `${label} source`,
+        txid: cb.txid
+      })
+      await active.insertOutput({
+        ...outputBase,
+        transactionId: fund,
+        spendable: false,
+        spentBy: transactionId,
+        vout: cb.vout,
+        satoshis: Number(cb.satoshis),
+        txid: cb.txid,
+        lockingScript: [81]
+      })
+      await active.insertOutput({
+        ...outputBase,
+        transactionId,
+        spendable: false,
+        vout: 0,
+        satoshis: Number(cb.satoshis) - 1,
+        txid: id,
+        lockingScript: [81]
+      })
+      return { txid: id, reqId: provenTxReqId }
+    }
+    if (scenario === 'incomplete-set') {
+      // A sendWith set that cannot be sent together commits no exact-retry state, in both immediate
+      // and delayed modes, so the monitor later finds nothing to broadcast. On this base an
+      // immediate share of an incomplete set posts its ready members and then throws.
+      const missing = 'ab'.repeat(32)
+      for (const acceptDelayedBroadcast of [false, true]) {
+        const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
+        const outcome = await wallet
+          .createAction({
+            description: 'resume with incomplete set',
+            options: { sendWith: [txid, missing], acceptDelayedBroadcast }
+          })
+          .catch(error => error)
+        const reported = outcome.sendWithResults?.find(result => result.txid === txid)?.status
+        assert.ok(
+          reported === undefined || reported === 'failed',
+          `${mode}: ${JSON.stringify(outcome.sendWithResults)}`
+        )
+        await assertNoRetryState([], `${mode} incomplete set`)
+      }
+      // The same retry inside a complete set still resumes and broadcasts.
+      const result = await resume()
+      assert.equal(result.sendWithResults[0].status, 'unproven', JSON.stringify(result))
+      assert.equal(await networkStatus(txid), 'known')
+      console.log('PASS incomplete-set: no retry state committed, nothing broadcast alone, complete set still resumes')
+      return
+    }
+    if (scenario === 'poc2-multi') {
+      // B spends A:0 as a chained atomic pair; B passes read-only planning but fails the commit's
+      // ownership check (isOutgoing=false). A's retry must not survive B's refusal in either mode.
+      const b = new Transaction()
+      b.addInput({ sourceTXID: txid, sourceOutputIndex: 0, unlockingScript: Script.fromHex(''), sequence: 0xffffffff })
+      b.addOutput({ satoshis: 4_999_999_998, lockingScript: Script.fromHex('51') })
+      const txidB = b.id('hex')
+      const bBeef = Beef.fromBinary(inputBeef.toBinary())
+      bBeef.mergeRawTx(rawTx)
+      const txIdB = await active.insertTransaction({
+        created_at: now,
+        updated_at: now,
+        transactionId: 0,
+        userId: user.userId,
+        status: 'failed',
+        reference: Buffer.from('secondB').toString('base64'),
+        isOutgoing: false,
+        satoshis: -1,
+        description: 'second action',
+        txid: txidB
+      })
+      await active.insertProvenTxReq({
+        created_at: now,
+        updated_at: now,
+        provenTxReqId: 0,
+        status: 'invalid',
+        attempts: 1,
+        notified: false,
+        txid: txidB,
+        history: JSON.stringify({ notes: [] }),
+        notify: JSON.stringify({ transactionIds: [txIdB] }),
+        rawTx: [...b.toBinary()],
+        inputBEEF: bBeef.toBinary()
+      })
+      await active.insertOutput({
+        ...outputBase,
+        transactionId: txIdB,
+        spendable: false,
+        vout: 0,
+        satoshis: 4_999_999_998,
+        txid: txidB,
+        lockingScript: [81]
+      })
+      for (const acceptDelayedBroadcast of [false, true]) {
+        await assert.rejects(
+          wallet.createAction({
+            description: 'resume a set whose second retry is refused',
+            options: { sendWith: [txid, txidB], acceptDelayedBroadcast }
+          }),
+          /Exact retry requires one owned failed outgoing action/
+        )
+        const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
+        assert.equal((await active.findProvenTxReqs({ partial: { txid: txidB } }))[0].status, 'invalid', mode)
+        await assertNoRetryState([txidB], mode)
+      }
+      // Nothing was left half-committed: A alone still resumes and broadcasts.
+      const result = await resume()
+      assert.equal(result.sendWithResults[0].status, 'unproven', JSON.stringify(result))
+      assert.equal(await networkStatus(txid), 'known')
+      console.log('PASS poc2-multi: a refused member rolls back every retry in the set, in both modes')
+      return
+    }
+    if (scenario === 'poc2-transient' || scenario === 'poc2-transient-delayed') {
+      // The coinbases mined at heights 1 and 2 mature after two more blocks.
+      await services.mineBlock()
+      await services.mineBlock()
+      const delayed = scenario === 'poc2-transient-delayed'
+      const mode = delayed ? 'delayed' : 'immediate'
+      const share = sendWith =>
+        wallet.createAction({
+          description: 'resume beside an ordinary nosend action',
+          options: { sendWith, acceptDelayedBroadcast: delayed }
+        })
+      // Each member's reads outside any transaction: read 1 is planning, read 2 is the share's lookup.
+      const find = active.findProvenTxReqs.bind(active)
+      const faultShareLookup = async (faulty, sendWith) => {
+        let reads = 0
+        active.findProvenTxReqs = async args => {
+          if (!args.trx && args.partial?.txid === faulty && ++reads === 2) throw new Error('transient lookup failure')
+          return find(args)
+        }
+        const outcome = await share(sendWith).catch(error => error)
+        active.findProvenTxReqs = find
+        assert.equal(reads, 2, `${mode}: the share's lookup did not read ${faulty}`)
+        return outcome
+      }
+      const b = await insertNosend(1, 'poc2-transient B')
+      // 1a. B's read in the share's lookup fails: the set is incomplete, so the retry is not admitted
+      // and nothing is committed, scheduled or posted.
+      const incomplete = await faultShareLookup(b.txid, [txid, b.txid])
+      assert.deepEqual(
+        incomplete.sendWithResults?.map(result => result.status),
+        ['failed', 'failed'],
+        `${mode}: ${JSON.stringify(incomplete.sendWithResults ?? incomplete)}`
+      )
+      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: b.reqId } }))[0].status, 'nosend')
+      await assertNoRetryState([b.txid], `${mode} B share-lookup fault`)
+      // 1b. A's own read in the share's lookup fails. The share then reports A as not sent, so nothing
+      // may be committed for A. On this 2.10.2 base the ready member B is still shared on its own: an
+      // immediate share posts it and then throws, a delayed one schedules it and reports A failed.
+      const unadmitted = await faultShareLookup(txid, [txid, b.txid])
+      const toldA = unadmitted.sendWithResults?.find(result => result.txid === txid)?.status
+      assert.ok(
+        delayed ? toldA === 'failed' : unadmitted instanceof Error && toldA === undefined,
+        `${mode}: ${JSON.stringify(unadmitted.sendWithResults ?? unadmitted.message)}`
+      )
+      await assertNoRetryState([], `${mode} A share-lookup fault`)
+      // 2. Without the fault the same retry is admitted and goes out with its set.
+      const c = await insertNosend(2, 'poc2-transient C')
+      const sent = await share([txid, c.txid])
+      if (delayed) {
+        assert.deepEqual(
+          sent.sendWithResults.map(result => result.status),
+          ['sending', 'sending'],
+          JSON.stringify(sent)
+        )
+        const [reqA] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+        const [reqC] = await active.findProvenTxReqs({ partial: { provenTxReqId: c.reqId } })
+        assert.equal(reqA.status, 'unsent')
+        assert.equal(reqC.status, 'unsent')
+        assert.ok(reqA.batch != null && reqA.batch === reqC.batch, `batches ${reqA.batch} / ${reqC.batch}`)
+        assert.equal(await networkStatus(txid), 'unknown')
+        await sendWaiting()
+      } else {
+        assert.deepEqual(
+          sent.sendWithResults.map(result => result.status),
+          ['unproven', 'unproven'],
+          JSON.stringify(sent)
+        )
+      }
+      assert.equal(await networkStatus(txid), 'known')
+      assert.equal(await networkStatus(c.txid), 'known')
+      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'unmined')
+      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: c.reqId } }))[0].status, 'unmined')
+      assert.equal((await active.findOutputs({ partial: { outputId: inputId } }))[0].spentBy, txId)
+      console.log(
+        `PASS ${scenario}: one share decision; an unadmitted retry commits nothing, an admitted one goes with its set`
+      )
+      return
+    }
+    if (scenario === 'poc2-ordering' || scenario === 'poc2-ordering-delayed') {
+      // A refusal after the share's decision but before the set is posted or scheduled must leave
+      // no retry state: the retry commits with the set's batch, after every pre-post check.
+      await services.mineBlock()
+      const delayed = scenario === 'poc2-ordering-delayed'
+      const b = await insertNosend(1, 'poc2-ordering B')
+      const setWith = async (label, inject, expected) => {
+        const restore = inject()
+        await assert.rejects(
+          wallet.createAction({
+            description: `resume beside B: ${label}`,
+            options: { sendWith: [txid, b.txid], acceptDelayedBroadcast: delayed }
+          }),
+          expected
+        )
+        restore()
+        await assertNoRetryState([b.txid], label)
+        assert.equal(
+          (await active.findProvenTxReqs({ partial: { provenTxReqId: b.reqId } }))[0].status,
+          'nosend',
+          label
+        )
+      }
+      const update = active.updateProvenTxReq.bind(active)
+      const touchesB = id => (Array.isArray(id) ? id : [id]).includes(b.reqId)
+      if (delayed) {
+        // The scheduling write for the set fails inside the scheduling transaction.
+        await setWith(
+          'delayed scheduling write fails',
+          () => {
+            active.updateProvenTxReq = async (id, fields, trx) => {
+              if (touchesB(id) && fields.status === 'unsent') throw new Error('crash scheduling the set')
+              return update(id, fields, trx)
+            }
+            return () => (active.updateProvenTxReq = update)
+          },
+          /crash scheduling the set/
+        )
+      } else {
+        // The set's merged BEEF is refused.
+        const get = active.getReqsAndBeefToShareWithWorld.bind(active)
+        await setWith(
+          'immediate merged BEEF refused',
+          () => {
+            active.getReqsAndBeefToShareWithWorld = async (...args) => {
+              const r = await get(...args)
+              r.beef.verify = async () => false
+              return r
+            }
+            return () => (active.getReqsAndBeefToShareWithWorld = get)
+          },
+          /merged Beef failed validation/
+        )
+        // The set's batch write fails.
+        await setWith(
+          'immediate batch write fails',
+          () => {
+            active.updateProvenTxReq = async (id, fields, trx) => {
+              if (touchesB(id) && Object.keys(fields).join() === 'batch') throw new Error('crash writing the set batch')
+              return update(id, fields, trx)
+            }
+            return () => (active.updateProvenTxReq = update)
+          },
+          /crash writing the set batch/
+        )
+      }
+      // Nothing was left half-committed: A alone still resumes and broadcasts.
+      const result = await resume()
+      assert.equal(result.sendWithResults[0].status, 'unproven', JSON.stringify(result))
+      assert.equal(await networkStatus(txid), 'known')
+      console.log(`PASS ${scenario}: a refusal before the post or schedule leaves no retry state`)
+      return
+    }
     if (scenario === 'delayed-race') {
       const find = active.findProvenTxReqs.bind(active)
       let changed = false
+      let reads = 0
       active.findProvenTxReqs = async args => {
         const rows = await find(args)
-        if (!args.trx && !changed && rows[0]?.status === 'unsent') {
+        // The concurrent broadcast lands after the request was queued or, now that the retry and
+        // its delayed scheduling commit in one transaction (#589), at the share's lookup (read 2
+        // of A; read 1 is planning), the last moment before that transaction.
+        const shareLookup = !args.trx && args.partial?.txid === txid && ++reads === 2
+        if (!args.trx && !changed && (rows[0]?.status === 'unsent' || shareLookup)) {
           changed = true
           await active.updateProvenTxReq(reqId, { status: 'unmined' })
           await active.updateTransaction(txId, { status: 'unproven' })
@@ -350,9 +694,13 @@ async function main() {
         }
       } else {
         const find = active.findProvenTxReqs.bind(active)
+        let reads = 0
         active.findProvenTxReqs = async args => {
           const rows = await find(args)
-          if (!args.trx && rows[0]?.status === 'unsent') await addForeign()
+          // As in delayed-race: after queueing, or at the share's lookup before the one
+          // transaction that commits and schedules the retry (#589).
+          const shareLookup = !args.trx && args.partial?.txid === txid && ++reads === 2
+          if (!args.trx && (rows[0]?.status === 'unsent' || shareLookup)) await addForeign()
           return rows
         }
       }
@@ -362,8 +710,12 @@ async function main() {
           : resume()
       )
       assert.equal((await active.findTransactions({ partial: { transactionId: foreignTxId } }))[0].status, 'failed')
-      if (scenario !== 'shared-during-post')
+      if (scenario !== 'shared-during-post') {
         assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'unknown')
+        // #589: the refusal comes before the retry commits, so no retry state survives it.
+        assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
+        assert.ok((await active.findOutputs({ partial: { outputId: inputId } }))[0].spentBy == null)
+      }
       console.log(`PASS refuses ${scenario} without advancing foreign action`)
       return
     }
