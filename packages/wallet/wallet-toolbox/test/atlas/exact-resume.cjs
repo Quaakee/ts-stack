@@ -519,9 +519,14 @@ async function main() {
       const sent = await share()
       const lookupsMade = lookups
       restore()
+      const told = sent.sendWithResults.map(result => result.status)
+      const [committed] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      // The caller's results must describe what was persisted: never failed beside a committed retry.
+      if (told.includes('failed'))
+        assert.equal(committed.status, 'invalid', `later-lookup fault: told ${told} but the retry is ${committed.status}`)
       assert.equal(lookupsMade, decision, `later-lookup fault: ${lookupsMade} lookups, the share re-looked-up`)
       if (delayed) {
-        assert.deepEqual(sent.sendWithResults.map(result => result.status), ['sending', 'sending'], JSON.stringify(sent))
+        assert.deepEqual(told, ['sending', 'sending'], JSON.stringify(sent))
         const [reqA] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
         const [reqB] = await active.findProvenTxReqs({ partial: { txid: txidB } })
         assert.equal(reqA.status, 'unsent')
@@ -530,7 +535,7 @@ async function main() {
         assert.equal(await networkStatus(txid), 'unknown')
         await sendWaiting()
       } else {
-        assert.deepEqual(sent.sendWithResults.map(result => result.status), ['unproven', 'unproven'], JSON.stringify(sent))
+        assert.deepEqual(told, ['unproven', 'unproven'], JSON.stringify(sent))
       }
       assert.equal(await networkStatus(txid), 'known')
       assert.equal(await networkStatus(txidB), 'known')
