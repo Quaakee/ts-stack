@@ -384,11 +384,13 @@ async function shareSendWithSet (
   const readyToSendReqs: EntityProvenTxReq[] = []
   if (!classifyReqDetails(r.details, swr, readyToSendReqs)) return { swr, ndr }
 
+  const readyToSendReqIds = readyToSendReqs.map(r => r.id)
+
   const batch = txids.length > 1 ? randomBytesBase64(16) : undefined
   if (isDelayed) {
     // Delayed sends rebuild BEEF when the monitor sends the req. Do not fail a committed
     // transaction here because the current aggregate BEEF is only a scheduling artifact.
-    if (readyToSendReqs.length > 0) {
+    if (readyToSendReqIds.length > 0) {
       await storage.transaction(async trx => {
         // #59 R2-1: retries commit in the same transaction that schedules their set.
         if (admitted.length > 0)
@@ -426,28 +428,35 @@ async function shareSendWithSet (
     return { swr, ndr }
   }
 
-  if (readyToSendReqs.length < 1) return { swr, ndr }
-
-  if (admitted.length > 0) {
-    // #59 R2-1: verify first, so a set whose merged BEEF is refused commits no retry.
-    await verifyMergedBeef(storage, r, readyToSendReqs, logger)
-    await storage.transaction(async trx => {
-      reconcileCommittedResumes(await commitExactResumes(storage, userId, admitted, trx), readyToSendReqs, swr)
-    })
-    if (readyToSendReqs.length < 1) return { swr, ndr }
-  }
+  if (readyToSendReqIds.length < 1) return { swr, ndr }
 
   for (const req of readyToSendReqs.filter(isExactResume))
     await storage.transaction(async trx => {
       await lockExactResumeBinding(storage, req, trx, userId)
     })
 
-  if (admitted.length === 0) await verifyMergedBeef(storage, r, readyToSendReqs, logger)
+  await verifyMergedBeef(storage, r, readyToSendReqs, logger)
 
-  const readyToSendReqIds = readyToSendReqs.map(r => r.id)
+  if (admitted.length > 0) {
+    // #59 R2-1: admitted retries commit only after every check above, and in the same
+    // transaction as every exact binding's revalidation and the set's batch, so nothing
+    // between this commit and the post below can refuse the set.
+    await storage.transaction(async trx => {
+      reconcileCommittedResumes(await commitExactResumes(storage, userId, admitted, trx), readyToSendReqs, swr)
+      for (const req of readyToSendReqs.filter(isExactResume)) await lockExactResumeBinding(storage, req, trx, userId)
+      if (batch && readyToSendReqs.length > 0)
+        await storage.updateProvenTxReq(
+          readyToSendReqs.map(req => req.id),
+          { batch },
+          trx
+        )
+    })
+    if (readyToSendReqs.length < 1) return { swr, ndr }
+  }
+
   if (batch) {
     for (const req of readyToSendReqs) req.batch = batch
-    await storage.updateProvenTxReq(readyToSendReqIds, { batch })
+    if (admitted.length === 0) await storage.updateProvenTxReq(readyToSendReqIds, { batch })
   }
 
   const prtn = await storage.attemptToPostReqsToNetwork(readyToSendReqs, undefined, logger)
