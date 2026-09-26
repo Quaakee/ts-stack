@@ -196,7 +196,7 @@
       "name": "@bsv/wallet-toolbox",
       "publishedVersion": "2.10.0",
       "releaseType": "patch",
-      "summary": "ATLAS maintained 2.10.2-atlas.520.1 artifact: exact signed-action recovery through existing sendWith, atomic reservation/lifecycle recovery, and indeterminate handling of ambiguous broadcast responses.",
+      "summary": "ATLAS maintained 2.10.2-atlas.520.2 artifact: exact signed-action recovery through existing sendWith, all-or-nothing reservation/lifecycle recovery for every retry in a sendWith set, and indeterminate handling of ambiguous broadcast responses.",
       "migration": "No WalletInterface or wire migration. Pin the immutable ATLAS artifact. Consumers must retain the original action on serviceError or recovery refusal and never infer retirement from failed status or abort success."
     },
     {

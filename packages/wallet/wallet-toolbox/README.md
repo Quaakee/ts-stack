@@ -8,8 +8,9 @@ A [BRC-100](https://github.com/bitcoin-sv/BRCs/blob/master/wallet/0100.md) confo
 
 ## ATLAS maintained lifecycle repair
 
-The `2.10.2-atlas.520.1` artifact adds safe exact signed-action retry through
-existing `sendWith`; see [compatibility and limitations](docs/atlas-exact-resume.md).
+The `2.10.2-atlas.520.2` artifact adds safe exact signed-action retry through
+existing `sendWith`, committing a set's retries all or nothing; see
+[compatibility and limitations](docs/atlas-exact-resume.md).
 It does not authorize creating replacement actions after uncertain broadcasts.
 
 ## Overview

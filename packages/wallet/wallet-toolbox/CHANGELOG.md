@@ -4,6 +4,23 @@ This document captures the history of significant changes to the wallet-toolbox 
 The git commit history contains the details but is unable to draw
 attention to changes that materially alter behavior or extend functionality.
 
+## 2.10.2-atlas.520.2 (ATLAS maintained artifact)
+
+- Commit the exact retries of a `sendWith` set all or nothing (ATLAS #589).
+  Every retry is first planned read-only. The share's one lookup then admits a
+  retry only while it still shows the planned failed request and every other
+  member of the set is already sendable or already sent. All admitted retries
+  commit in one storage transaction, with every row lock taken before the first
+  read and every existing check applied, so any refusal leaves no retry state.
+  With delayed broadcast that transaction also schedules the set; in immediate
+  mode it follows the exact-binding checks and merged-BEEF verification and also
+  records the set's batch, so only the post follows it. In
+  `2.10.2-atlas.520.1` a refused later retry, a retry the share then reported
+  failed, or a failed check after the commit could leave a retry queued for the
+  monitor to broadcast alone while the caller received an error or failed result.
+- Ordinary `sendWith` sharing is unchanged from 2.10.2.
+  See [exact-retry compatibility and limitations](docs/atlas-exact-resume.md).
+
 ## 2.10.2-atlas.520.1 (ATLAS maintained artifact)
 
 - Extend existing `createAction` `sendWith` to recover a validated failed signed
