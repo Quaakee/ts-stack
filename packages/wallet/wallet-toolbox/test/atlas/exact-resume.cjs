@@ -404,27 +404,23 @@ async function main() {
       return
     }
     if (scenario === 'duplicate-member' || scenario === 'duplicate-member-delayed') {
-      // A txid listed twice is one retry: every result reported for it matches what was persisted,
-      // and each of its positions takes the exact-retry path. Immediate mode posts to an offline
+      // A txid listed twice is one retry: every result storage reports for it matches what was
+      // persisted, and each of its positions takes the exact-retry path. Storage is called directly,
+      // as a remote client's processAction reaches it: whether createAction itself rejects duplicate
+      // sendWith txids depends on the paired SDK's validation. Immediate mode posts to an offline
       // provider, which an exact retry must report as indeterminate (sending), never as an error.
-      const acceptDelayedBroadcast = scenario === 'duplicate-member-delayed'
-      const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
-      if (!acceptDelayedBroadcast)
+      const isDelayed = scenario === 'duplicate-member-delayed'
+      const mode = isDelayed ? 'delayed' : 'immediate'
+      if (!isDelayed)
         services.postBeef = async () => {
           throw new Error('offline')
         }
-      const result = await wallet
-        .createAction({
-          description: 'resume a retry listed twice',
-          options: { sendWith: [txid, txid], acceptDelayedBroadcast }
-        })
-        .catch(error => {
-          assert.equal(error.name, 'WERR_REVIEW_ACTIONS', `${mode}: ${error.message}`)
-          return error
-        })
+      const result = await manager
+        .processAction({ isNewTx: false, isSendWith: true, isNoSend: false, isDelayed, sendWith: [txid, txid] })
+        .catch(error => assert.fail(`${mode}: ${error.name} ${error.message}`))
       services.postBeef = post
       const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
-      assert.equal(req.status, acceptDelayedBroadcast ? 'unsent' : 'sending', mode)
+      assert.equal(req.status, isDelayed ? 'unsent' : 'sending', mode)
       assert.deepEqual(
         result.sendWithResults.map(r => r.status),
         ['sending', 'sending'],
