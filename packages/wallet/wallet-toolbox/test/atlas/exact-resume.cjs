@@ -403,6 +403,40 @@ async function main() {
       console.log('PASS incomplete-set: no retry state committed, nothing broadcast alone, complete set still resumes')
       return
     }
+    if (scenario === 'duplicate-member' || scenario === 'duplicate-member-delayed') {
+      // A txid listed twice is one retry: every result reported for it matches what was persisted,
+      // and each of its positions takes the exact-retry path. Immediate mode posts to an offline
+      // provider, which an exact retry must report as indeterminate (sending), never as an error.
+      const acceptDelayedBroadcast = scenario === 'duplicate-member-delayed'
+      const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
+      if (!acceptDelayedBroadcast)
+        services.postBeef = async () => {
+          throw new Error('offline')
+        }
+      const result = await wallet
+        .createAction({
+          description: 'resume a retry listed twice',
+          options: { sendWith: [txid, txid], acceptDelayedBroadcast }
+        })
+        .catch(error => {
+          assert.equal(error.name, 'WERR_REVIEW_ACTIONS', `${mode}: ${error.message}`)
+          return error
+        })
+      services.postBeef = post
+      const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(req.status, acceptDelayedBroadcast ? 'unsent' : 'sending', mode)
+      assert.deepEqual(
+        result.sendWithResults.map(r => r.status),
+        ['sending', 'sending'],
+        `${mode}: ${JSON.stringify(result.sendWithResults)}`
+      )
+      assert.equal(JSON.parse(req.history).notes.filter(note => note.what === 'exactSendWithResume').length, 1)
+      assert.equal((await active.findOutputs({ partial: { outputId: inputId } }))[0].spentBy, txId)
+      await sendWaiting()
+      assert.equal(await networkStatus(txid), 'known', mode)
+      console.log(`PASS ${scenario}: every result for a retry listed twice matches its one persisted retry`)
+      return
+    }
     if (scenario === 'poc2-multi') {
       // B spends A:0 as a chained atomic pair; B passes read-only planning but fails the commit's
       // ownership check (isOutgoing=false). A's retry must not survive B's refusal in either mode.

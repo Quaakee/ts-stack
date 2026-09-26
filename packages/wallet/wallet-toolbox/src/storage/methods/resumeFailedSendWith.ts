@@ -45,26 +45,31 @@ export async function planExactResumes(
 /**
  * Admit planned retries into the share's one lookup `r` (#589).
  *
- * A candidate is admitted only while `r` still shows its planned failed request, and only when
- * every other member of `r` is already sendable or already sent. This base shares the ready part of
- * an incomplete set (and an immediate share then throws), so a retry must never join one. Admitted
- * details become `readyToSend` (an immediate share also merges their planned, verified BEEF into
- * `r.beef`), so the share's classification reads this same decision. Otherwise `r` keeps the
- * failed details, the share reports every candidate as failed and no retry is ever committed.
+ * A candidate is admitted only while every detail `r` holds for its txid still shows its planned
+ * failed request, and only when every other member of `r` is already sendable or already sent.
+ * This base shares the ready part of an incomplete set (and an immediate share then throws), so a
+ * retry must never join one. Admitted details become `readyToSend` (an immediate share also merges
+ * their planned, verified BEEF into `r.beef`), so the share's classification reads this same
+ * decision. Otherwise `r` keeps the failed details, the share reports every candidate as failed
+ * and no retry is ever committed.
  */
 export function admitExactResumes(
   r: GetReqsAndBeefResult,
   candidates: ExactResumeCandidate[],
   isDelayed: boolean
 ): ExactResumeCandidate[] {
-  const detailOf = (txid: string) => r.details.find(detail => detail.txid === txid)
+  const detailsOf = (txid: string) => r.details.filter(detail => detail.txid === txid)
   const admitted = candidates.filter(candidate => {
-    const detail = detailOf(candidate.txid)
+    const details = detailsOf(candidate.txid)
     return (
-      detail?.status === 'error' &&
-      detail.proven == null &&
-      detail.req?.provenTxReqId === candidate.original.provenTxReqId &&
-      resumableStatuses.includes(detail.req.status)
+      details.length > 0 &&
+      details.every(
+        detail =>
+          detail.status === 'error' &&
+          detail.proven == null &&
+          detail.req?.provenTxReqId === candidate.original.provenTxReqId &&
+          resumableStatuses.includes(detail.req.status)
+      )
     )
   })
   if (admitted.length === 0) return []
@@ -77,7 +82,7 @@ export function admitExactResumes(
     return []
   for (const candidate of admitted) {
     if (!isDelayed) r.beef.mergeBeef(candidate.beef.toBinary())
-    detailOf(candidate.txid)!.status = 'readyToSend'
+    for (const detail of detailsOf(candidate.txid)) detail.status = 'readyToSend'
   }
   return admitted
 }

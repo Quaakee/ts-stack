@@ -27,6 +27,8 @@ const scenarios = [
   'delayed-race',
   'proof',
   'incomplete-set',
+  'duplicate-member',
+  'duplicate-member-delayed',
   'poc2-multi',
   'poc2-transient',
   'poc2-transient-delayed',

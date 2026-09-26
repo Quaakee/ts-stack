@@ -276,8 +276,9 @@ export async function shareReqsWithWorld(
 
 /**
  * #589: each admitted retry's request, as committed or as another caller left it, replaces the
- * planned failed one only while it stays sendable, or is marked unproven when already sent.
- * Anything else throws inside the commit transaction, which then commits no retry at all.
+ * planned failed one (at every position its txid holds in the set) only while it stays sendable,
+ * or is marked unproven when already sent. Anything else throws inside the commit transaction,
+ * which then commits no retry at all.
  */
 function reconcileCommittedResumes(
   committed: EntityProvenTxReq[],
@@ -287,13 +288,13 @@ function reconcileCommittedResumes(
   for (const req of committed) {
     const detail: GetReqsAndBeefDetail = { txid: req.txid, status: 'unknown' }
     classifyReqStatus(detail, req.toApi())
-    const index = readyToSendReqs.findIndex(ready => ready.txid === req.txid)
-    if (index < 0) throw new WERR_INTERNAL('An admitted exact retry is missing from its set.')
+    const indexes = readyToSendReqs.flatMap((ready, index) => (ready.txid === req.txid ? [index] : []))
+    if (indexes.length === 0) throw new WERR_INTERNAL('An admitted exact retry is missing from its set.')
     if (detail.status === 'readyToSend') {
-      readyToSendReqs[index] = req
+      for (const index of indexes) readyToSendReqs[index] = req
     } else if (detail.status === 'alreadySent') {
-      readyToSendReqs.splice(index, 1)
-      swr.find(result => result.txid === req.txid)!.status = 'unproven'
+      for (const index of indexes.reverse()) readyToSendReqs.splice(index, 1)
+      for (const result of swr) if (result.txid === req.txid) result.status = 'unproven'
     } else {
       throw new WERR_INVALID_OPERATION('Exact retry state changed before it could be committed.')
     }
