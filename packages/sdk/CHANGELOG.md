@@ -214,6 +214,10 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Atlas maintained fork: byte snapshots
+
+- Reduce temporary authentication byte-descriptor storage and repeated private HTTP wallet byte copies without weakening validation, resource bounds, mutation isolation or error ordering. No API, wire or data migration; compatible patch impact for a future upstream release. Local content-addressed fork artifacts retain the existing package identity and exact peer compatibility. See [the boundary contract](docs/byte-snapshot-performance.md).
+
 ### ATLAS maintained fork — zero-field initial certificate proofs
 
 - Accept BRC-52 zero-field proofs in the `initialResponse` handshake path only

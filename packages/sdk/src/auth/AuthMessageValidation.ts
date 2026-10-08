@@ -4,6 +4,12 @@ import type { AuthMessage, RequestedCertificateSet } from './types.js'
 import { isUnsafeRecordKey } from '../primitives/SafeRecord.js'
 import { base64ToBytes } from '../wallet/WalletByteEncoding.js'
 
+const IntrinsicArray = Array
+const intrinsicArrayFrom = Array.from
+const intrinsicApply = Reflect.apply
+const intrinsicObjectCreate = Object.create
+const intrinsicNumberIsInteger = Number.isInteger
+
 export const MAX_AUTH_MESSAGE_BYTES = 16 * 1024 * 1024
 export const MAX_AUTH_MESSAGE_DEPTH = 64
 export const MAX_AUTH_MESSAGE_NODES = 100_000
@@ -208,30 +214,52 @@ function walkAuthData<T>(value: T, snapshot: boolean): T {
         if (!Number.isSafeInteger(length) || length < 0 || length > MAX_AUTH_MESSAGE_BYTES) {
           throw new Error('Authentication message array exceeds its limit.')
         }
-        const descriptors = Array.from({ length }, (_, index) =>
-          Object.getOwnPropertyDescriptor(candidate, index)
-        )
-        if (descriptors.some(descriptor => descriptor == null || !('value' in descriptor))) {
+        // Capture every value once without retaining a descriptor object per
+        // byte. Never read candidate[index] again: a Proxy may change between
+        // reads, and the verified snapshot must contain exactly these values.
+        let missingDataProperty = false
+        const shape = intrinsicObjectCreate(null) as { length: number }
+        shape.length = length
+        const values = intrinsicApply(intrinsicArrayFrom, IntrinsicArray, [
+          shape,
+          (_: unknown, index: number) => {
+            const descriptor = Object.getOwnPropertyDescriptor(candidate, index)
+            if (descriptor == null || !('value' in descriptor)) {
+              missingDataProperty = true
+              return undefined
+            }
+            return descriptor.value
+          }
+        ]) as unknown[]
+        if (missingDataProperty) {
           throw new Error('Authentication messages must not contain sparse arrays.')
         }
-        const denseBytes = descriptors.every(
-          descriptor =>
-            Number.isInteger(descriptor!.value) &&
-            descriptor!.value >= 0 &&
-            descriptor!.value <= 255
-        )
+        // Never pass this retained buffer to replaceable array methods. Such
+        // methods could otherwise capture it and mutate a verified payload.
+        let denseBytes = true
+        for (let index = 0; index < values.length; index++) {
+          const value = values[index]
+          if (
+            !intrinsicNumberIsInteger(value) ||
+            (value as number) < 0 ||
+            (value as number) > 255
+          ) {
+            denseBytes = false
+            break
+          }
+        }
         if (denseBytes) {
           // JSON uses at most three digits and a comma for each byte.
           bytes += length * 4 + 2
           if (snapshot) {
-            retain(descriptors.map(descriptor => descriptor!.value))
+            retain(values)
           }
         } else {
           const copy = snapshot ? Array.from({ length }, () => undefined as unknown) : undefined
           retain(copy)
           for (let index = length - 1; index >= 0; index--) {
             pending.push({
-              value: descriptors[index]!.value,
+              value: values[index],
               depth: current.depth + 1,
               parent: copy,
               key: index

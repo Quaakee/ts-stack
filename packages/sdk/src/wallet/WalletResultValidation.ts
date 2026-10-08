@@ -20,6 +20,8 @@ import { isUnsafeRecordKey } from '../primitives/SafeRecord.js'
 
 const IntrinsicNumber = Number
 const IntrinsicString = String
+const IntrinsicArray = Array
+const intrinsicArrayFrom = Array.from
 const IntrinsicUint8Array = Uint8Array
 const IntrinsicURL = URL
 const intrinsicArrayPrototype = Array.prototype
@@ -514,6 +516,23 @@ function ownArrayLength(value: unknown[]): number | undefined {
     : undefined
 }
 
+// Array.from defines own indices without invoking Array.prototype setters.
+// A null-prototype array-like cannot acquire a hostile inherited iterator.
+function privateByteArray(length: number): number[] {
+  const shape = intrinsicObjectCreate(null) as { length: number }
+  shape.length = length
+  return intrinsicApply(intrinsicArrayFrom, IntrinsicArray, [shape, () => 0]) as number[]
+}
+
+function privatePush<T>(items: T[], value: T): void {
+  intrinsicObjectDefineProperty(items, stringValue(items.length), {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true
+  })
+}
+
 function snapshotDenseByteArray(
   value: unknown[],
   length: number,
@@ -536,8 +555,7 @@ function snapshotDenseByteArray(
       return undefined
     }
   }
-  const snapshot: number[] | undefined = length <= remainingByteBudget ? [] : undefined
-  if (snapshot !== undefined) snapshot.length = length
+  const snapshot = length <= remainingByteBudget ? privateByteArray(length) : undefined
   for (let index = 0; index < length; index++) {
     const descriptor = intrinsicObjectGetOwnPropertyDescriptor(value, stringValue(index))
     if (
@@ -564,8 +582,7 @@ function snapshotHistoricalByteRecord(
   if (prototype !== intrinsicObjectPrototype && prototype !== null) return undefined
   const keys = intrinsicReflectOwnKeys(value)
   if (keys.length === 0 || keys.length > maximumLength) return undefined
-  const snapshot: number[] | undefined = keys.length <= remainingByteBudget ? [] : undefined
-  if (snapshot !== undefined) snapshot.length = keys.length
+  const snapshot = keys.length <= remainingByteBudget ? privateByteArray(keys.length) : undefined
   for (let index = 0; index < keys.length; index++) {
     const key = keys[index]
     if (key !== stringValue(index)) return undefined
@@ -646,7 +663,8 @@ interface SnapshotFrame {
 function snapshotSafeObjectGraph(
   value: unknown,
   call: string,
-  recoverHistoricalWalletByteFields = false
+  recoverHistoricalWalletByteFields = false,
+  privateBytes?: WeakMap<object, number>
 ): unknown {
   const pending: SnapshotFrame[] = []
   const seen = new IntrinsicWeakMap<object, unknown>()
@@ -684,6 +702,9 @@ function snapshotSafeObjectGraph(
         }
         copiedBytes += historicalSnapshot.length
         weakSetAdd(ownedByteArrays, historicalSnapshot)
+        if (privateBytes !== undefined) {
+          weakMapSet(privateBytes, historicalSnapshot, historicalSnapshot.length)
+        }
         weakMapSet(seenHistoricalByteRecords, candidate, historicalSnapshot)
         return historicalSnapshot
       }
@@ -695,6 +716,21 @@ function snapshotSafeObjectGraph(
     nodes++
     if (nodes > maxObjectGraphNodes) invalid(call, 'object graph', 'a bounded result')
 
+    // Only the synchronous HTTP boundary creates this scope. Its buffers have
+    // never escaped; public validation always starts without it. Retain every
+    // graph/aggregate-byte check while avoiding another per-byte snapshot.
+    const privateLength =
+      privateBytes === undefined ? undefined : weakMapGet(privateBytes, candidate)
+    if (privateLength !== undefined) {
+      if (privateLength > MAX_WALLET_WIRE_FRAME_BYTES - copiedBytes) {
+        invalid(call, 'byte arrays', `at most ${MAX_WALLET_WIRE_FRAME_BYTES} total bytes`)
+      }
+      copiedBytes += privateLength
+      weakSetAdd(ownedByteArrays, candidate)
+      weakMapSet(seen, candidate, candidate)
+      return candidate
+    }
+
     if (isUint8Array(candidate)) {
       const snapshot = snapshotUint8Array(
         candidate,
@@ -703,6 +739,9 @@ function snapshotSafeObjectGraph(
       )
       copiedBytes += typedArrayDetails(snapshot)!.length
       weakSetAdd(ownedByteArrays, snapshot)
+      if (privateBytes !== undefined) {
+        weakMapSet(privateBytes, snapshot, typedArrayDetails(snapshot)!.length)
+      }
       weakMapSet(seen, candidate, snapshot)
       return snapshot
     }
@@ -728,6 +767,7 @@ function snapshotSafeObjectGraph(
       if (byteSnapshot !== undefined) {
         copiedBytes += byteSnapshot.length
         weakSetAdd(ownedByteArrays, byteSnapshot)
+        if (privateBytes !== undefined) weakMapSet(privateBytes, byteSnapshot, byteSnapshot.length)
         weakMapSet(seen, candidate, byteSnapshot)
         return byteSnapshot
       }
@@ -737,7 +777,7 @@ function snapshotSafeObjectGraph(
       const target: unknown[] = []
       target.length = candidateLength
       weakMapSet(seen, candidate, target)
-      pending[pending.length] = { source: candidate, target, array: true }
+      privatePush(pending, { source: candidate, target, array: true })
       return target
     }
 
@@ -751,7 +791,7 @@ function snapshotSafeObjectGraph(
     // inherited from Object.prototype.
     const target = (prototype === null ? intrinsicObjectCreate(null) : {}) as UnknownRecord
     weakMapSet(seen, candidate, target)
-    pending[pending.length] = { source: candidate, target, array: false }
+    privatePush(pending, { source: candidate, target, array: false })
     return target
   }
 
@@ -835,6 +875,97 @@ export function assertSafeWalletValue<T>(value: T, context: string): T {
  */
 export function assertSafeWalletJSONValue<T>(value: T, context: string): T {
   return snapshotSafeObjectGraph(value, context, true) as T
+}
+
+function privateWalletBytes(
+  value: unknown,
+  privateBytes: WeakMap<object, number>
+): number[] | Uint8Array | undefined {
+  if (value == null || typeof value !== 'object') return undefined
+  if (weakMapGet(privateBytes, value) !== undefined) return value as number[] | Uint8Array
+  if (arrayIsArray(value)) {
+    // Non-enumerable byte indices are deliberately not marked reusable: the
+    // following graph walk must retain their existing shape validation.
+    for (let index = 0; index < value.length; index++) {
+      const byte = value[index]
+      if (!intrinsicNumberIsInteger(byte) || (byte as number) < 0 || (byte as number) > 255) {
+        return undefined
+      }
+    }
+    return value as number[]
+  }
+  // Match HTTP's historical repair exactly: only enumerable canonical byte
+  // indices count here; safe non-enumerable metadata remains ignored.
+  const keys = intrinsicObjectKeys(value)
+  if (keys.length === 0) return undefined
+  const bytes = privateByteArray(keys.length)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    if (key !== stringValue(index)) return undefined
+    const byte = (value as UnknownRecord)[key]
+    if (!intrinsicNumberIsInteger(byte) || (byte as number) < 0 || (byte as number) > 255) {
+      return undefined
+    }
+    bytes[index] = byte as number
+  }
+  weakMapSet(privateBytes, bytes, bytes.length)
+  return bytes
+}
+
+function normalizePrivateWalletBytes(value: unknown, privateBytes: WeakMap<object, number>): void {
+  const seen = new IntrinsicWeakSet<object>()
+  const pending: unknown[] = []
+  privatePush(pending, value)
+  while (pending.length > 0) {
+    const candidate = pending[pending.length - 1]
+    pending.length -= 1
+    if (candidate == null || typeof candidate !== 'object') continue
+    if (weakMapGet(privateBytes, candidate) !== undefined || weakSetHas(seen, candidate)) continue
+    weakSetAdd(seen, candidate)
+    if (arrayIsArray(candidate)) {
+      for (let index = 0; index < candidate.length; index++) privatePush(pending, candidate[index])
+      continue
+    }
+    const keys = intrinsicObjectKeys(candidate)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      const fieldValue = (candidate as UnknownRecord)[key]
+      const bytes = isHistoricalWalletByteField(key)
+        ? privateWalletBytes(fieldValue, privateBytes)
+        : undefined
+      if (bytes === undefined) privatePush(pending, fieldValue)
+      else (candidate as UnknownRecord)[key] = bytes
+    }
+  }
+}
+
+/**
+ * @internal Defensively validate one HTTP response without exposing its owned
+ * byte buffers between normalization and result validation. The scope expires
+ * on return; public validators never reuse ownership from a previous call.
+ */
+export function validateHTTPWalletJSONResponse(
+  call: CallType,
+  value: unknown,
+  request: unknown,
+  response: { readonly ok: boolean }
+): { ok: true; data: unknown } | { ok: false; data: UnknownRecord } {
+  const privateBytes = new IntrinsicWeakMap<object, number>()
+  const raw = snapshotSafeObjectGraph(
+    value,
+    `HTTPWalletJSON ${call} raw response`,
+    true,
+    privateBytes
+  )
+  normalizePrivateWalletBytes(raw, privateBytes)
+  const data = snapshotSafeObjectGraph(raw, `HTTPWalletJSON ${call} response`, false, privateBytes)
+  if (data == null || typeof data !== 'object' || arrayIsArray(data)) {
+    throw new Error(`Invalid HTTPWalletJSON ${call} response: expected an object`)
+  }
+  // A custom adapter's getter runs at the same point as before, and receives
+  // no reference to the private graph. Error handling stays in HTTPWalletJSON.
+  if (!response.ok) return { ok: false, data: data as UnknownRecord }
+  return { ok: true, data: validatePrivateWalletResult(call, data, request, privateBytes) }
 }
 
 function record(value: unknown, call: string, field = 'value'): UnknownRecord {
@@ -1981,7 +2112,16 @@ function validateKeyLinkage(result: UnknownRecord, call: string): void {
  * treats them as authorization, cryptographic, identity, or financial facts.
  */
 export function validateWalletResult<T>(call: CallType, value: T, request?: unknown): T {
-  const ownedValue = snapshotSafeObjectGraph(value, call) as T
+  return validatePrivateWalletResult(call, value, request)
+}
+
+function validatePrivateWalletResult<T>(
+  call: CallType,
+  value: T,
+  request?: unknown,
+  privateBytes?: WeakMap<object, number>
+): T {
+  const ownedValue = snapshotSafeObjectGraph(value, call, false, privateBytes) as T
   const result = record(ownedValue, call)
   const requestArgs = requestRecord(request)
 

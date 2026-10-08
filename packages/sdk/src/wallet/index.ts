@@ -17,4 +17,9 @@ export * from './substrates/index.js'
 export * from './WalletLoggerInterface.js'
 export * from './completeBoundAction.js'
 export * from './WalletArgumentValidation.js'
-export * from './WalletResultValidation.js'
+export {
+  assertSafeWalletValue,
+  assertSafeWalletJSONValue,
+  snapshotWalletResultRequest,
+  validateWalletResult
+} from './WalletResultValidation.js'

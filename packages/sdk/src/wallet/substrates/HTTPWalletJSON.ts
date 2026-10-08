@@ -38,17 +38,12 @@ import {
 import { WERR_REVIEW_ACTIONS } from '../WERR_REVIEW_ACTIONS.js'
 import { WERR_INVALID_PARAMETER } from '../WERR_INVALID_PARAMETER.js'
 import { normalizeWalletHttpBaseUrl, toOriginHeader } from './utils/toOriginHeader.js'
-import {
-  normalizeBRC100ByteArray,
-  normalizeBRC100WalletByteFields,
-  stringifyBRC100
-} from '../BRC100ByteEncoding.js'
+import { normalizeBRC100ByteArray, stringifyBRC100 } from '../BRC100ByteEncoding.js'
 import WERR_INSUFFICIENT_FUNDS from '../WERR_INSUFFICIENT_FUNDS.js'
 import { MAXIMUM_SEND_WITH_TRANSACTIONS, validateOriginator } from '../validationHelpers.js'
 import { validateWalletArgs } from '../WalletArgumentValidation.js'
 import {
-  assertSafeWalletJSONValue,
-  assertSafeWalletValue,
+  validateHTTPWalletJSONResponse,
   snapshotWalletResultRequest,
   validateWalletResult
 } from '../WalletResultValidation.js'
@@ -316,30 +311,21 @@ export default class HTTPWalletJSON implements WalletInterface {
         body: requestBody
       })
 
-      const rawData = assertSafeWalletJSONValue(
+      const validated = validateHTTPWalletJSONResponse(
+        call,
         await readBoundedJSON(res),
-        `HTTPWalletJSON ${call} raw response`
+        bindingRequest,
+        res
       )
-      // Response-like compatibility adapters can return arbitrary JavaScript
-      // values rather than native JSON.parse output. Reject accessors, exotic
-      // prototypes, and oversized graphs before normalization enumerates them.
-      const data = assertSafeWalletValue(
-        normalizeBRC100WalletByteFields(rawData) as Record<string, unknown>,
-        `HTTPWalletJSON ${call} response`
-      )
-      if (data == null || typeof data !== 'object' || Array.isArray(data)) {
-        throw new Error(`Invalid HTTPWalletJSON ${call} response: expected an object`)
-      }
-
-      // Check the HTTP status on the original response
-      if (!res.ok) {
+      if (!validated.ok) {
+        const data = validated.data
         if (res.status === 400 && Object.prototype.hasOwnProperty.call(data, 'isError')) {
           const walletError = deserializeWalletError(data, call, bindingRequest)
           if (walletError !== undefined) throw walletError
         }
         throw new Error(`HTTPWalletJSON ${call} failed with HTTP status ${res.status}`)
       }
-      return validateWalletResult(call, data, bindingRequest)
+      return validated.data
     }
   }
 
