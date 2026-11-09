@@ -409,6 +409,52 @@ async function main() {
       })
       return { txid: id, reqId: provenTxReqId }
     }
+    if (scenario === 'brc177-target' || scenario === 'brc177-reclaim') {
+      // 2.15.3's BRC-177 nosend-expiry lifecycle alone broadcasts or revives a protected action and
+      // its reclaim, so a failed one keeps 2.15.3's sendWith refusal: the set is reported failed
+      // and no exact-retry state is committed, in both modes.
+      if (scenario === 'brc177-target') {
+        await active
+          .knex('transactions')
+          .where({ transactionId: txId })
+          .update({ noSendExpiryMode: 'blockheight', noSendExpiryState: 'reclaimed' })
+      } else {
+        // The failed action is the signed reclaim of another, protected action whose target won.
+        const targetId = await active.insertTransaction({
+          created_at: now,
+          updated_at: now,
+          transactionId: 0,
+          userId: user.userId,
+          status: 'completed',
+          reference: Buffer.from('brc177-target').toString('base64'),
+          isOutgoing: true,
+          satoshis: -1,
+          description: 'BRC-177 protected target',
+          txid: 'cd'.repeat(32)
+        })
+        await active
+          .knex('transactions')
+          .where({ transactionId: targetId })
+          .update({ noSendExpiryMode: 'blockheight', noSendExpiryState: 'target-won', noSendExpiryReclaimTxid: txid })
+      }
+      for (const acceptDelayedBroadcast of [false, true]) {
+        const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
+        const outcome = await wallet
+          .createAction({
+            description: 'resume a BRC-177 lifecycle transaction',
+            options: { sendWith: [txid], acceptDelayedBroadcast }
+          })
+          .catch(error => error)
+        assert.deepEqual(
+          outcome.sendWithResults?.map(result => result.status),
+          ['failed'],
+          `${mode}: ${JSON.stringify(outcome.sendWithResults ?? outcome.message)}`
+        )
+        await assertNoRetryState([], `${mode} ${scenario}`)
+      }
+      console.log(`PASS ${scenario}: a failed BRC-177 lifecycle transaction is not retried through sendWith`)
+      return
+    }
     if (scenario === 'incomplete-set') {
       // A sendWith set that cannot be sent together commits no exact-retry state, in both immediate
       // and delayed modes, so the monitor later finds nothing to broadcast. On this 2.15.3 base the

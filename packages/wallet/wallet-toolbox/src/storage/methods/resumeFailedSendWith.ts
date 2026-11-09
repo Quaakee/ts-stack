@@ -118,6 +118,26 @@ export async function commitExactResumes(
   return current
 }
 
+/**
+ * The BRC-177 nosend-expiry lifecycle alone broadcasts or revives a protected action and its signed
+ * reclaim, so neither is ever an exact retry: sendWith keeps its ordinary refusal for them.
+ */
+async function isNoSendExpiryLifecycleTransaction(
+  storage: StorageProvider,
+  userId: number,
+  txid: string,
+  trx?: TrxToken
+): Promise<boolean> {
+  const actions = await storage.findTransactions({ partial: { txid }, noRawTx: true, trx })
+  if (actions.some(action => action.noSendExpiryState != null)) return true
+  const targets = await storage.findTransactions({
+    partial: { userId, noSendExpiryReclaimTxid: txid },
+    noRawTx: true,
+    trx
+  })
+  return targets.length > 0
+}
+
 async function planExactResume(
   storage: StorageProvider,
   userId: number,
@@ -125,6 +145,7 @@ async function planExactResume(
 ): Promise<ExactResumeCandidate | undefined> {
   const rows = await storage.findProvenTxReqs({ partial: { txid } })
   if (rows.length !== 1 || !resumableStatuses.includes(rows[0].status)) return undefined
+  if (await isNoSendExpiryLifecycleTransaction(storage, userId, txid)) return undefined
   const original = rows[0]
   const raw = Transaction.fromBinary(original.rawTx)
   if (raw.id('hex') !== txid || original.inputBEEF == null || raw.inputs.length === 0)
@@ -179,6 +200,8 @@ async function commitExactResume(
   const action = transactions[0]
   if (action.transactionId !== preparedAction.transactionId)
     throw new WERR_INVALID_OPERATION('Exact retry action changed.')
+  if (await isNoSendExpiryLifecycleTransaction(storage, userId, txid, trx))
+    throw new WERR_INVALID_OPERATION('Exact retry refuses a BRC-177 nosend-expiry lifecycle transaction.')
   if (action.rawTx != null && JSON.stringify(action.rawTx) !== JSON.stringify(original.rawTx))
     throw new WERR_INVALID_OPERATION('Exact retry action bytes disagree with its request.')
   if (req.notify.transactionIds?.length !== 1 || req.notify.transactionIds[0] !== action.transactionId)
