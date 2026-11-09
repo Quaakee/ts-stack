@@ -5,6 +5,7 @@ import { TrxToken } from '../../sdk/WalletStorage.interfaces'
 import { TableProvenTxReq } from '../schema/tables/TableProvenTxReq'
 import { TableTransaction } from '../schema/tables/TableTransaction'
 import { WERR_INVALID_OPERATION } from '../../sdk/WERR_errors'
+import { normalizePostTxids } from '../../services/validatePostBeefResult'
 import type { GetReqsAndBeefResult } from './processAction'
 
 const resumableStatuses = ['invalid', 'doubleSpend', 'unknown', 'unfail']
@@ -28,6 +29,8 @@ export interface ExactResumeCandidate {
 /**
  * Plan the exact retries in a sendWith set, read-only: nothing is committed here (#589).
  * Every candidate is planned before any is committed, so a refused candidate commits no retry.
+ * Only the caller's own failed outgoing actions are planned; any other txid, including another
+ * user's, is left to the share exactly as an unknown one is.
  */
 export async function planExactResumes(
   storage: StorageProvider,
@@ -35,7 +38,8 @@ export async function planExactResumes(
   txids: string[]
 ): Promise<ExactResumeCandidate[]> {
   const candidates: ExactResumeCandidate[] = []
-  for (const txid of new Set(txids)) {
+  const unique = [...new Set(txids.map(txid => (typeof txid === 'string' ? txid.toLowerCase() : txid)))]
+  for (const txid of normalizePostTxids(unique, 'sendWith', true)) {
     const candidate = await planExactResume(storage, userId, txid)
     if (candidate != null) candidates.push(candidate)
   }
@@ -88,6 +92,28 @@ export function admitExactResumes(
 }
 
 /**
+ * A sendWith member whose request carries another user's exact-retry binding reads, to this caller,
+ * as an unknown txid (#829). Storage can serve several users; the caller learns nothing about that
+ * request, and the share neither posts nor schedules it, instead of refusing it with an error that
+ * names the exact retry.
+ */
+export function hideForeignExactResumes(r: GetReqsAndBeefResult, txids: string[], userId: number): void {
+  const named = new Set(txids)
+  for (const detail of r.details) {
+    if (!named.has(detail.txid) || detail.status !== 'readyToSend' || detail.req == null) continue
+    const bindings = new EntityProvenTxReq(detail.req).history.notes?.filter(isExactResumeBinding) ?? []
+    if (bindings.length > 0 && bindings.every(binding => binding.userId !== userId)) {
+      detail.status = 'error'
+      detail.error = `ERR_UNKNOWN_TXID: ${detail.txid} was not found.`
+    }
+  }
+}
+
+function isExactResumeBinding(note: { what: string }): boolean {
+  return note.what === 'exactSendWithResume'
+}
+
+/**
  * Commit every admitted retry inside the caller's one storage transaction, all or nothing (#589).
  *
  * Every row lock of every candidate is taken before the first snapshot read, then each candidate
@@ -124,14 +150,12 @@ export async function commitExactResumes(
  */
 async function isNoSendExpiryLifecycleTransaction(
   storage: StorageProvider,
-  userId: number,
-  txid: string,
+  action: TableTransaction,
   trx?: TrxToken
 ): Promise<boolean> {
-  const actions = await storage.findTransactions({ partial: { txid }, noRawTx: true, trx })
-  if (actions.some(action => action.noSendExpiryState != null)) return true
+  if (action.noSendExpiryState != null) return true
   const targets = await storage.findTransactions({
-    partial: { userId, noSendExpiryReclaimTxid: txid },
+    partial: { userId: action.userId, noSendExpiryReclaimTxid: action.txid },
     noRawTx: true,
     trx
   })
@@ -143,9 +167,18 @@ async function planExactResume(
   userId: number,
   txid: string
 ): Promise<ExactResumeCandidate | undefined> {
+  // #829: ownership first. Until the caller is known to own exactly one failed outgoing action
+  // with this txid, nothing else is read, and every refusal is the same "not resumable": a caller
+  // learns nothing about a txid it does not own, not even whether it exists.
+  const owned = await storage.findTransactions({ partial: { txid, userId }, noRawTx: true })
+  if (owned.length !== 1) return undefined
+  const preparedAction = owned[0]
+  if (!preparedAction.isOutgoing || !['failed', 'unfail'].includes(preparedAction.status)) return undefined
+  if (await isNoSendExpiryLifecycleTransaction(storage, preparedAction)) return undefined
+  // Requests have no owner column. This one is read only for the caller's own action, and the
+  // commit still refuses a request whose notification lineage is not exactly that action.
   const rows = await storage.findProvenTxReqs({ partial: { txid } })
   if (rows.length !== 1 || !resumableStatuses.includes(rows[0].status)) return undefined
-  if (await isNoSendExpiryLifecycleTransaction(storage, userId, txid)) return undefined
   const original = rows[0]
   const raw = Transaction.fromBinary(original.rawTx)
   if (raw.id('hex') !== txid || original.inputBEEF == null || raw.inputs.length === 0)
@@ -157,10 +190,9 @@ async function planExactResume(
   if (!(await Transaction.fromBEEF(beef.toBinary(), txid).verify(await storage.getServices().getChainTracker())))
     throw new WERR_INVALID_OPERATION('Exact retry could not validate stored signed transaction.')
 
-  const preparedTransactions = await storage.findTransactions({ partial: { txid } })
-  if (preparedTransactions.length !== 1) throw new WERR_INVALID_OPERATION('Exact retry requires one action.')
-  const preparedAction = preparedTransactions[0]
-  const preparedOutputs = await storage.findOutputs({ partial: { transactionId: preparedAction.transactionId } })
+  const preparedOutputs = await storage.findOutputs({
+    partial: { userId, transactionId: preparedAction.transactionId }
+  })
   const preparedInputs = (
     await Promise.all(
       raw.inputs.map(input =>
@@ -200,7 +232,7 @@ async function commitExactResume(
   const action = transactions[0]
   if (action.transactionId !== preparedAction.transactionId)
     throw new WERR_INVALID_OPERATION('Exact retry action changed.')
-  if (await isNoSendExpiryLifecycleTransaction(storage, userId, txid, trx))
+  if (await isNoSendExpiryLifecycleTransaction(storage, action, trx))
     throw new WERR_INVALID_OPERATION('Exact retry refuses a BRC-177 nosend-expiry lifecycle transaction.')
   if (action.rawTx != null && JSON.stringify(action.rawTx) !== JSON.stringify(original.rawTx))
     throw new WERR_INVALID_OPERATION('Exact retry action bytes disagree with its request.')

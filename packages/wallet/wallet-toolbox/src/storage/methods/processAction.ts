@@ -11,6 +11,7 @@ import {
   admitExactResumes,
   commitExactResumes,
   ExactResumeCandidate,
+  hideForeignExactResumes,
   isExactResume,
   lockExactResumeBinding,
   planExactResumes
@@ -399,6 +400,9 @@ async function shareSendWithSet(
     'details',
     true
   )
+
+  // #829: a named txid bound to another user's exact retry is, to this caller, unknown.
+  hideForeignExactResumes(r, txids, userId)
 
   // #589: this one lookup is the only decision for the set. A planned retry is sendable only while
   // the lookup still shows its planned failed request and every other member already is sendable;

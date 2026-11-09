@@ -14,6 +14,11 @@ attention to changes that materially alter behavior or extend functionality.
   no retry state.
 - A BRC-177 protected action, and the signed reclaim of one, is never an exact
   retry. The nosend-expiry lifecycle alone broadcasts or revives them.
+- Plan a retry only for the caller's own failed outgoing action, before reading
+  anything else about the txid, and read a member bound to another user's retry
+  as unknown. Another user of the same storage gets the unknown-txid answer and
+  can neither retry nor change the action. 2.10.2-atlas.520.2 and .520.1
+  answered such a caller with errors that disclosed the action's state.
 - Distribution is an immutable ATLAS tarball, not an npm release. The
   2.10.2-atlas.771.1 changes are upstream and are not carried.
   See [exact-retry compatibility and limitations](docs/atlas-exact-resume.md).

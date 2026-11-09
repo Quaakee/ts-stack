@@ -207,7 +207,6 @@ async function main() {
       [
         'malformed',
         'wrong-id',
-        'foreign-owner',
         'output-mismatch',
         'reallocated',
         'missing-output',
@@ -218,6 +217,21 @@ async function main() {
       await assert.rejects(resume)
       assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
       assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'unknown')
+      console.log(`PASS refuses ${scenario} without posting or lifecycle mutation`)
+      return
+    }
+    if (scenario === 'foreign-owner') {
+      // An incoming row is not the caller's outgoing action, so planning never treats it as a retry
+      // (#829): the share refuses it as it does any request that is not ready to send.
+      const outcome = await resume().catch(error => error)
+      assert.deepEqual(
+        outcome.sendWithResults?.map(result => result.status),
+        ['failed'],
+        JSON.stringify(outcome)
+      )
+      assert.equal((await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } }))[0].status, 'invalid')
+      assert.equal((await services.getStatusForTxids([txid])).results[0].status, 'unknown')
+      assert.ok((await active.findOutputs({ partial: { outputId: inputId } }))[0].spentBy == null)
       console.log(`PASS refuses ${scenario} without posting or lifecycle mutation`)
       return
     }
@@ -409,6 +423,75 @@ async function main() {
       })
       return { txid: id, reqId: provenTxReqId }
     }
+    if (scenario === 'foreign-user') {
+      // #829: storage can serve several users. User B naming user A's txid gets exactly the answer B
+      // gets for a txid nobody stored, both while A's action is failed and while A's own retry of it
+      // is queued, through createAction and through storage's processAction as a remote client calls
+      // it, in both modes. B's calls change none of A's rows, post nothing and queue nothing.
+      const rootB = PrivateKey.fromHex('3'.repeat(64))
+      const managerB = new WalletStorageManager(rootB.toPublicKey().toString(), active)
+      await managerB.makeAvailable()
+      const walletB = new Wallet({
+        chain: 'mock',
+        keyDeriver: new CachedKeyDeriver(rootB),
+        storage: managerB,
+        services
+      })
+      const unknown = 'ef'.repeat(32)
+      const answer = async (target, call) => {
+        const outcome = await call(target).then(
+          result => ({ result }),
+          error => ({ error: { name: error.name, message: error.message, ...error } })
+        )
+        return JSON.stringify(outcome).split(target).join('<txid>')
+      }
+      const rowsOfA = async () =>
+        JSON.stringify({
+          reqs: await active.findProvenTxReqs({ partial: { txid } }),
+          actions: await active.findTransactions({ partial: { userId: user.userId } }),
+          outputs: await active.findOutputs({ partial: { userId: user.userId } })
+        })
+      const asB = async label => {
+        const before = await rowsOfA()
+        for (const isDelayed of [false, true]) {
+          const mode = isDelayed ? 'delayed' : 'immediate'
+          const viaWallet = target =>
+            walletB.createAction({
+              description: 'sendWith naming a txid of another user',
+              options: { sendWith: [target], acceptDelayedBroadcast: isDelayed }
+            })
+          const viaStorage = target =>
+            managerB.processAction({ isNewTx: false, isSendWith: true, isNoSend: false, isDelayed, sendWith: [target] })
+          for (const [how, call] of [
+            ['createAction', viaWallet],
+            ['processAction', viaStorage]
+          ]) {
+            const foreign = await answer(txid, call)
+            assert.equal(foreign, await answer(unknown, call), `${label} ${mode} ${how}`)
+            assert.match(foreign, /"status":"failed"/, `${label} ${mode} ${how}`)
+          }
+        }
+        assert.equal(await rowsOfA(), before, `${label}: user B changed user A's rows`)
+        assert.equal(await networkStatus(txid), 'unknown', `${label}: user B posted user A's action`)
+      }
+      await asB('failed action')
+      await assertNoRetryState([], 'after user B')
+      // A's own retry, queued for the monitor, carries A's binding; B still sees an unknown txid.
+      const queued = await wallet.createAction({ description: 'queue exact retry', options: { sendWith: [txid] } })
+      assert.equal(queued.sendWithResults[0].status, 'sending', JSON.stringify(queued))
+      await asB('queued retry')
+      await sendWaiting()
+      assert.equal(await networkStatus(txid), 'known')
+      const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+      assert.equal(req.status, 'unmined')
+      const bindings = JSON.parse(req.history).notes.filter(note => note.what === 'exactSendWithResume')
+      assert.deepEqual(
+        bindings.map(note => note.userId),
+        [user.userId]
+      )
+      console.log('PASS foreign-user: another user sees an unknown txid and changes nothing; the owner still resumes')
+      return
+    }
     if (scenario === 'brc177-target' || scenario === 'brc177-reclaim') {
       // 2.15.3's BRC-177 nosend-expiry lifecycle alone broadcasts or revives a protected action and
       // its reclaim, so a failed one keeps 2.15.3's sendWith refusal: the set is reported failed
@@ -519,7 +602,8 @@ async function main() {
     }
     if (scenario === 'poc2-multi') {
       // B spends A:0 as a chained atomic pair; B passes read-only planning but fails the commit's
-      // ownership check (isOutgoing=false). A's retry must not survive B's refusal in either mode.
+      // output lineage check (its stored output disagrees with the signed one). A's retry must not
+      // survive B's refusal in either mode.
       const b = new Transaction()
       b.addInput({ sourceTXID: txid, sourceOutputIndex: 0, unlockingScript: Script.fromHex(''), sequence: 0xffffffff })
       b.addOutput({ satoshis: 4_999_999_998, lockingScript: Script.fromHex('51') })
@@ -533,7 +617,7 @@ async function main() {
         userId: user.userId,
         status: 'failed',
         reference: Buffer.from('secondB').toString('base64'),
-        isOutgoing: false,
+        isOutgoing: true,
         satoshis: -1,
         description: 'second action',
         txid: txidB
@@ -556,7 +640,7 @@ async function main() {
         transactionId: txIdB,
         spendable: false,
         vout: 0,
-        satoshis: 4_999_999_998,
+        satoshis: 1,
         txid: txidB,
         lockingScript: [81]
       })
@@ -566,7 +650,7 @@ async function main() {
             description: 'resume a set whose second retry is refused',
             options: { sendWith: [txid, txidB], acceptDelayedBroadcast }
           }),
-          /Exact retry requires one owned failed outgoing action/
+          /Exact retry output lineage is inconsistent or allocated/
         )
         const mode = acceptDelayedBroadcast ? 'delayed' : 'immediate'
         assert.equal((await active.findProvenTxReqs({ partial: { txid: txidB } }))[0].status, 'invalid', mode)
@@ -590,17 +674,20 @@ async function main() {
           description: 'resume beside an ordinary nosend action',
           options: { sendWith, acceptDelayedBroadcast: delayed }
         })
-      // Each member's reads outside any transaction: read 1 is planning, read 2 is the share's lookup.
+      // Each member's request reads outside any transaction. Planning reads only the request of the
+      // caller's own failed action (A), so A's share lookup is its read 2 and the ordinary B's is read 1.
       const find = active.findProvenTxReqs.bind(active)
       const faultShareLookup = async (faulty, sendWith) => {
+        const shareRead = faulty === txid ? 2 : 1
         let reads = 0
         active.findProvenTxReqs = async args => {
-          if (!args.trx && args.partial?.txid === faulty && ++reads === 2) throw new Error('transient lookup failure')
+          if (!args.trx && args.partial?.txid === faulty && ++reads === shareRead)
+            throw new Error('transient lookup failure')
           return find(args)
         }
         const outcome = await share(sendWith).catch(error => error)
         active.findProvenTxReqs = find
-        assert.equal(reads, 2, `${mode}: the share's lookup did not read ${faulty}`)
+        assert.equal(reads, shareRead, `${mode}: the share's lookup did not read ${faulty}`)
         return outcome
       }
       const b = await insertNosend(1, 'poc2-transient B')

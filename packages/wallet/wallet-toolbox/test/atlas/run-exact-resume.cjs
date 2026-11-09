@@ -35,7 +35,8 @@ const scenarios = [
   'poc2-ordering',
   'poc2-ordering-delayed',
   'brc177-target',
-  'brc177-reclaim'
+  'brc177-reclaim',
+  'foreign-user'
 ]
 const [launcher, fixture] = process.argv.slice(2)
 if (!launcher || !fixture) throw new Error('Usage: node run-exact-resume.cjs <node-or-tsx> <fixture-path>')
