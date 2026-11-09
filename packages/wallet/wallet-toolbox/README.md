@@ -6,6 +6,13 @@
 
 A [BRC-100](https://github.com/bitcoin-sv/BRCs/blob/master/wallet/0100.md) conforming wallet implementation for the BSV blockchain, built on the [BSV SDK](https://bsv-blockchain.github.io/ts-stack/packages/sdk/). Provides persistent storage, protocol-based key derivation, transaction monitoring, chain tracking, and signing — everything needed to build wallet-powered applications on BSV.
 
+## ATLAS maintained lifecycle repair
+
+The `2.15.3-atlas.520.3` artifact adds safe exact signed-action retry through
+existing `sendWith`, committing a set's retries all or nothing; see
+[compatibility and limitations](docs/atlas-exact-resume.md).
+It does not authorize creating replacement actions after uncertain broadcasts.
+
 ## Diagnosing foreground BEEF verification failures
 
 Foreground Storage processing retains its signed transaction before proof

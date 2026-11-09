@@ -4,6 +4,20 @@ This document captures the history of significant changes to the wallet-toolbox 
 The git commit history contains the details but is unable to draw
 attention to changes that materially alter behavior or extend functionality.
 
+## 2.15.3-atlas.520.3 (ATLAS maintained artifact)
+
+- Port the ATLAS exact signed-action retry of `2.10.2-atlas.520.2` onto 2.15.3
+  (ATLAS #829). An existing `createAction` `sendWith` retries a validated
+  failed signed action by requeueing exactly its stored bytes, and the retries
+  of a set commit in one storage transaction, all or nothing, as in 520.2.
+  2.15.3's refusals of an incomplete set and of a txid listed twice also leave
+  no retry state.
+- A BRC-177 protected action, and the signed reclaim of one, is never an exact
+  retry. The nosend-expiry lifecycle alone broadcasts or revives them.
+- Distribution is an immutable ATLAS tarball, not an npm release. The
+  2.10.2-atlas.771.1 changes are upstream and are not carried.
+  See [exact-retry compatibility and limitations](docs/atlas-exact-resume.md).
+
 ## wallet-toolbox 2.15.3 (source candidate)
 
 - Restore ordinary internalization of exactly framed legacy AtomicBEEF with

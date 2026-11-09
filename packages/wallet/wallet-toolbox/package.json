@@ -1,6 +1,6 @@
 {
   "name": "@bsv/wallet-toolbox",
-  "version": "2.15.3",
+  "version": "2.15.3-atlas.520.3",
   "sideEffects": false,
   "type": "commonjs",
   "engines": {
