@@ -731,6 +731,68 @@ async function main() {
       console.log(`PASS ${scenario}: a refusal before the post or schedule leaves no retry state`)
       return
     }
+    if (scenario === 'independent-pools') {
+      // Not in the runner's list: run on its own, repeatedly and against MySQL, as the concurrency
+      // qualification. Four concurrent retries of one failed action go through two wallets whose
+      // storage uses independent connection pools on the same store. Exactly one retry commits,
+      // and no caller is told the action failed while it was resumed. better-sqlite3 waits for a
+      // lock synchronously, which blocks the other pool in the same process, so this needs MySQL.
+      assert.ok(mysqlConnection, 'independent-pools requires ATLAS_EXACT_RESUME_MYSQL')
+      const otherDb = knex(walletConfig)
+      const other = new StorageKnex({
+        chain: 'mock',
+        knex: otherDb,
+        commissionSatoshis: 0,
+        feeModel: { model: 'sat/kb', value: 1 }
+      })
+      other.setServices(services)
+      await other.makeAvailable()
+      try {
+        const otherManager = new WalletStorageManager(identityKey, other)
+        await otherManager.makeAvailable()
+        const otherWallet = new Wallet({
+          chain: 'mock',
+          keyDeriver: new CachedKeyDeriver(root),
+          storage: otherManager,
+          services
+        })
+        const retry = w =>
+          w.createAction({
+            description: 'independent-pool exact retry',
+            options: { sendWith: [txid], acceptDelayedBroadcast: false }
+          })
+        const outcomes = await Promise.allSettled([
+          retry(wallet),
+          retry(otherWallet),
+          retry(wallet),
+          retry(otherWallet)
+        ])
+        const reported = outcomes.map(outcome =>
+          outcome.status === 'fulfilled'
+            ? outcome.value.sendWithResults[0].status
+            : `${outcome.reason.name}: ${outcome.reason.sendWithResults?.[0]?.status ?? outcome.reason.message}`
+        )
+        assert.ok(reported.includes('unproven'), JSON.stringify(reported))
+        for (const status of reported)
+          assert.ok(
+            ['unproven', 'sending', 'WERR_REVIEW_ACTIONS: sending'].includes(status) ||
+              status.startsWith('WERR_INVALID_OPERATION: Exact retry'),
+            JSON.stringify(reported)
+          )
+        const [req] = await active.findProvenTxReqs({ partial: { provenTxReqId: reqId } })
+        assert.equal(req.status, 'unmined')
+        assert.deepEqual(req.rawTx, rawTx)
+        assert.equal(JSON.parse(req.history).notes.filter(note => note.what === 'exactSendWithResume').length, 1)
+        assert.equal((await active.findTransactions({ partial: { transactionId: txId } }))[0].status, 'unproven')
+        assert.equal((await active.findTransactions({ partial: { txid } })).length, 1)
+        assert.equal((await active.findOutputs({ partial: { outputId: inputId } }))[0].spentBy, txId)
+        assert.equal(await networkStatus(txid), 'known')
+        console.log(`PASS independent-pools: one committed retry, every caller consistent ${JSON.stringify(reported)}`)
+      } finally {
+        await other.destroy()
+      }
+      return
+    }
     if (scenario === 'delayed-race') {
       const find = active.findProvenTxReqs.bind(active)
       let changed = false
