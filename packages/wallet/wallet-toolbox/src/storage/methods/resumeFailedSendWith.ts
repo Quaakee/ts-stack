@@ -47,8 +47,8 @@ export async function planExactResumes(
  *
  * A candidate is admitted only while every detail `r` holds for its txid still shows its planned
  * failed request, and only when every other member of `r` is already sendable or already sent.
- * This base shares the ready part of an incomplete set (and an immediate share then throws), so a
- * retry must never join one. Admitted details become `readyToSend` (an immediate share also merges
+ * A retry must never join an incomplete set, which the share then refuses as a whole (2.15.3 shares
+ * no ready subset of one). Admitted details become `readyToSend` (an immediate share also merges
  * their planned, verified BEEF into `r.beef`), so the share's classification reads this same
  * decision. Otherwise `r` keeps the failed details, the share reports every candidate as failed
  * and no retry is ever committed.
